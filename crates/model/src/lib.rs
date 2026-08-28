@@ -432,22 +432,51 @@ impl GgufModel {
     /// storage type, the model bytes changed, a tensor range is invalid, or a
     /// shape does not match its decoded values.
     pub fn load_f32_many(&self, names: &[&str]) -> Result<Vec<Tensor>, ModelError> {
+        let mut tensors = Vec::with_capacity(names.len());
+        self.for_each_f32(names, |_, tensor| {
+            tensors.push(tensor);
+            Ok::<(), ModelError>(())
+        })?;
+        Ok(tensors)
+    }
+
+    /// Materializes several tensors as F32 values from one validated mapping,
+    /// invoking `callback` after each tensor so callers can release host data
+    /// before the next tensor is decoded.
+    ///
+    /// The callback receives tensors in the order of `names`. Duplicate names
+    /// are allowed. Its error type must be constructible from [`ModelError`]
+    /// so model validation failures can be returned without losing the
+    /// caller's error type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a tensor is missing or uses an unsupported
+    /// storage type, the model bytes changed, a tensor range is invalid, a
+    /// shape does not match its decoded values, or `callback` fails.
+    pub fn for_each_f32<F, E>(&self, names: &[&str], mut callback: F) -> Result<(), E>
+    where
+        F: FnMut(&str, Tensor) -> Result<(), E>,
+        E: From<ModelError>,
+    {
         let descriptors = names
             .iter()
             .map(|name| {
                 self.tensor(name)
                     .ok_or_else(|| ModelError::TensorNotFound((*name).to_owned()))
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mapped = map_model(&self.path, self.max_file_bytes)?;
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(E::from)?;
+        let mapped = map_model(&self.path, self.max_file_bytes).map_err(E::from)?;
         let bytes = mapped.as_bytes();
         if digest_bytes(bytes) != self.digest {
-            return Err(ModelError::ContentChanged);
+            return Err(E::from(ModelError::ContentChanged));
         }
-        descriptors
-            .into_iter()
-            .map(|descriptor| Self::materialize_f32(bytes, descriptor))
-            .collect()
+        for descriptor in descriptors {
+            let tensor = Self::materialize_f32(bytes, descriptor).map_err(E::from)?;
+            callback(&descriptor.name, tensor)?;
+        }
+        Ok(())
     }
 
     fn materialize_f32(bytes: &[u8], descriptor: &TensorDescriptor) -> Result<Tensor, ModelError> {
