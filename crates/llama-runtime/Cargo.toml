@@ -10,6 +10,7 @@ description = "Llama configuration and GGUF layout validation for a Rust-native 
 
 [dependencies]
 ggml-model = { path = "../model" }
+ggml-tensor = { path = "../tensor" }
 
 [lints]
 workspace = true

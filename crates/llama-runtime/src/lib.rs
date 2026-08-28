@@ -4,6 +4,7 @@ use std::fmt;
 use std::path::Path;
 
 use ggml_model::{GgufModel, MetadataScalar, ModelError};
+use ggml_tensor::{Tensor, TensorError};
 
 /// Validated architecture parameters for a Llama decoder.
 #[derive(Debug, Clone, PartialEq)]
@@ -188,6 +189,7 @@ impl LlamaConfig {
 #[derive(Debug)]
 pub enum LlamaError {
     Model(ModelError),
+    Tensor(String),
     UnsupportedArchitecture(String),
     MissingMetadata(&'static str),
     InvalidMetadata {
@@ -207,6 +209,7 @@ impl fmt::Display for LlamaError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Model(error) => write!(formatter, "GGUF model error: {error}"),
+            Self::Tensor(error) => write!(formatter, "Llama tensor execution error: {error}"),
             Self::UnsupportedArchitecture(value) => {
                 write!(formatter, "unsupported GGUF architecture: {value}")
             }
@@ -233,6 +236,12 @@ impl std::error::Error for LlamaError {}
 impl From<ModelError> for LlamaError {
     fn from(value: ModelError) -> Self {
         Self::Model(value)
+    }
+}
+
+impl From<TensorError> for LlamaError {
+    fn from(value: TensorError) -> Self {
+        Self::Tensor(value.to_string())
     }
 }
 
@@ -283,6 +292,168 @@ impl LlamaModel {
     pub const fn config(&self) -> &LlamaConfig {
         &self.config
     }
+
+    /// Loads the validated model tensors into the checked CPU tensor engine.
+    ///
+    /// This prepares the single-token position-zero forward path. It does not
+    /// load tokenizer tables or allocate a KV cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a required tensor cannot be materialized as F32.
+    pub fn load_cpu(&self) -> Result<LlamaCpuModel, LlamaError> {
+        LlamaCpuModel::load(self)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LayerWeights {
+    attn_norm: Tensor,
+    attn_q: Tensor,
+    attn_k: Tensor,
+    attn_v: Tensor,
+    attn_output: Tensor,
+    ffn_norm: Tensor,
+    ffn_gate: Tensor,
+    ffn_down: Tensor,
+    ffn_up: Tensor,
+}
+
+/// A CPU-resident Llama model for a checked single-token forward pass.
+///
+/// The current execution contract intentionally covers position zero only.
+/// It is useful for validating tensor orientation and numerical execution
+/// before adding tokenizer, KV-cache, multi-token sampling, and Apple GPU
+/// kernels.
+#[derive(Debug, Clone)]
+pub struct LlamaCpuModel {
+    config: LlamaConfig,
+    token_embedding: Tensor,
+    output: Tensor,
+    output_norm: Tensor,
+    layers: Vec<LayerWeights>,
+}
+
+impl LlamaCpuModel {
+    fn load(model: &LlamaModel) -> Result<Self, LlamaError> {
+        let config = model.config.clone();
+        let load = |name: &str| model.model.load_f32(name).map_err(LlamaError::from);
+        let token_embedding = load("token_embd.weight")?;
+        let output = load("output.weight")?;
+        let output_norm = load("output_norm.weight")?;
+        let mut layers = Vec::with_capacity(config.block_count);
+        for layer in 0..config.block_count {
+            let prefix = format!("blk.{layer}");
+            layers.push(LayerWeights {
+                attn_norm: load(&format!("{prefix}.attn_norm.weight"))?,
+                attn_q: load(&format!("{prefix}.attn_q.weight"))?,
+                attn_k: load(&format!("{prefix}.attn_k.weight"))?,
+                attn_v: load(&format!("{prefix}.attn_v.weight"))?,
+                attn_output: load(&format!("{prefix}.attn_output.weight"))?,
+                ffn_norm: load(&format!("{prefix}.ffn_norm.weight"))?,
+                ffn_gate: load(&format!("{prefix}.ffn_gate.weight"))?,
+                ffn_down: load(&format!("{prefix}.ffn_down.weight"))?,
+                ffn_up: load(&format!("{prefix}.ffn_up.weight"))?,
+            });
+        }
+        Ok(Self {
+            config,
+            token_embedding,
+            output,
+            output_norm,
+            layers,
+        })
+    }
+
+    /// Returns the validated model configuration.
+    #[must_use]
+    pub const fn config(&self) -> &LlamaConfig {
+        &self.config
+    }
+
+    /// Runs one position-zero token through the CPU decoder and returns logits.
+    ///
+    /// Position zero makes rotary embedding an identity and single-token
+    /// attention has a one-element softmax. This method is a runtime smoke
+    /// path, not a complete text-generation API.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `token_id` is outside the vocabulary or a checked
+    /// tensor operation fails.
+    pub fn forward_token(&self, token_id: usize) -> Result<Vec<f32>, LlamaError> {
+        if token_id >= self.config.vocab_size {
+            return Err(LlamaError::InvalidConfig(format!(
+                "token id {token_id} is outside vocabulary size {}",
+                self.config.vocab_size
+            )));
+        }
+        let embedding_width = self.config.embedding_length;
+        let vocab_size = self.config.vocab_size;
+        let embedding = self.token_embedding.data();
+        let hidden = (0..embedding_width)
+            .map(|row| embedding[row * vocab_size + token_id])
+            .collect::<Vec<_>>();
+        let mut hidden = row_tensor(embedding_width, hidden)?;
+        let head_dim = embedding_width / self.config.head_count;
+        #[allow(clippy::cast_precision_loss)]
+        let attention_scale = (head_dim as f32).sqrt().recip();
+        for layer in &self.layers {
+            let normalized = hidden
+                .rms_norm(self.config.rms_norm_epsilon)?
+                .mul(&row_tensor(
+                    embedding_width,
+                    layer.attn_norm.data().to_vec(),
+                )?)?;
+            let query = normalized.matmul(&layer.attn_q)?;
+            let key = normalized.matmul(&layer.attn_k)?;
+            let value = normalized.matmul(&layer.attn_v)?;
+            let query_values = query.data();
+            let key_values = key.data();
+            let value_values = value.data();
+            let mut attended = vec![0.0; embedding_width];
+            let query_groups = self.config.head_count / self.config.head_count_kv;
+            for query_head in 0..self.config.head_count {
+                let kv_head = query_head / query_groups;
+                let query_start = query_head * head_dim;
+                let kv_start = kv_head * head_dim;
+                let mut score = 0.0_f32;
+                for offset in 0..head_dim {
+                    score += query_values[query_start + offset] * key_values[kv_start + offset];
+                }
+                if !(score * attention_scale).is_finite() {
+                    return Err(LlamaError::Tensor(
+                        "attention score is not finite".to_owned(),
+                    ));
+                }
+                attended[query_start..query_start + head_dim]
+                    .copy_from_slice(&value_values[kv_start..kv_start + head_dim]);
+            }
+            let attended = row_tensor(embedding_width, attended)?.matmul(&layer.attn_output)?;
+            hidden = hidden.add(&attended)?;
+            let normalized = hidden
+                .rms_norm(self.config.rms_norm_epsilon)?
+                .mul(&row_tensor(
+                    embedding_width,
+                    layer.ffn_norm.data().to_vec(),
+                )?)?;
+            let gate = normalized.matmul(&layer.ffn_gate)?.silu()?;
+            let up = normalized.matmul(&layer.ffn_up)?;
+            let feed_forward = gate.mul(&up)?.matmul(&layer.ffn_down)?;
+            hidden = hidden.add(&feed_forward)?;
+        }
+        let normalized = hidden
+            .rms_norm(self.config.rms_norm_epsilon)?
+            .mul(&row_tensor(
+                embedding_width,
+                self.output_norm.data().to_vec(),
+            )?)?;
+        Ok(normalized.matmul(&self.output)?.into_data())
+    }
+}
+
+fn row_tensor(width: usize, data: Vec<f32>) -> Result<Tensor, LlamaError> {
+    Tensor::from_data([1, width], data).map_err(LlamaError::from)
 }
 
 fn required_usize(model: &GgufModel, key: &'static str) -> Result<usize, LlamaError> {
@@ -526,6 +697,18 @@ mod tests {
         assert_eq!(model.config().context_length(), 16);
         assert_eq!(model.config().head_count_kv(), 1);
         assert_eq!(model.model().tensors().len(), 12);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn loads_cpu_model_and_runs_position_zero_forward() {
+        let path = write_fixture(&llama_fixture());
+        let model = LlamaModel::open(&path, 1 << 20).unwrap();
+        let cpu = model.load_cpu().unwrap();
+        let logits = cpu.forward_token(3).unwrap();
+        assert_eq!(logits, vec![0.0; 8]);
+        let result = cpu.forward_token(8);
+        assert!(matches!(result, Err(LlamaError::InvalidConfig(_))));
         fs::remove_file(path).unwrap();
     }
 

@@ -100,6 +100,7 @@ name = "llama-runtime"
 version = "0.1.0"
 dependencies = [
  "ggml-model",
+ "ggml-tensor",
 ]
 
 [[package]]
