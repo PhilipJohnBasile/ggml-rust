@@ -265,19 +265,45 @@ impl GgufModel {
     /// Returns an error when the model changed, the mapped bytes are invalid,
     /// or the requested metadata value is an array.
     pub fn metadata_scalar(&self, key: &str) -> Result<Option<MetadataScalar>, ModelError> {
-        let mapped = map_model(&self.path, self.max_file_bytes)?;
-        let bytes = mapped.as_bytes();
-        if digest_bytes(bytes) != self.digest {
-            return Err(ModelError::ContentChanged);
-        }
-        let gguf = Gguf::from_bytes(bytes).map_err(|error| ModelError::Parse(error.to_string()))?;
-        let Some(value) = gguf.metadata_value(key) else {
-            return Ok(None);
-        };
-        match value {
-            ggml_gguf::MetadataValue::Scalar(value) => Ok(Some(owned_scalar(*value))),
-            ggml_gguf::MetadataValue::Array(_) => Err(ModelError::MetadataArray(key.to_owned())),
-        }
+        self.with_validated_gguf(|gguf| {
+            let Some(value) = gguf.metadata_value(key) else {
+                return Ok(None);
+            };
+            match value {
+                ggml_gguf::MetadataValue::Scalar(value) => Ok(Some(owned_scalar(*value))),
+                ggml_gguf::MetadataValue::Array(_) => {
+                    Err(ModelError::MetadataArray(key.to_owned()))
+                }
+            }
+        })
+    }
+
+    /// Reads several scalar metadata values while enforcing the model digest
+    /// only once. Returned values preserve the order of `keys`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model changed, the mapped bytes are invalid,
+    /// or one of the requested metadata values is an array.
+    pub fn metadata_scalars(
+        &self,
+        keys: &[&str],
+    ) -> Result<Vec<Option<MetadataScalar>>, ModelError> {
+        self.with_validated_gguf(|gguf| {
+            keys.iter()
+                .map(|key| {
+                    let Some(value) = gguf.metadata_value(key) else {
+                        return Ok(None);
+                    };
+                    match value {
+                        ggml_gguf::MetadataValue::Scalar(value) => Ok(Some(owned_scalar(*value))),
+                        ggml_gguf::MetadataValue::Array(_) => {
+                            Err(ModelError::MetadataArray((*key).to_owned()))
+                        }
+                    }
+                })
+                .collect()
+        })
     }
 
     /// Reads a bounded string array from GGUF metadata while enforcing the model digest.
@@ -291,43 +317,39 @@ impl GgufModel {
         key: &str,
         max_elements: u64,
     ) -> Result<Option<Vec<String>>, ModelError> {
-        let mapped = map_model(&self.path, self.max_file_bytes)?;
-        let bytes = mapped.as_bytes();
-        if digest_bytes(bytes) != self.digest {
-            return Err(ModelError::ContentChanged);
-        }
-        let gguf = Gguf::from_bytes(bytes).map_err(|error| ModelError::Parse(error.to_string()))?;
-        let Some(value) = gguf.metadata_value(key) else {
-            return Ok(None);
-        };
-        let ggml_gguf::MetadataValue::Array(array) = value else {
-            return Err(ModelError::MetadataArray(key.to_owned()));
-        };
-        if array.element_type() != ggml_gguf::MetadataType::String {
-            return Err(ModelError::MetadataArrayType {
-                key: key.to_owned(),
-                expected: "String",
-                actual: format!("{:?}", array.element_type()),
-            });
-        }
-        let length = array.len();
-        if u64::try_from(length).unwrap_or(u64::MAX) > max_elements {
-            return Err(ModelError::MetadataArrayLimit {
-                key: key.to_owned(),
-                len: length,
-                max: max_elements,
-            });
-        }
-        let mut values = Vec::with_capacity(length);
-        for index in 0..length {
-            let Some(ggml_gguf::ScalarValue::String(value)) = array.get(index) else {
-                return Err(ModelError::Parse(format!(
-                    "GGUF metadata {key} string array contains an invalid element"
-                )));
+        self.with_validated_gguf(|gguf| {
+            let Some(value) = gguf.metadata_value(key) else {
+                return Ok(None);
             };
-            values.push(value.to_owned());
-        }
-        Ok(Some(values))
+            let ggml_gguf::MetadataValue::Array(array) = value else {
+                return Err(ModelError::MetadataArray(key.to_owned()));
+            };
+            if array.element_type() != ggml_gguf::MetadataType::String {
+                return Err(ModelError::MetadataArrayType {
+                    key: key.to_owned(),
+                    expected: "String",
+                    actual: format!("{:?}", array.element_type()),
+                });
+            }
+            let length = array.len();
+            if u64::try_from(length).unwrap_or(u64::MAX) > max_elements {
+                return Err(ModelError::MetadataArrayLimit {
+                    key: key.to_owned(),
+                    len: length,
+                    max: max_elements,
+                });
+            }
+            let mut values = Vec::with_capacity(length);
+            for index in 0..length {
+                let Some(ggml_gguf::ScalarValue::String(value)) = array.get(index) else {
+                    return Err(ModelError::Parse(format!(
+                        "GGUF metadata {key} string array contains an invalid element"
+                    )));
+                };
+                values.push(value.to_owned());
+            }
+            Ok(Some(values))
+        })
     }
 
     /// Reads a bounded F32 metadata array while enforcing the model digest.
@@ -341,48 +363,44 @@ impl GgufModel {
         key: &str,
         max_elements: u64,
     ) -> Result<Option<Vec<f32>>, ModelError> {
-        let mapped = map_model(&self.path, self.max_file_bytes)?;
-        let bytes = mapped.as_bytes();
-        if digest_bytes(bytes) != self.digest {
-            return Err(ModelError::ContentChanged);
-        }
-        let gguf = Gguf::from_bytes(bytes).map_err(|error| ModelError::Parse(error.to_string()))?;
-        let Some(value) = gguf.metadata_value(key) else {
-            return Ok(None);
-        };
-        let ggml_gguf::MetadataValue::Array(array) = value else {
-            return Err(ModelError::MetadataArray(key.to_owned()));
-        };
-        if array.element_type() != ggml_gguf::MetadataType::F32 {
-            return Err(ModelError::MetadataArrayType {
-                key: key.to_owned(),
-                expected: "F32",
-                actual: format!("{:?}", array.element_type()),
-            });
-        }
-        let length = array.len();
-        if u64::try_from(length).unwrap_or(u64::MAX) > max_elements {
-            return Err(ModelError::MetadataArrayLimit {
-                key: key.to_owned(),
-                len: length,
-                max: max_elements,
-            });
-        }
-        let mut values = Vec::with_capacity(length);
-        for index in 0..length {
-            let Some(ggml_gguf::ScalarValue::F32(value)) = array.get(index) else {
-                return Err(ModelError::Parse(format!(
-                    "GGUF metadata {key} F32 array contains an invalid element"
-                )));
+        self.with_validated_gguf(|gguf| {
+            let Some(value) = gguf.metadata_value(key) else {
+                return Ok(None);
             };
-            if !value.is_finite() {
-                return Err(ModelError::Parse(format!(
-                    "GGUF metadata {key} contains a non-finite value"
-                )));
+            let ggml_gguf::MetadataValue::Array(array) = value else {
+                return Err(ModelError::MetadataArray(key.to_owned()));
+            };
+            if array.element_type() != ggml_gguf::MetadataType::F32 {
+                return Err(ModelError::MetadataArrayType {
+                    key: key.to_owned(),
+                    expected: "F32",
+                    actual: format!("{:?}", array.element_type()),
+                });
             }
-            values.push(value);
-        }
-        Ok(Some(values))
+            let length = array.len();
+            if u64::try_from(length).unwrap_or(u64::MAX) > max_elements {
+                return Err(ModelError::MetadataArrayLimit {
+                    key: key.to_owned(),
+                    len: length,
+                    max: max_elements,
+                });
+            }
+            let mut values = Vec::with_capacity(length);
+            for index in 0..length {
+                let Some(ggml_gguf::ScalarValue::F32(value)) = array.get(index) else {
+                    return Err(ModelError::Parse(format!(
+                        "GGUF metadata {key} F32 array contains an invalid element"
+                    )));
+                };
+                if !value.is_finite() {
+                    return Err(ModelError::Parse(format!(
+                        "GGUF metadata {key} contains a non-finite value"
+                    )));
+                }
+                values.push(value);
+            }
+            Ok(Some(values))
+        })
     }
 
     /// Returns all indexed tensor descriptors in GGUF order.
@@ -399,7 +417,7 @@ impl GgufModel {
 
     /// Materializes one tensor as F32 values in the checked CPU tensor engine.
     ///
-    /// F32, F16, `Q4_0`, `Q4_K`, and `Q8_0` storage are supported. Quantized formats are
+    /// F32, F16, `Q4_0`, `Q4_K`, `Q6_K`, and `Q8_0` storage are supported. Quantized formats are
     /// decoded on the CPU into owned F32 values; the encoded bytes remain
     /// content-bound to the digest captured by [`Self::open`].
     ///
@@ -412,12 +430,7 @@ impl GgufModel {
         let descriptor = self
             .tensor(name)
             .ok_or_else(|| ModelError::TensorNotFound(name.to_owned()))?;
-        let mapped = map_model(&self.path, self.max_file_bytes)?;
-        let bytes = mapped.as_bytes();
-        if digest_bytes(bytes) != self.digest {
-            return Err(ModelError::ContentChanged);
-        }
-        Self::materialize_f32(bytes, descriptor)
+        self.with_validated_bytes(|bytes| Self::materialize_f32(bytes, descriptor))
     }
 
     /// Materializes several tensors as F32 values while mapping and hashing
@@ -479,8 +492,31 @@ impl GgufModel {
         Ok(())
     }
 
+    fn with_validated_gguf<F, T>(&self, callback: F) -> Result<T, ModelError>
+    where
+        F: FnOnce(&Gguf<'_>) -> Result<T, ModelError>,
+    {
+        self.with_validated_bytes(|bytes| {
+            let gguf =
+                Gguf::from_bytes(bytes).map_err(|error| ModelError::Parse(error.to_string()))?;
+            callback(&gguf)
+        })
+    }
+
+    fn with_validated_bytes<F, T>(&self, callback: F) -> Result<T, ModelError>
+    where
+        F: FnOnce(&[u8]) -> Result<T, ModelError>,
+    {
+        let mapped = map_model(&self.path, self.max_file_bytes)?;
+        let bytes = mapped.as_bytes();
+        if digest_bytes(bytes) != self.digest {
+            return Err(ModelError::ContentChanged);
+        }
+        callback(bytes)
+    }
+
     fn materialize_f32(bytes: &[u8], descriptor: &TensorDescriptor) -> Result<Tensor, ModelError> {
-        if !matches!(descriptor.value_type.raw(), 0 | 1 | 2 | 8 | 12) {
+        if !matches!(descriptor.value_type.raw(), 0 | 1 | 2 | 8 | 12 | 14) {
             return Err(ModelError::UnsupportedTensorType {
                 name: descriptor.name.clone(),
                 value_type: descriptor.value_type,
@@ -513,6 +549,7 @@ fn decode_values(value_type: TensorType, bytes: &[u8]) -> Result<Vec<f32>, Model
         2 => decode_q4_0(bytes),
         8 => decode_q8_0(bytes),
         12 => decode_q4_k(bytes),
+        14 => decode_q6_k(bytes),
         _ => Err(ModelError::UnsupportedTensorType {
             name: "<unknown>".to_owned(),
             value_type,
@@ -616,6 +653,66 @@ fn decode_q4_k(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
                     scale * f32::from(group_scale) * quantized_value
                         - min_scale * f32::from(group_min),
                 );
+            }
+        }
+    }
+    Ok(values)
+}
+
+fn decode_q6_k(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
+    const BLOCK_BYTES: usize = 210;
+    const BLOCK_VALUES: usize = 256;
+    let (blocks, remainder) = bytes.as_chunks::<BLOCK_BYTES>();
+    if !remainder.is_empty() {
+        return Err(ModelError::Shape(
+            "Q6_K tensor byte length is not block aligned".to_owned(),
+        ));
+    }
+    let mut values = vec![0.0; blocks.len() * BLOCK_VALUES];
+    for (block_index, block) in blocks.iter().enumerate() {
+        let scale = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+        let ql = &block[..128];
+        let qh = &block[128..192];
+        let scales = &block[192..208];
+        let output = &mut values[block_index * BLOCK_VALUES..(block_index + 1) * BLOCK_VALUES];
+        for chunk in 0..2 {
+            let output_offset = chunk * 128;
+            let low_offset = chunk * 64;
+            let high_offset = chunk * 32;
+            let scale_offset = chunk * 8;
+            for l in 0..32 {
+                let sub_block = l / 16;
+                let q1 =
+                    i8::try_from((ql[low_offset + l] & 0x0f) | ((qh[high_offset + l] & 0x03) << 4))
+                        .unwrap_or_default()
+                        - 32;
+                let q2 = i8::try_from(
+                    (ql[low_offset + l + 32] & 0x0f) | (((qh[high_offset + l] >> 2) & 0x03) << 4),
+                )
+                .unwrap_or_default()
+                    - 32;
+                let q3 = i8::try_from(
+                    (ql[low_offset + l] >> 4) | (((qh[high_offset + l] >> 4) & 0x03) << 4),
+                )
+                .unwrap_or_default()
+                    - 32;
+                let q4 = i8::try_from(
+                    (ql[low_offset + l + 32] >> 4) | (((qh[high_offset + l] >> 6) & 0x03) << 4),
+                )
+                .unwrap_or_default()
+                    - 32;
+                let scale_1 =
+                    scale * f32::from(i8::from_ne_bytes([scales[scale_offset + sub_block]]));
+                let scale_2 =
+                    scale * f32::from(i8::from_ne_bytes([scales[scale_offset + sub_block + 2]]));
+                let scale_3 =
+                    scale * f32::from(i8::from_ne_bytes([scales[scale_offset + sub_block + 4]]));
+                let scale_4 =
+                    scale * f32::from(i8::from_ne_bytes([scales[scale_offset + sub_block + 6]]));
+                output[output_offset + l] = scale_1 * f32::from(q1);
+                output[output_offset + l + 32] = scale_2 * f32::from(q2);
+                output[output_offset + l + 64] = scale_3 * f32::from(q3);
+                output[output_offset + l + 96] = scale_4 * f32::from(q4);
             }
         }
     }
@@ -775,6 +872,16 @@ mod tests {
             model.metadata_scalar("general.name").unwrap(),
             Some(MetadataScalar::String("fixture".to_owned()))
         );
+        assert_eq!(
+            model
+                .metadata_scalars(&["general.architecture", "general.name", "missing"])
+                .unwrap(),
+            vec![
+                Some(MetadataScalar::String("llama".to_owned())),
+                Some(MetadataScalar::String("fixture".to_owned())),
+                None,
+            ]
+        );
         assert_eq!(model.tensors().len(), 1);
         assert_eq!(model.tensor("probe.tensor").unwrap().shape(), &[2, 2]);
         assert_eq!(model.load_f32("probe.tensor").unwrap().data(), &values);
@@ -841,6 +948,20 @@ mod tests {
                     .all(|value| value.to_bits() == expected.to_bits())
             );
         }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn materializes_q6_k_tensor() {
+        let mut encoded = vec![0_u8; 210];
+        encoded[192..208].fill(1);
+        encoded[208..210].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        let path = write_fixture(&fixture(14, &[256], &encoded));
+        let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
+        assert_eq!(
+            model.load_f32("probe.tensor").unwrap().data(),
+            &[-32.0; 256]
+        );
         fs::remove_file(path).unwrap();
     }
 

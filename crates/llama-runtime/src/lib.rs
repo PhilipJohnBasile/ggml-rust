@@ -65,17 +65,31 @@ impl LlamaConfig {
                 model.architecture().unwrap_or("missing").to_owned(),
             ));
         }
-        let context_length = required_usize(model, "llama.context_length")?;
-        let embedding_length = required_usize(model, "llama.embedding_length")?;
-        let block_count = required_usize(model, "llama.block_count")?;
-        let head_count = required_usize(model, "llama.attention.head_count")?;
+        let keys = [
+            "llama.context_length",
+            "llama.embedding_length",
+            "llama.block_count",
+            "llama.attention.head_count",
+            "llama.attention.head_count_kv",
+            "llama.feed_forward_length",
+            "llama.vocab_size",
+            "llama.attention.layer_norm_rms_epsilon",
+            "llama.rope.freq_base",
+        ];
+        let values = model.metadata_scalars(&keys)?;
+        let mut values = values.into_iter();
+        let context_length = required_usize_value(values.next().flatten(), keys[0])?;
+        let embedding_length = required_usize_value(values.next().flatten(), keys[1])?;
+        let block_count = required_usize_value(values.next().flatten(), keys[2])?;
+        let head_count = required_usize_value(values.next().flatten(), keys[3])?;
         let head_count_kv =
-            optional_usize(model, "llama.attention.head_count_kv")?.unwrap_or(head_count);
-        let feed_forward_length = required_usize(model, "llama.feed_forward_length")?;
-        let vocab_size = required_usize(model, "llama.vocab_size")?;
+            optional_usize_value(values.next().flatten(), keys[4])?.unwrap_or(head_count);
+        let feed_forward_length = required_usize_value(values.next().flatten(), keys[5])?;
+        let vocab_size = required_usize_value(values.next().flatten(), keys[6])?;
         let rms_norm_epsilon =
-            optional_f32(model, "llama.attention.layer_norm_rms_epsilon")?.unwrap_or(1.0e-5);
-        let rope_freq_base = optional_f32(model, "llama.rope.freq_base")?.unwrap_or(10_000.0);
+            optional_f32_value(values.next().flatten(), keys[7])?.unwrap_or(1.0e-5);
+        let rope_freq_base =
+            optional_f32_value(values.next().flatten(), keys[8])?.unwrap_or(10_000.0);
         Self::new(
             context_length,
             embedding_length,
@@ -356,9 +370,19 @@ impl LlamaTokenizer {
                 value: format!("{} scores, expected {}", scores.len(), tokens.len()),
             });
         }
-        let bos_token_id = optional_usize(model, "tokenizer.ggml.bos_token_id")?;
-        let eos_token_id = optional_usize(model, "tokenizer.ggml.eos_token_id")?;
-        let unk_token_id = optional_usize(model, "tokenizer.ggml.unknown_token_id")?;
+        let token_id_keys = [
+            "tokenizer.ggml.bos_token_id",
+            "tokenizer.ggml.eos_token_id",
+            "tokenizer.ggml.unknown_token_id",
+        ];
+        let token_id_values = model.metadata_scalars(&token_id_keys)?;
+        let mut token_id_values = token_id_values.into_iter();
+        let bos_token_id =
+            optional_usize_value(token_id_values.next().flatten(), token_id_keys[0])?;
+        let eos_token_id =
+            optional_usize_value(token_id_values.next().flatten(), token_id_keys[1])?;
+        let unk_token_id =
+            optional_usize_value(token_id_values.next().flatten(), token_id_keys[2])?;
         for (name, value) in [
             ("tokenizer.ggml.bos_token_id", bos_token_id),
             ("tokenizer.ggml.eos_token_id", eos_token_id),
@@ -574,28 +598,62 @@ pub struct LlamaCpuModel {
 impl LlamaCpuModel {
     fn load(model: &LlamaModel) -> Result<Self, LlamaError> {
         let config = model.config.clone();
-        let load = |name: &str| model.model.load_f32(name).map_err(LlamaError::from);
         let tokenizer = match model.tokenizer() {
             Ok(tokenizer) => Some(tokenizer),
             Err(LlamaError::MissingMetadata("tokenizer.ggml.tokens")) => None,
             Err(error) => return Err(error),
         };
-        let token_embedding = load("token_embd.weight")?;
-        let output = load("output.weight")?;
-        let output_norm = load("output_norm.weight")?;
+        let mut names = vec![
+            "token_embd.weight".to_owned(),
+            "output.weight".to_owned(),
+            "output_norm.weight".to_owned(),
+        ];
+        for layer in 0..config.block_count {
+            let prefix = format!("blk.{layer}");
+            for suffix in [
+                "attn_norm.weight",
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_output.weight",
+                "ffn_norm.weight",
+                "ffn_gate.weight",
+                "ffn_down.weight",
+                "ffn_up.weight",
+            ] {
+                names.push(format!("{prefix}.{suffix}"));
+            }
+        }
+        let name_refs = names.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut loaded = (0..names.len())
+            .map(|_| None)
+            .collect::<Vec<Option<Tensor>>>();
+        let mut next = 0;
+        model.model.for_each_f32(&name_refs, |_name, tensor| {
+            let slot = loaded.get_mut(next).ok_or_else(|| {
+                LlamaError::Tensor("GGUF loader returned an unexpected tensor".to_owned())
+            })?;
+            *slot = Some(tensor);
+            next += 1;
+            Ok::<(), LlamaError>(())
+        })?;
+        let mut loaded = loaded.into_iter();
+        let token_embedding = next_tensor(&mut loaded, "token_embd.weight")?;
+        let output = next_tensor(&mut loaded, "output.weight")?;
+        let output_norm = next_tensor(&mut loaded, "output_norm.weight")?;
         let mut layers = Vec::with_capacity(config.block_count);
         for layer in 0..config.block_count {
             let prefix = format!("blk.{layer}");
             layers.push(LayerWeights {
-                attn_norm: load(&format!("{prefix}.attn_norm.weight"))?,
-                attn_q: load(&format!("{prefix}.attn_q.weight"))?,
-                attn_k: load(&format!("{prefix}.attn_k.weight"))?,
-                attn_v: load(&format!("{prefix}.attn_v.weight"))?,
-                attn_output: load(&format!("{prefix}.attn_output.weight"))?,
-                ffn_norm: load(&format!("{prefix}.ffn_norm.weight"))?,
-                ffn_gate: load(&format!("{prefix}.ffn_gate.weight"))?,
-                ffn_down: load(&format!("{prefix}.ffn_down.weight"))?,
-                ffn_up: load(&format!("{prefix}.ffn_up.weight"))?,
+                attn_norm: next_tensor(&mut loaded, &format!("{prefix}.attn_norm.weight"))?,
+                attn_q: next_tensor(&mut loaded, &format!("{prefix}.attn_q.weight"))?,
+                attn_k: next_tensor(&mut loaded, &format!("{prefix}.attn_k.weight"))?,
+                attn_v: next_tensor(&mut loaded, &format!("{prefix}.attn_v.weight"))?,
+                attn_output: next_tensor(&mut loaded, &format!("{prefix}.attn_output.weight"))?,
+                ffn_norm: next_tensor(&mut loaded, &format!("{prefix}.ffn_norm.weight"))?,
+                ffn_gate: next_tensor(&mut loaded, &format!("{prefix}.ffn_gate.weight"))?,
+                ffn_down: next_tensor(&mut loaded, &format!("{prefix}.ffn_down.weight"))?,
+                ffn_up: next_tensor(&mut loaded, &format!("{prefix}.ffn_up.weight"))?,
             });
         }
         Ok(Self {
@@ -1009,25 +1067,40 @@ fn row_tensor(width: usize, data: Vec<f32>) -> Result<Tensor, LlamaError> {
     Tensor::from_data([1, width], data).map_err(LlamaError::from)
 }
 
-fn required_usize(model: &GgufModel, key: &'static str) -> Result<usize, LlamaError> {
-    let value = model
-        .metadata_scalar(key)?
-        .ok_or(LlamaError::MissingMetadata(key))?;
+fn required_usize_value(
+    value: Option<MetadataScalar>,
+    key: &'static str,
+) -> Result<usize, LlamaError> {
+    let value = value.ok_or(LlamaError::MissingMetadata(key))?;
     as_usize(value).map_err(|value| LlamaError::InvalidMetadata { key, value })
 }
 
-fn optional_usize(model: &GgufModel, key: &'static str) -> Result<Option<usize>, LlamaError> {
-    model
-        .metadata_scalar(key)?
+fn optional_usize_value(
+    value: Option<MetadataScalar>,
+    key: &'static str,
+) -> Result<Option<usize>, LlamaError> {
+    value
         .map(|value| as_usize(value).map_err(|value| LlamaError::InvalidMetadata { key, value }))
         .transpose()
 }
 
-fn optional_f32(model: &GgufModel, key: &'static str) -> Result<Option<f32>, LlamaError> {
-    model
-        .metadata_scalar(key)?
+fn optional_f32_value(
+    value: Option<MetadataScalar>,
+    key: &'static str,
+) -> Result<Option<f32>, LlamaError> {
+    value
         .map(|value| as_f32(value).map_err(|value| LlamaError::InvalidMetadata { key, value }))
         .transpose()
+}
+
+fn next_tensor(
+    tensors: &mut impl Iterator<Item = Option<Tensor>>,
+    name: &str,
+) -> Result<Tensor, LlamaError> {
+    tensors
+        .next()
+        .flatten()
+        .ok_or_else(|| LlamaError::Tensor(format!("GGUF loader did not return {name}")))
 }
 
 fn as_usize(value: MetadataScalar) -> Result<usize, String> {
