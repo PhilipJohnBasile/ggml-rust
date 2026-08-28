@@ -223,18 +223,22 @@ impl GgufModel {
         self.tensors.iter().find(|tensor| tensor.name == name)
     }
 
-    /// Materializes one F32 tensor into the checked CPU tensor engine.
+    /// Materializes one tensor as F32 values in the checked CPU tensor engine.
+    ///
+    /// F32, F16, `Q4_0`, and `Q8_0` storage are supported. Quantized formats are
+    /// decoded on the CPU into owned F32 values; the encoded bytes remain
+    /// content-bound to the digest captured by [`Self::open`].
     ///
     /// # Errors
     ///
-    /// Returns an error when the tensor is missing or non-F32, the model bytes
-    /// changed, the tensor range is invalid, or the shape does not match the
-    /// decoded F32 values.
+    /// Returns an error when the tensor is missing or uses an unsupported
+    /// storage type, the model bytes changed, the tensor range is invalid, or
+    /// the shape does not match the decoded values.
     pub fn load_f32(&self, name: &str) -> Result<Tensor, ModelError> {
         let descriptor = self
             .tensor(name)
             .ok_or_else(|| ModelError::TensorNotFound(name.to_owned()))?;
-        if descriptor.value_type.raw() != 0 {
+        if !matches!(descriptor.value_type.raw(), 0 | 1 | 2 | 8) {
             return Err(ModelError::UnsupportedTensorType {
                 name: name.to_owned(),
                 value_type: descriptor.value_type,
@@ -255,19 +259,122 @@ impl GgufModel {
         let tensor_bytes = bytes
             .get(start..end)
             .ok_or_else(|| ModelError::Parse("tensor range is outside the file".to_owned()))?;
-        let (chunks, remainder) = tensor_bytes.as_chunks::<4>();
-        if !remainder.is_empty() {
-            return Err(ModelError::Shape(
-                "F32 tensor byte length is not aligned".to_owned(),
-            ));
-        }
-        let values = chunks
-            .iter()
-            .map(|chunk| f32::from_le_bytes(*chunk))
-            .collect::<Vec<_>>();
-        Tensor::from_data(descriptor.shape.clone(), values)
-            .map_err(|error| ModelError::Shape(error.to_string()))
+        let values = decode_values(descriptor.value_type, tensor_bytes)?;
+        let tensor = Tensor::from_data(descriptor.shape.clone(), values)
+            .map_err(|error| ModelError::Shape(error.to_string()))?;
+        tensor
+            .validate_finite()
+            .map_err(|error| ModelError::Shape(error.to_string()))?;
+        Ok(tensor)
     }
+}
+
+fn decode_values(value_type: TensorType, bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
+    match value_type.raw() {
+        0 => decode_f32(bytes),
+        1 => decode_f16(bytes),
+        2 => decode_q4_0(bytes),
+        8 => decode_q8_0(bytes),
+        _ => Err(ModelError::UnsupportedTensorType {
+            name: "<unknown>".to_owned(),
+            value_type,
+        }),
+    }
+}
+
+fn decode_f32(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
+    let (chunks, remainder) = bytes.as_chunks::<4>();
+    if !remainder.is_empty() {
+        return Err(ModelError::Shape(
+            "F32 tensor byte length is not aligned".to_owned(),
+        ));
+    }
+    Ok(chunks
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
+        .collect())
+}
+
+fn decode_f16(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
+    let (chunks, remainder) = bytes.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(ModelError::Shape(
+            "F16 tensor byte length is not aligned".to_owned(),
+        ));
+    }
+    Ok(chunks
+        .iter()
+        .map(|chunk| f16_to_f32(u16::from_le_bytes(*chunk)))
+        .collect())
+}
+
+fn decode_q4_0(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
+    const BLOCK_BYTES: usize = 18;
+    const BLOCK_VALUES: usize = 32;
+    let (blocks, remainder) = bytes.as_chunks::<BLOCK_BYTES>();
+    if !remainder.is_empty() {
+        return Err(ModelError::Shape(
+            "Q4_0 tensor byte length is not block aligned".to_owned(),
+        ));
+    }
+    let mut values = Vec::with_capacity(blocks.len() * BLOCK_VALUES);
+    for block in blocks {
+        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        for index in 0..16 {
+            let packed = block[2 + index];
+            values.push((f32::from(packed & 0x0f) - 8.0) * scale);
+        }
+        for index in 0..16 {
+            let packed = block[2 + index];
+            values.push((f32::from(packed >> 4) - 8.0) * scale);
+        }
+    }
+    Ok(values)
+}
+
+fn decode_q8_0(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
+    const BLOCK_BYTES: usize = 34;
+    const BLOCK_VALUES: usize = 32;
+    let (blocks, remainder) = bytes.as_chunks::<BLOCK_BYTES>();
+    if !remainder.is_empty() {
+        return Err(ModelError::Shape(
+            "Q8_0 tensor byte length is not block aligned".to_owned(),
+        ));
+    }
+    let mut values = Vec::with_capacity(blocks.len() * BLOCK_VALUES);
+    for block in blocks {
+        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        values.extend(
+            block[2..]
+                .iter()
+                .map(|value| f32::from(i8::from_ne_bytes([*value])) * scale),
+        );
+    }
+    Ok(values)
+}
+
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = (u32::from(bits & 0x8000)) << 16;
+    let exponent = u32::from((bits >> 10) & 0x1f);
+    let fraction = u32::from(bits & 0x03ff);
+    let value = match exponent {
+        0 => {
+            if fraction == 0 {
+                sign
+            } else {
+                let mut fraction = fraction;
+                let mut exponent = 127 - 14;
+                while fraction & 0x0400 == 0 {
+                    fraction <<= 1;
+                    exponent -= 1;
+                }
+                sign | (exponent << 23) | ((fraction & 0x03ff) << 13)
+            }
+        }
+        0x1f => sign | 0x7f80_0000 | (fraction << 13),
+        exponent => sign | ((exponent + 112) << 23) | (fraction << 13),
+    };
+    f32::from_bits(value)
 }
 
 #[allow(unsafe_code)]
@@ -316,7 +423,7 @@ mod tests {
         bytes.extend_from_slice(value.as_bytes());
     }
 
-    fn f32_fixture(value_type: u32, tensor_bytes: &[u8]) -> Vec<u8> {
+    fn fixture(value_type: u32, shape: &[u64], tensor_bytes: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"GGUF");
         bytes.extend_from_slice(&3_u32.to_le_bytes());
@@ -329,9 +436,10 @@ mod tests {
         bytes.extend_from_slice(&8_u32.to_le_bytes());
         push_string(&mut bytes, "fixture");
         push_string(&mut bytes, "probe.tensor");
-        bytes.extend_from_slice(&2_u32.to_le_bytes());
-        bytes.extend_from_slice(&2_u64.to_le_bytes());
-        bytes.extend_from_slice(&2_u64.to_le_bytes());
+        bytes.extend_from_slice(&u32::try_from(shape.len()).unwrap().to_le_bytes());
+        for dimension in shape {
+            bytes.extend_from_slice(&dimension.to_le_bytes());
+        }
         bytes.extend_from_slice(&value_type.to_le_bytes());
         bytes.extend_from_slice(&0_u64.to_le_bytes());
         while bytes.len() % 32 != 0 {
@@ -342,6 +450,10 @@ mod tests {
             bytes.push(0);
         }
         bytes
+    }
+
+    fn f32_fixture(value_type: u32, tensor_bytes: &[u8]) -> Vec<u8> {
+        fixture(value_type, &[2, 2], tensor_bytes)
     }
 
     fn write_fixture(bytes: &[u8]) -> PathBuf {
@@ -369,8 +481,45 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_f32_tensor_materialization() {
-        let path = write_fixture(&f32_fixture(1, &[0; 8]));
+    fn materializes_f16_tensor() {
+        let encoded = [0x00, 0x3c, 0x00, 0xc0, 0x00, 0x40, 0x00, 0x44];
+        let path = write_fixture(&f32_fixture(1, &encoded));
+        let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
+        assert_eq!(
+            model.load_f32("probe.tensor").unwrap().data(),
+            &[1.0, -2.0, 2.0, 4.0]
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn materializes_q4_0_tensor() {
+        let mut encoded = vec![0x00, 0x3c];
+        encoded.extend(std::iter::repeat_n(0x78, 16));
+        let path = write_fixture(&fixture(2, &[32], &encoded));
+        let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
+        let values = model.load_f32("probe.tensor").unwrap();
+        assert_eq!(&values.data()[..16], &[0.0; 16]);
+        assert_eq!(&values.data()[16..], &[-1.0; 16]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn materializes_q8_0_tensor() {
+        let mut encoded = vec![0x00, 0x3c];
+        encoded.extend((0_u8..32).map(|value| value.wrapping_add(0x80)));
+        let path = write_fixture(&fixture(8, &[32], &encoded));
+        let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
+        let values = model.load_f32("probe.tensor").unwrap();
+        assert_eq!(values.data()[0].to_bits(), (-128.0_f32).to_bits());
+        assert_eq!(values.data()[1].to_bits(), (-127.0_f32).to_bits());
+        assert_eq!(values.data()[31].to_bits(), (-97.0_f32).to_bits());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_unsupported_tensor_materialization() {
+        let path = write_fixture(&fixture(3, &[32], &[0; 20]));
         let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
         assert!(matches!(
             model.load_f32("probe.tensor"),
