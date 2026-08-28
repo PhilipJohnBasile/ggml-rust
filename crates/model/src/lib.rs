@@ -418,7 +418,7 @@ impl GgufModel {
     /// Materializes one tensor as F32 values in the checked CPU tensor engine.
     ///
     /// F32, F16, `Q4_0`, `Q5_0`, `Q5_1`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`,
-    /// `Q6_K`, and `Q8_0` storage are supported. Quantized formats are
+    /// `Q6_K`, `Q8_0`, and `Q8_K` storage are supported. Quantized formats are
     /// decoded on the CPU into owned F32 values; the encoded bytes remain
     /// content-bound to the digest captured by [`Self::open`].
     ///
@@ -519,7 +519,7 @@ impl GgufModel {
     fn materialize_f32(bytes: &[u8], descriptor: &TensorDescriptor) -> Result<Tensor, ModelError> {
         if !matches!(
             descriptor.value_type.raw(),
-            0 | 1 | 2 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14
+            0 | 1 | 2 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15
         ) {
             return Err(ModelError::UnsupportedTensorType {
                 name: descriptor.name.clone(),
@@ -559,6 +559,7 @@ fn decode_values(value_type: TensorType, bytes: &[u8]) -> Result<Vec<f32>, Model
         12 => decode_q4_k(bytes),
         13 => decode_q5_k(bytes),
         14 => decode_q6_k(bytes),
+        15 => decode_q8_k(bytes),
         _ => Err(ModelError::UnsupportedTensorType {
             name: "<unknown>".to_owned(),
             value_type,
@@ -889,6 +890,27 @@ fn decode_q6_k(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
     Ok(values)
 }
 
+fn decode_q8_k(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
+    const BLOCK_BYTES: usize = 292;
+    const BLOCK_VALUES: usize = 256;
+    let (blocks, remainder) = bytes.as_chunks::<BLOCK_BYTES>();
+    if !remainder.is_empty() {
+        return Err(ModelError::Shape(
+            "Q8_K tensor byte length is not block aligned".to_owned(),
+        ));
+    }
+    let mut values = Vec::with_capacity(blocks.len() * BLOCK_VALUES);
+    for block in blocks {
+        let scale = f32::from_le_bytes([block[0], block[1], block[2], block[3]]);
+        values.extend(
+            block[4..260]
+                .iter()
+                .map(|value| scale * f32::from(i8::from_ne_bytes([*value]))),
+        );
+    }
+    Ok(values)
+}
+
 fn q4_k_scale_min(group: usize, scales: &[u8]) -> (u8, u8) {
     if group < 4 {
         (scales[group] & 0x3f, scales[group + 4] & 0x3f)
@@ -1098,6 +1120,20 @@ mod tests {
         assert_eq!(values.data()[0].to_bits(), (-128.0_f32).to_bits());
         assert_eq!(values.data()[1].to_bits(), (-127.0_f32).to_bits());
         assert_eq!(values.data()[31].to_bits(), (-97.0_f32).to_bits());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn materializes_q8_k_tensor() {
+        let mut encoded = 1.0_f32.to_le_bytes().to_vec();
+        encoded.extend((0_u8..=255).map(|value| value.wrapping_add(0x80)));
+        encoded.extend(std::iter::repeat_n(0_u8, 32));
+        let path = write_fixture(&fixture(15, &[256], &encoded));
+        let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
+        let values = model.load_f32("probe.tensor").unwrap();
+        assert_eq!(values.data()[0].to_bits(), (-128.0_f32).to_bits());
+        assert_eq!(values.data()[1].to_bits(), (-127.0_f32).to_bits());
+        assert_eq!(values.data()[255].to_bits(), 127.0_f32.to_bits());
         fs::remove_file(path).unwrap();
     }
 
