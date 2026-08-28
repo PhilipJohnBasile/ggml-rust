@@ -1352,16 +1352,16 @@ mod tests {
     #[test]
     fn multiplies_q8_0_matrix_without_materializing_f32_values() {
         let mut encoded = vec![0x00, 0x3c];
-        encoded.extend(std::iter::repeat_n(1_u8, 32));
+        encoded.extend((-16_i8..16_i8).map(|value| value.to_ne_bytes()[0]));
         encoded.extend([0x00, 0x3c]);
-        encoded.extend(std::iter::repeat_n(2_u8, 32));
+        encoded.extend((16_i8..48_i8).map(|value| value.to_ne_bytes()[0]));
         let path = write_fixture(&fixture(8, &[32, 2], &encoded));
         let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
         assert_eq!(
             model
                 .matmul_f32_quantized("probe.tensor", &[1.0; 32])
                 .unwrap(),
-            &[32.0, 64.0]
+            &[-16.0, 1008.0]
         );
         fs::remove_file(path).unwrap();
     }
