@@ -455,6 +455,108 @@ impl GgufModel {
         Ok(tensors)
     }
 
+    /// Computes a row-vector matrix product directly from a quantized GGUF
+    /// matrix without materializing the matrix as F32 values.
+    ///
+    /// The input must have the length of the descriptor's first dimension.
+    /// GGML stores matrix values in column-major tensor order, so each output
+    /// column is decoded and dotted against the input row. `Q4_0` and
+    /// `Q8_0` are supported initially because their fixed 32-value blocks can
+    /// be addressed without allocating a temporary tensor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tensor is not a rank-2 `Q4_0` or `Q8_0`
+    /// matrix, dimensions or block alignment are invalid, model bytes have
+    /// changed, or a numerical result is non-finite.
+    pub fn matmul_f32_quantized(&self, name: &str, input: &[f32]) -> Result<Vec<f32>, ModelError> {
+        let descriptor = self
+            .tensor(name)
+            .ok_or_else(|| ModelError::TensorNotFound(name.to_owned()))?;
+        let (rows, columns) = match descriptor.shape.as_slice() {
+            [rows, columns] => (*rows, *columns),
+            shape => {
+                return Err(ModelError::Shape(format!(
+                    "quantized matmul requires a rank-2 matrix, got {shape:?}"
+                )));
+            }
+        };
+        if input.len() != rows {
+            return Err(ModelError::Shape(format!(
+                "quantized matmul input has {} values, expected {rows}",
+                input.len()
+            )));
+        }
+        if input.iter().any(|value| !value.is_finite()) {
+            return Err(ModelError::Shape(
+                "quantized matmul input contains a non-finite value".to_owned(),
+            ));
+        }
+        if !rows.is_multiple_of(32) {
+            return Err(ModelError::Shape(
+                "quantized matmul rows must be a multiple of 32".to_owned(),
+            ));
+        }
+        let block_bytes = match descriptor.value_type.raw() {
+            2 => 18,
+            8 => 34,
+            _ => {
+                return Err(ModelError::UnsupportedTensorType {
+                    name: descriptor.name.clone(),
+                    value_type: descriptor.value_type,
+                });
+            }
+        };
+        let expected_bytes = rows
+            .checked_mul(columns)
+            .and_then(|elements| elements.checked_div(32))
+            .and_then(|blocks| blocks.checked_mul(block_bytes))
+            .ok_or_else(|| {
+                ModelError::Shape("quantized matrix byte length overflows".to_owned())
+            })?;
+        if usize::try_from(descriptor.byte_len).ok() != Some(expected_bytes) {
+            return Err(ModelError::Shape(format!(
+                "quantized matrix byte length {}, expected {expected_bytes}",
+                descriptor.byte_len
+            )));
+        }
+        self.with_validated_bytes(|bytes| {
+            let start = usize::try_from(descriptor.byte_offset)
+                .map_err(|_| ModelError::Shape("tensor offset exceeds usize".to_owned()))?;
+            let end = start
+                .checked_add(expected_bytes)
+                .ok_or_else(|| ModelError::Shape("tensor range overflows usize".to_owned()))?;
+            let tensor_bytes = bytes
+                .get(start..end)
+                .ok_or_else(|| ModelError::Parse("tensor range is outside the file".to_owned()))?;
+            let mut output = Vec::with_capacity(columns);
+            for column in 0..columns {
+                let mut sum = 0.0_f32;
+                for (row, &value) in input.iter().enumerate() {
+                    let flat_index = column
+                        .checked_mul(rows)
+                        .and_then(|base| base.checked_add(row))
+                        .ok_or_else(|| {
+                            ModelError::Shape("quantized matrix index overflows".to_owned())
+                        })?;
+                    let weight = match descriptor.value_type.raw() {
+                        2 => q4_0_value_at(tensor_bytes, flat_index),
+                        8 => q8_0_value_at(tensor_bytes, flat_index),
+                        _ => unreachable!("value type validated above"),
+                    }?;
+                    sum += value * weight;
+                    if !sum.is_finite() {
+                        return Err(ModelError::Shape(
+                            "quantized matmul produced a non-finite value".to_owned(),
+                        ));
+                    }
+                }
+                output.push(sum);
+            }
+            Ok(output)
+        })
+    }
+
     /// Materializes several tensors as F32 values from one validated mapping,
     /// invoking `callback` after each tensor so callers can release host data
     /// before the next tensor is decoded.
@@ -678,6 +780,44 @@ fn decode_q8_0(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
         );
     }
     Ok(values)
+}
+
+fn q4_0_value_at(bytes: &[u8], index: usize) -> Result<f32, ModelError> {
+    let block = index / 32;
+    let offset = index % 32;
+    let start = block
+        .checked_mul(18)
+        .ok_or_else(|| ModelError::Shape("Q4_0 index overflows".to_owned()))?;
+    let end = start
+        .checked_add(18)
+        .ok_or_else(|| ModelError::Shape("Q4_0 block range overflows".to_owned()))?;
+    let block = bytes
+        .get(start..end)
+        .ok_or_else(|| ModelError::Shape("Q4_0 block is outside the tensor".to_owned()))?;
+    let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let packed = block[2 + offset % 16];
+    let quantized = if offset < 16 {
+        packed & 0x0f
+    } else {
+        packed >> 4
+    };
+    Ok((f32::from(quantized) - 8.0) * scale)
+}
+
+fn q8_0_value_at(bytes: &[u8], index: usize) -> Result<f32, ModelError> {
+    let block = index / 32;
+    let offset = index % 32;
+    let start = block
+        .checked_mul(34)
+        .ok_or_else(|| ModelError::Shape("Q8_0 index overflows".to_owned()))?;
+    let end = start
+        .checked_add(34)
+        .ok_or_else(|| ModelError::Shape("Q8_0 block range overflows".to_owned()))?;
+    let block = bytes
+        .get(start..end)
+        .ok_or_else(|| ModelError::Shape("Q8_0 block is outside the tensor".to_owned()))?;
+    let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    Ok(f32::from(i8::from_ne_bytes([block[2 + offset]])) * scale)
 }
 
 fn decode_q5_0(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
@@ -1189,6 +1329,53 @@ mod tests {
         assert_eq!(values.data()[0].to_bits(), (-128.0_f32).to_bits());
         assert_eq!(values.data()[1].to_bits(), (-127.0_f32).to_bits());
         assert_eq!(values.data()[31].to_bits(), (-97.0_f32).to_bits());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn multiplies_q4_0_matrix_without_materializing_f32_values() {
+        let mut encoded = vec![0x00, 0x3c];
+        encoded.extend(std::iter::repeat_n(0x99, 16));
+        encoded.extend([0x00, 0x3c]);
+        encoded.extend(std::iter::repeat_n(0xaa, 16));
+        let path = write_fixture(&fixture(2, &[32, 2], &encoded));
+        let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
+        assert_eq!(
+            model
+                .matmul_f32_quantized("probe.tensor", &[1.0; 32])
+                .unwrap(),
+            &[32.0, 64.0]
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn multiplies_q8_0_matrix_without_materializing_f32_values() {
+        let mut encoded = vec![0x00, 0x3c];
+        encoded.extend(std::iter::repeat_n(1_u8, 32));
+        encoded.extend([0x00, 0x3c]);
+        encoded.extend(std::iter::repeat_n(2_u8, 32));
+        let path = write_fixture(&fixture(8, &[32, 2], &encoded));
+        let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
+        assert_eq!(
+            model
+                .matmul_f32_quantized("probe.tensor", &[1.0; 32])
+                .unwrap(),
+            &[32.0, 64.0]
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_unsupported_quantized_matmul_inputs() {
+        let mut encoded = vec![0x00, 0x3c, 0x00, 0x3c];
+        encoded.extend(std::iter::repeat_n(0_u8, 16));
+        let path = write_fixture(&fixture(3, &[32, 1], &encoded));
+        let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
+        assert!(matches!(
+            model.matmul_f32_quantized("probe.tensor", &[1.0; 32]),
+            Err(ModelError::UnsupportedTensorType { .. })
+        ));
         fs::remove_file(path).unwrap();
     }
 
