@@ -1,0 +1,18 @@
+[package]
+name = "ggml-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+description = "Digest-bound GGUF model indexing and F32 tensor loading"
+
+[dependencies]
+ggml-gguf = { path = "../gguf" }
+ggml-mmap = { path = "../mmap" }
+ggml-tensor = { path = "../tensor" }
+sha2.workspace = true
+
+[lints]
+workspace = true
