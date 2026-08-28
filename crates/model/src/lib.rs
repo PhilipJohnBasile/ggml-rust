@@ -412,16 +412,50 @@ impl GgufModel {
         let descriptor = self
             .tensor(name)
             .ok_or_else(|| ModelError::TensorNotFound(name.to_owned()))?;
-        if !matches!(descriptor.value_type.raw(), 0 | 1 | 2 | 8 | 12) {
-            return Err(ModelError::UnsupportedTensorType {
-                name: name.to_owned(),
-                value_type: descriptor.value_type,
-            });
-        }
         let mapped = map_model(&self.path, self.max_file_bytes)?;
         let bytes = mapped.as_bytes();
         if digest_bytes(bytes) != self.digest {
             return Err(ModelError::ContentChanged);
+        }
+        Self::materialize_f32(bytes, descriptor)
+    }
+
+    /// Materializes several tensors as F32 values while mapping and hashing
+    /// the GGUF file only once.
+    ///
+    /// The returned tensors preserve the order of `names`. Duplicate names
+    /// are allowed and produce duplicate owned tensors.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a tensor is missing or uses an unsupported
+    /// storage type, the model bytes changed, a tensor range is invalid, or a
+    /// shape does not match its decoded values.
+    pub fn load_f32_many(&self, names: &[&str]) -> Result<Vec<Tensor>, ModelError> {
+        let descriptors = names
+            .iter()
+            .map(|name| {
+                self.tensor(name)
+                    .ok_or_else(|| ModelError::TensorNotFound((*name).to_owned()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mapped = map_model(&self.path, self.max_file_bytes)?;
+        let bytes = mapped.as_bytes();
+        if digest_bytes(bytes) != self.digest {
+            return Err(ModelError::ContentChanged);
+        }
+        descriptors
+            .into_iter()
+            .map(|descriptor| Self::materialize_f32(bytes, descriptor))
+            .collect()
+    }
+
+    fn materialize_f32(bytes: &[u8], descriptor: &TensorDescriptor) -> Result<Tensor, ModelError> {
+        if !matches!(descriptor.value_type.raw(), 0 | 1 | 2 | 8 | 12) {
+            return Err(ModelError::UnsupportedTensorType {
+                name: descriptor.name.clone(),
+                value_type: descriptor.value_type,
+            });
         }
         let start = usize::try_from(descriptor.byte_offset)
             .map_err(|_| ModelError::Shape("tensor offset exceeds usize".to_owned()))?;
@@ -715,6 +749,12 @@ mod tests {
         assert_eq!(model.tensors().len(), 1);
         assert_eq!(model.tensor("probe.tensor").unwrap().shape(), &[2, 2]);
         assert_eq!(model.load_f32("probe.tensor").unwrap().data(), &values);
+        let batched = model
+            .load_f32_many(&["probe.tensor", "probe.tensor"])
+            .unwrap();
+        assert_eq!(batched.len(), 2);
+        assert_eq!(batched[0].data(), &values);
+        assert_eq!(batched[1].data(), &values);
         fs::remove_file(path).unwrap();
     }
 
