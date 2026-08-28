@@ -417,8 +417,9 @@ impl GgufModel {
 
     /// Materializes one tensor as F32 values in the checked CPU tensor engine.
     ///
-    /// F32, F16, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`,
-    /// `Q6_K`, `Q8_0`, and `Q8_K` storage are supported. Quantized formats are
+    /// F32, F16, BF16, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q2_K`, `Q3_K`, `Q4_K`,
+    /// `Q5_K`, `Q6_K`, `Q8_0`, and `Q8_K` storage are supported. Quantized
+    /// formats are
     /// decoded on the CPU into owned F32 values; the encoded bytes remain
     /// content-bound to the digest captured by [`Self::open`].
     ///
@@ -519,7 +520,7 @@ impl GgufModel {
     fn materialize_f32(bytes: &[u8], descriptor: &TensorDescriptor) -> Result<Tensor, ModelError> {
         if !matches!(
             descriptor.value_type.raw(),
-            0 | 1 | 2 | 3 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15
+            0 | 1 | 2 | 3 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15 | 30
         ) {
             return Err(ModelError::UnsupportedTensorType {
                 name: descriptor.name.clone(),
@@ -550,6 +551,7 @@ fn decode_values(value_type: TensorType, bytes: &[u8]) -> Result<Vec<f32>, Model
     match value_type.raw() {
         0 => decode_f32(bytes),
         1 => decode_f16(bytes),
+        30 => decode_bf16(bytes),
         2 => decode_q4_0(bytes),
         3 => decode_q4_1(bytes),
         6 => decode_q5_0(bytes),
@@ -591,6 +593,20 @@ fn decode_f16(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
     Ok(chunks
         .iter()
         .map(|chunk| f16_to_f32(u16::from_le_bytes(*chunk)))
+        .collect())
+}
+
+fn decode_bf16(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
+    let (chunks, remainder) = bytes.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(ModelError::Shape(
+            "BF16 tensor byte length is not aligned".to_owned(),
+        ));
+    }
+    Ok(chunks
+        .iter()
+        .map(|chunk| u32::from(u16::from_le_bytes(*chunk)) << 16)
+        .map(f32::from_bits)
         .collect())
 }
 
@@ -1120,6 +1136,23 @@ mod tests {
         assert_eq!(
             model.load_f32("probe.tensor").unwrap().data(),
             &[1.0, -2.0, 2.0, 4.0]
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn materializes_bf16_tensor() {
+        let encoded = [
+            0x80, 0x3f, // 1.0
+            0x20, 0xc0, // -2.5
+            0x00, 0x00, // 0.0
+            0x48, 0x41, // 12.5
+        ];
+        let path = write_fixture(&f32_fixture(30, &encoded));
+        let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
+        assert_eq!(
+            model.load_f32("probe.tensor").unwrap().data(),
+            &[1.0, -2.5, 0.0, 12.5]
         );
         fs::remove_file(path).unwrap();
     }
