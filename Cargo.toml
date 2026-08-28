@@ -2,6 +2,7 @@
 members = [
     "crates/gguf",
     "crates/mmap",
+    "crates/tensor",
     "tools/gguf-inspect",
 ]
 resolver = "3"

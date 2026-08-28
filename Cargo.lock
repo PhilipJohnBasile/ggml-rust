@@ -14,6 +14,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ggml-tensor"
+version = "0.1.0"
+
+[[package]]
 name = "gguf-inspect"
 version = "0.1.0"
 dependencies = [
