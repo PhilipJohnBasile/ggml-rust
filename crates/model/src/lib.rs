@@ -417,7 +417,7 @@ impl GgufModel {
 
     /// Materializes one tensor as F32 values in the checked CPU tensor engine.
     ///
-    /// F32, F16, `Q4_0`, `Q5_0`, `Q5_1`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`,
+    /// F32, F16, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`,
     /// `Q6_K`, `Q8_0`, and `Q8_K` storage are supported. Quantized formats are
     /// decoded on the CPU into owned F32 values; the encoded bytes remain
     /// content-bound to the digest captured by [`Self::open`].
@@ -519,7 +519,7 @@ impl GgufModel {
     fn materialize_f32(bytes: &[u8], descriptor: &TensorDescriptor) -> Result<Tensor, ModelError> {
         if !matches!(
             descriptor.value_type.raw(),
-            0 | 1 | 2 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15
+            0 | 1 | 2 | 3 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15
         ) {
             return Err(ModelError::UnsupportedTensorType {
                 name: descriptor.name.clone(),
@@ -551,6 +551,7 @@ fn decode_values(value_type: TensorType, bytes: &[u8]) -> Result<Vec<f32>, Model
         0 => decode_f32(bytes),
         1 => decode_f16(bytes),
         2 => decode_q4_0(bytes),
+        3 => decode_q4_1(bytes),
         6 => decode_q5_0(bytes),
         7 => decode_q5_1(bytes),
         8 => decode_q8_0(bytes),
@@ -612,6 +613,31 @@ fn decode_q4_0(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
         for index in 0..16 {
             let packed = block[2 + index];
             values.push((f32::from(packed >> 4) - 8.0) * scale);
+        }
+    }
+    Ok(values)
+}
+
+fn decode_q4_1(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
+    const BLOCK_BYTES: usize = 20;
+    const BLOCK_VALUES: usize = 32;
+    let (blocks, remainder) = bytes.as_chunks::<BLOCK_BYTES>();
+    if !remainder.is_empty() {
+        return Err(ModelError::Shape(
+            "Q4_1 tensor byte length is not block aligned".to_owned(),
+        ));
+    }
+    let mut values = Vec::with_capacity(blocks.len() * BLOCK_VALUES);
+    for block in blocks {
+        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let minimum = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        for index in 0..16 {
+            let packed = block[4 + index];
+            values.push(scale * f32::from(packed & 0x0f) + minimum);
+        }
+        for index in 0..16 {
+            let packed = block[4 + index];
+            values.push(scale * f32::from(packed >> 4) + minimum);
         }
     }
     Ok(values)
@@ -1111,6 +1137,16 @@ mod tests {
     }
 
     #[test]
+    fn materializes_q4_1_tensor() {
+        let mut encoded = vec![0x00, 0x3c, 0x00, 0x3c];
+        encoded.extend(std::iter::repeat_n(0x00, 16));
+        let path = write_fixture(&fixture(3, &[32], &encoded));
+        let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
+        assert_eq!(model.load_f32("probe.tensor").unwrap().data(), &[1.0; 32]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn materializes_q8_0_tensor() {
         let mut encoded = vec![0x00, 0x3c];
         encoded.extend((0_u8..32).map(|value| value.wrapping_add(0x80)));
@@ -1240,7 +1276,7 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_tensor_materialization() {
-        let path = write_fixture(&fixture(3, &[32], &[0; 20]));
+        let path = write_fixture(&fixture(16, &[256], &[0; 66]));
         let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
         assert!(matches!(
             model.load_f32("probe.tensor"),
