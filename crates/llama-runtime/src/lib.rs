@@ -85,7 +85,16 @@ impl LlamaConfig {
         let head_count_kv =
             optional_usize_value(values.next().flatten(), keys[4])?.unwrap_or(head_count);
         let feed_forward_length = required_usize_value(values.next().flatten(), keys[5])?;
-        let vocab_size = required_usize_value(values.next().flatten(), keys[6])?;
+        let vocab_size = match values.next().flatten() {
+            Some(value) => as_usize(value).map_err(|value| LlamaError::InvalidMetadata {
+                key: keys[6],
+                value,
+            })?,
+            None => model
+                .metadata_string_array("tokenizer.ggml.tokens", MAX_TOKENIZER_ELEMENTS)?
+                .ok_or(LlamaError::MissingMetadata(keys[6]))?
+                .len(),
+        };
         let rms_norm_epsilon =
             optional_f32_value(values.next().flatten(), keys[7])?.unwrap_or(1.0e-5);
         let rope_freq_base =
