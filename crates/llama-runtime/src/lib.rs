@@ -728,7 +728,10 @@ impl LlamaCpuModel {
             .tokenizer
             .as_ref()
             .ok_or(LlamaError::MissingMetadata("tokenizer.ggml.tokens"))?;
-        let prompt_ids = tokenizer.encode(prompt)?;
+        let mut prompt_ids = tokenizer.encode(prompt)?;
+        if let Some(bos) = tokenizer.bos_token_id() {
+            prompt_ids.insert(0, bos);
+        }
         let mut session = self.session()?;
         let generated = session.generate_greedy(&prompt_ids, max_new_tokens)?;
         tokenizer.decode(&generated)
