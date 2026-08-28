@@ -556,12 +556,11 @@ struct LayerWeights {
     ffn_up: Tensor,
 }
 
-/// A CPU-resident Llama model for a checked single-token forward pass.
+/// A CPU-resident Llama model with checked incremental decoding.
 ///
-/// The current execution contract intentionally covers position zero only.
-/// It is useful for validating tensor orientation and numerical execution
-/// before adding tokenizer, KV-cache, multi-token sampling, and Apple GPU
-/// kernels.
+/// The CPU path covers bounded tokenizer loading, RoPE-aware causal attention,
+/// per-layer KV caching, and deterministic greedy generation. It remains a
+/// correctness reference until optimized sampling and Apple GPU kernels land.
 #[derive(Debug, Clone)]
 pub struct LlamaCpuModel {
     config: LlamaConfig,
@@ -634,8 +633,9 @@ impl LlamaCpuModel {
     /// Runs one position-zero token through the CPU decoder and returns logits.
     ///
     /// Position zero makes rotary embedding an identity and single-token
-    /// attention has a one-element softmax. This method is a runtime smoke
-    /// path, not a complete text-generation API.
+    /// attention has a one-element softmax. This convenience method creates a
+    /// fresh session, so callers doing sequence decoding should use
+    /// [`LlamaCpuModel::session`] directly.
     ///
     /// # Errors
     ///
@@ -922,21 +922,20 @@ impl<'a> LlamaSession<'a> {
         prompt_ids: &[usize],
         max_new_tokens: usize,
     ) -> Result<Vec<usize>, LlamaError> {
-        let mut logits = self
-            .decode(prompt_ids)?
-            .pop()
-            .or_else(|| {
-                self.model
-                    .tokenizer
-                    .as_ref()
-                    .and_then(|tokenizer| tokenizer.bos_token_id)
-                    .and_then(|bos| self.forward_token(bos).ok())
-            })
-            .ok_or_else(|| {
-                LlamaError::InvalidConfig(
-                    "an empty prompt requires a BOS token for generation".to_owned(),
-                )
-            })?;
+        let mut logits = if let Some(logits) = self.decode(prompt_ids)?.pop() {
+            logits
+        } else if let Some(bos) = self
+            .model
+            .tokenizer
+            .as_ref()
+            .and_then(|tokenizer| tokenizer.bos_token_id)
+        {
+            self.forward_token(bos)?
+        } else {
+            return Err(LlamaError::InvalidConfig(
+                "an empty prompt requires a BOS token for generation".to_owned(),
+            ));
+        };
         let eos_token_id = self
             .model
             .tokenizer
