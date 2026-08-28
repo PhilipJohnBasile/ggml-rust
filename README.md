@@ -10,7 +10,7 @@ Current workspace:
 
 - `ggml-gguf`: bounded GGUF parser with byte-slice and safe seekable-reader validation paths
 - `ggml-mmap`: explicitly size-bounded, read-only model file mapping
-- `ggml-model`: digest-bound GGUF tensor index with F32, F16, Q4_0, and Q8_0 CPU materialization
+- `ggml-model`: digest-bound GGUF tensor index with F32, F16, Q4_0, Q4_K, and Q8_0 CPU materialization
 - `ggml-tensor`: checked row-major CPU tensor primitives for decoder layers
 - `gguf-inspect`: memory-mapped command-line metadata and tensor-table inspector
 

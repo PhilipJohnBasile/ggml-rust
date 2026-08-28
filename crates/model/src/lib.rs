@@ -225,7 +225,7 @@ impl GgufModel {
 
     /// Materializes one tensor as F32 values in the checked CPU tensor engine.
     ///
-    /// F32, F16, `Q4_0`, and `Q8_0` storage are supported. Quantized formats are
+    /// F32, F16, `Q4_0`, `Q4_K`, and `Q8_0` storage are supported. Quantized formats are
     /// decoded on the CPU into owned F32 values; the encoded bytes remain
     /// content-bound to the digest captured by [`Self::open`].
     ///
@@ -238,7 +238,7 @@ impl GgufModel {
         let descriptor = self
             .tensor(name)
             .ok_or_else(|| ModelError::TensorNotFound(name.to_owned()))?;
-        if !matches!(descriptor.value_type.raw(), 0 | 1 | 2 | 8) {
+        if !matches!(descriptor.value_type.raw(), 0 | 1 | 2 | 8 | 12) {
             return Err(ModelError::UnsupportedTensorType {
                 name: name.to_owned(),
                 value_type: descriptor.value_type,
@@ -275,6 +275,7 @@ fn decode_values(value_type: TensorType, bytes: &[u8]) -> Result<Vec<f32>, Model
         1 => decode_f16(bytes),
         2 => decode_q4_0(bytes),
         8 => decode_q8_0(bytes),
+        12 => decode_q4_k(bytes),
         _ => Err(ModelError::UnsupportedTensorType {
             name: "<unknown>".to_owned(),
             value_type,
@@ -351,6 +352,48 @@ fn decode_q8_0(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
         );
     }
     Ok(values)
+}
+
+fn decode_q4_k(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
+    const BLOCK_BYTES: usize = 144;
+    const BLOCK_VALUES: usize = 256;
+    let (blocks, remainder) = bytes.as_chunks::<BLOCK_BYTES>();
+    if !remainder.is_empty() {
+        return Err(ModelError::Shape(
+            "Q4_K tensor byte length is not block aligned".to_owned(),
+        ));
+    }
+    let mut values = Vec::with_capacity(blocks.len() * BLOCK_VALUES);
+    for block in blocks {
+        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let min_scale = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        let scales = &block[4..16];
+        let quantized = &block[16..];
+        for group in 0..8 {
+            let (group_scale, group_min) = q4_k_scale_min(group, scales);
+            let byte_offset = (group / 2) * 32;
+            let shift = (group % 2) * 4;
+            for packed in &quantized[byte_offset..byte_offset + 32] {
+                let quantized_value = f32::from((*packed >> shift) & 0x0f);
+                values.push(
+                    scale * f32::from(group_scale) * quantized_value
+                        - min_scale * f32::from(group_min),
+                );
+            }
+        }
+    }
+    Ok(values)
+}
+
+fn q4_k_scale_min(group: usize, scales: &[u8]) -> (u8, u8) {
+    if group < 4 {
+        (scales[group] & 0x3f, scales[group + 4] & 0x3f)
+    } else {
+        (
+            (scales[group + 4] & 0x0f) | ((scales[group - 4] >> 6) << 4),
+            (scales[group + 4] >> 4) | ((scales[group] >> 6) << 4),
+        )
+    }
 }
 
 fn f16_to_f32(bits: u16) -> f32 {
@@ -514,6 +557,26 @@ mod tests {
         assert_eq!(values.data()[0].to_bits(), (-128.0_f32).to_bits());
         assert_eq!(values.data()[1].to_bits(), (-127.0_f32).to_bits());
         assert_eq!(values.data()[31].to_bits(), (-97.0_f32).to_bits());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn materializes_q4_k_tensor() {
+        let mut encoded = vec![0x00, 0x3c, 0x00, 0x00];
+        encoded.extend([1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1]);
+        encoded.extend(std::iter::repeat_n(0x10, 128));
+        let path = write_fixture(&fixture(12, &[256], &encoded));
+        let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
+        let values = model.load_f32("probe.tensor").unwrap();
+        for group in 0..8 {
+            let start = group * 32;
+            let expected: f32 = if group % 2 == 0 { 0.0 } else { 1.0 };
+            assert!(
+                values.data()[start..start + 32]
+                    .iter()
+                    .all(|value| value.to_bits() == expected.to_bits())
+            );
+        }
         fs::remove_file(path).unwrap();
     }
 
