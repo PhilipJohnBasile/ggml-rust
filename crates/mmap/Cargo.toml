@@ -1,0 +1,23 @@
+[package]
+name = "ggml-mmap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/ggml-mmap"
+description = "Bounded read-only memory mapping for GGML runtimes"
+
+[dependencies]
+memmap2 = "0.9.11"
+
+# Memory mapping requires one audited OS boundary. Keep unsafe code denied
+# everywhere else instead of weakening the workspace-wide default.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"

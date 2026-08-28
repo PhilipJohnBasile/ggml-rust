@@ -1,0 +1,17 @@
+[package]
+name = "gguf-inspect"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+documentation = "https://github.com/PhilipJohnBasile/ggml-rust/tree/main/tools/gguf-inspect"
+description = "Inspect GGUF metadata and tensor tables"
+
+[dependencies]
+ggml-gguf = { version = "0.1.0", path = "../../crates/gguf" }
+ggml-mmap = { version = "0.1.0", path = "../../crates/mmap" }
+
+[lints]
+workspace = true

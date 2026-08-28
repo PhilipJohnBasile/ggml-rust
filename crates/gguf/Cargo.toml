@@ -1,0 +1,13 @@
+[package]
+name = "ggml-gguf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/ggml-gguf"
+description = "Bounded parser for current little-endian GGUF v2 and v3 files"
+
+[lints]
+workspace = true

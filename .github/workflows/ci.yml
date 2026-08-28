@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt
+      - name: Select pinned Rust toolchain
+        run: rustup override set 1.98.0
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --locked
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test workspace
+        run: cargo test --workspace --all-targets --locked
+      - name: Test release profile
+        run: cargo test --workspace --all-targets --release --locked
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked
+      - name: Verify package contents
+        run: |
+          cargo package -p ggml-gguf --locked --no-verify --list
+          cargo package -p ggml-mmap --locked --no-verify --list
+          cargo package -p gguf-inspect --locked --no-verify --list
+      - name: Check license copies
+        run: |
+          cmp LICENSE crates/gguf/LICENSE
+          cmp LICENSE crates/mmap/LICENSE
+          cmp LICENSE tools/gguf-inspect/LICENSE
