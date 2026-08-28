@@ -262,6 +262,7 @@ impl Tensor {
     /// Returns an error when either tensor is not rank 2, inner dimensions do
     /// not match, or a matrix product is non-finite.
     pub fn matmul(&self, rhs: &Self) -> Result<Self, TensorError> {
+        const TILE: usize = 32;
         if self.rank() != 2 {
             return Err(TensorError::RankMismatch {
                 expected: 2,
@@ -284,14 +285,27 @@ impl Tensor {
                 right: rhs.shape.clone(),
             });
         }
-        let mut result = vec![0.0; rows * columns];
-        for row in 0..rows {
-            for column in 0..columns {
-                let mut value = 0.0_f32;
-                for index in 0..inner {
-                    value += self.data[row * inner + index] * rhs.data[index * columns + column];
+        let result_len = rows
+            .checked_mul(columns)
+            .ok_or(TensorError::ElementCountOverflow)?;
+        let mut result = vec![0.0; result_len];
+        for row_start in (0..rows).step_by(TILE) {
+            let row_end = (row_start + TILE).min(rows);
+            for inner_start in (0..inner).step_by(TILE) {
+                let inner_end = (inner_start + TILE).min(inner);
+                for column_start in (0..columns).step_by(TILE) {
+                    let column_end = (column_start + TILE).min(columns);
+                    for row in row_start..row_end {
+                        for index in inner_start..inner_end {
+                            let left = self.data[row * inner + index];
+                            let rhs_row = index * columns;
+                            let result_row = row * columns;
+                            for column in column_start..column_end {
+                                result[result_row + column] += left * rhs.data[rhs_row + column];
+                            }
+                        }
+                    }
                 }
-                result[row * columns + column] = value;
             }
         }
         checked_output(vec![rows, columns], result, "matmul")
