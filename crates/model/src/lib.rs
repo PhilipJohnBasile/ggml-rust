@@ -97,6 +97,16 @@ pub enum ModelError {
     ContentChanged,
     InvalidUtf8Metadata(&'static str),
     MetadataArray(String),
+    MetadataArrayType {
+        key: String,
+        expected: &'static str,
+        actual: String,
+    },
+    MetadataArrayLimit {
+        key: String,
+        len: usize,
+        max: u64,
+    },
 }
 
 impl fmt::Display for ModelError {
@@ -124,6 +134,18 @@ impl fmt::Display for ModelError {
             Self::MetadataArray(key) => {
                 write!(formatter, "GGUF metadata {key} is an array, not a scalar")
             }
+            Self::MetadataArrayType {
+                key,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "GGUF metadata {key} array has element type {actual}, expected {expected}"
+            ),
+            Self::MetadataArrayLimit { key, len, max } => write!(
+                formatter,
+                "GGUF metadata {key} array has {len} elements, exceeding limit {max}"
+            ),
         }
     }
 }
@@ -256,6 +278,111 @@ impl GgufModel {
             ggml_gguf::MetadataValue::Scalar(value) => Ok(Some(owned_scalar(*value))),
             ggml_gguf::MetadataValue::Array(_) => Err(ModelError::MetadataArray(key.to_owned())),
         }
+    }
+
+    /// Reads a bounded string array from GGUF metadata while enforcing the model digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model changed, the metadata is malformed, the
+    /// array type is not string, or the caller's element bound is exceeded.
+    pub fn metadata_string_array(
+        &self,
+        key: &str,
+        max_elements: u64,
+    ) -> Result<Option<Vec<String>>, ModelError> {
+        let mapped = map_model(&self.path, self.max_file_bytes)?;
+        let bytes = mapped.as_bytes();
+        if digest_bytes(bytes) != self.digest {
+            return Err(ModelError::ContentChanged);
+        }
+        let gguf = Gguf::from_bytes(bytes).map_err(|error| ModelError::Parse(error.to_string()))?;
+        let Some(value) = gguf.metadata_value(key) else {
+            return Ok(None);
+        };
+        let ggml_gguf::MetadataValue::Array(array) = value else {
+            return Err(ModelError::MetadataArray(key.to_owned()));
+        };
+        if array.element_type() != ggml_gguf::MetadataType::String {
+            return Err(ModelError::MetadataArrayType {
+                key: key.to_owned(),
+                expected: "String",
+                actual: format!("{:?}", array.element_type()),
+            });
+        }
+        let length = array.len();
+        if u64::try_from(length).unwrap_or(u64::MAX) > max_elements {
+            return Err(ModelError::MetadataArrayLimit {
+                key: key.to_owned(),
+                len: length,
+                max: max_elements,
+            });
+        }
+        let mut values = Vec::with_capacity(length);
+        for index in 0..length {
+            let Some(ggml_gguf::ScalarValue::String(value)) = array.get(index) else {
+                return Err(ModelError::Parse(format!(
+                    "GGUF metadata {key} string array contains an invalid element"
+                )));
+            };
+            values.push(value.to_owned());
+        }
+        Ok(Some(values))
+    }
+
+    /// Reads a bounded F32 metadata array while enforcing the model digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model changed, the metadata is malformed, the
+    /// array type is not F32, or the caller's element bound is exceeded.
+    pub fn metadata_f32_array(
+        &self,
+        key: &str,
+        max_elements: u64,
+    ) -> Result<Option<Vec<f32>>, ModelError> {
+        let mapped = map_model(&self.path, self.max_file_bytes)?;
+        let bytes = mapped.as_bytes();
+        if digest_bytes(bytes) != self.digest {
+            return Err(ModelError::ContentChanged);
+        }
+        let gguf = Gguf::from_bytes(bytes).map_err(|error| ModelError::Parse(error.to_string()))?;
+        let Some(value) = gguf.metadata_value(key) else {
+            return Ok(None);
+        };
+        let ggml_gguf::MetadataValue::Array(array) = value else {
+            return Err(ModelError::MetadataArray(key.to_owned()));
+        };
+        if array.element_type() != ggml_gguf::MetadataType::F32 {
+            return Err(ModelError::MetadataArrayType {
+                key: key.to_owned(),
+                expected: "F32",
+                actual: format!("{:?}", array.element_type()),
+            });
+        }
+        let length = array.len();
+        if u64::try_from(length).unwrap_or(u64::MAX) > max_elements {
+            return Err(ModelError::MetadataArrayLimit {
+                key: key.to_owned(),
+                len: length,
+                max: max_elements,
+            });
+        }
+        let mut values = Vec::with_capacity(length);
+        for index in 0..length {
+            let Some(ggml_gguf::ScalarValue::F32(value)) = array.get(index) else {
+                return Err(ModelError::Parse(format!(
+                    "GGUF metadata {key} F32 array contains an invalid element"
+                )));
+            };
+            if !value.is_finite() {
+                return Err(ModelError::Parse(format!(
+                    "GGUF metadata {key} contains a non-finite value"
+                )));
+            }
+            values.push(value);
+        }
+        Ok(Some(values))
     }
 
     /// Returns all indexed tensor descriptors in GGUF order.

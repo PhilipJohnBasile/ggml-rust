@@ -171,6 +171,11 @@ impl LlamaConfig {
                 "embedding_length must be divisible by head_count".to_owned(),
             ));
         }
+        if !(self.embedding_length / self.head_count).is_multiple_of(2) {
+            return Err(LlamaError::InvalidConfig(
+                "head dimension must be even for rotary embeddings".to_owned(),
+            ));
+        }
         if !self.rms_norm_epsilon.is_finite() || self.rms_norm_epsilon <= 0.0 {
             return Err(LlamaError::InvalidConfig(
                 "rms_norm_epsilon must be finite and positive".to_owned(),
@@ -304,6 +309,238 @@ impl LlamaModel {
     pub fn load_cpu(&self) -> Result<LlamaCpuModel, LlamaError> {
         LlamaCpuModel::load(self)
     }
+
+    /// Loads the model tokenizer tables from bounded GGUF metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when tokenizer arrays are absent, malformed, or do not
+    /// match the model vocabulary.
+    pub fn tokenizer(&self) -> Result<LlamaTokenizer, LlamaError> {
+        LlamaTokenizer::from_model(&self.model, self.config.vocab_size)
+    }
+}
+
+const MAX_TOKENIZER_ELEMENTS: u64 = 16 * 1024 * 1024;
+
+/// A bounded GGUF tokenizer vocabulary with greedy SentencePiece-style pieces.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LlamaTokenizer {
+    tokens: Vec<String>,
+    scores: Vec<f32>,
+    bos_token_id: Option<usize>,
+    eos_token_id: Option<usize>,
+    unk_token_id: Option<usize>,
+}
+
+impl LlamaTokenizer {
+    fn from_model(model: &GgufModel, vocab_size: usize) -> Result<Self, LlamaError> {
+        let tokens = model
+            .metadata_string_array("tokenizer.ggml.tokens", MAX_TOKENIZER_ELEMENTS)?
+            .ok_or(LlamaError::MissingMetadata("tokenizer.ggml.tokens"))?;
+        if tokens.len() != vocab_size {
+            return Err(LlamaError::InvalidMetadata {
+                key: "tokenizer.ggml.tokens",
+                value: format!(
+                    "{} tokens, expected vocabulary size {vocab_size}",
+                    tokens.len()
+                ),
+            });
+        }
+        let scores = model
+            .metadata_f32_array("tokenizer.ggml.scores", MAX_TOKENIZER_ELEMENTS)?
+            .unwrap_or_else(|| vec![0.0; tokens.len()]);
+        if scores.len() != tokens.len() {
+            return Err(LlamaError::InvalidMetadata {
+                key: "tokenizer.ggml.scores",
+                value: format!("{} scores, expected {}", scores.len(), tokens.len()),
+            });
+        }
+        let bos_token_id = optional_usize(model, "tokenizer.ggml.bos_token_id")?;
+        let eos_token_id = optional_usize(model, "tokenizer.ggml.eos_token_id")?;
+        let unk_token_id = optional_usize(model, "tokenizer.ggml.unknown_token_id")?;
+        for (name, value) in [
+            ("tokenizer.ggml.bos_token_id", bos_token_id),
+            ("tokenizer.ggml.eos_token_id", eos_token_id),
+            ("tokenizer.ggml.unknown_token_id", unk_token_id),
+        ] {
+            if let Some(value) = value
+                && value >= tokens.len()
+            {
+                return Err(LlamaError::InvalidMetadata {
+                    key: name,
+                    value: format!("token id {value} is outside vocabulary"),
+                });
+            }
+        }
+        Ok(Self {
+            tokens,
+            scores,
+            bos_token_id,
+            eos_token_id,
+            unk_token_id,
+        })
+    }
+
+    /// Returns the vocabulary size.
+    #[must_use]
+    pub fn vocab_size(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// Returns the optional beginning-of-sequence token id.
+    #[must_use]
+    pub const fn bos_token_id(&self) -> Option<usize> {
+        self.bos_token_id
+    }
+
+    /// Returns the optional end-of-sequence token id.
+    #[must_use]
+    pub const fn eos_token_id(&self) -> Option<usize> {
+        self.eos_token_id
+    }
+
+    /// Encodes text using normalized whitespace markers and greedy longest pieces.
+    ///
+    /// This covers the standard Llama `SentencePiece` vocabulary representation.
+    /// Byte-fallback pieces are honored when present; otherwise an explicit
+    /// unknown token is required for unmatched input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the text cannot be represented by this vocabulary.
+    pub fn encode(&self, text: &str) -> Result<Vec<usize>, LlamaError> {
+        let normalized = normalize_sentencepiece(text);
+        let mut token_ids = Vec::new();
+        let mut offset = 0;
+        while offset < normalized.len() {
+            let suffix = &normalized[offset..];
+            let mut best: Option<(usize, usize, f32)> = None;
+            for (index, token) in self.tokens.iter().enumerate() {
+                if token.is_empty() || !suffix.starts_with(token) {
+                    continue;
+                }
+                let candidate = (token.len(), index, self.scores[index]);
+                if best.is_none_or(|current| {
+                    candidate.0 > current.0 || (candidate.0 == current.0 && candidate.2 > current.2)
+                }) {
+                    best = Some(candidate);
+                }
+            }
+            if let Some((length, index, _)) = best {
+                token_ids.push(index);
+                offset += length;
+                continue;
+            }
+            let character = suffix
+                .chars()
+                .next()
+                .ok_or_else(|| LlamaError::InvalidMetadata {
+                    key: "tokenizer.ggml.tokens",
+                    value: "invalid UTF-8 token boundary".to_owned(),
+                })?;
+            let mut consumed_byte = false;
+            for byte in character.to_string().as_bytes() {
+                let fallback = format!("<0x{byte:02X}>");
+                if let Some(index) = self.tokens.iter().position(|token| token == &fallback) {
+                    token_ids.push(index);
+                    consumed_byte = true;
+                } else {
+                    consumed_byte = false;
+                    break;
+                }
+            }
+            if consumed_byte {
+                offset += character.len_utf8();
+            } else if let Some(unk_token_id) = self.unk_token_id {
+                token_ids.push(unk_token_id);
+                offset += character.len_utf8();
+            } else {
+                return Err(LlamaError::InvalidMetadata {
+                    key: "tokenizer.ggml.tokens",
+                    value: format!("no token matches input at byte offset {offset}"),
+                });
+            }
+        }
+        Ok(token_ids)
+    }
+
+    /// Decodes token ids into text, including byte-fallback pieces.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a token id is outside the vocabulary or byte
+    /// fallback pieces are not valid UTF-8.
+    pub fn decode(&self, token_ids: &[usize]) -> Result<String, LlamaError> {
+        let mut output = String::new();
+        let mut bytes = Vec::new();
+        for &token_id in token_ids {
+            let token = self
+                .tokens
+                .get(token_id)
+                .ok_or_else(|| LlamaError::InvalidMetadata {
+                    key: "tokenizer.ggml.tokens",
+                    value: format!("token id {token_id} is outside vocabulary"),
+                })?;
+            if Some(token_id) == self.bos_token_id || Some(token_id) == self.eos_token_id {
+                continue;
+            }
+            if let Some(byte) = parse_byte_fallback(token) {
+                bytes.push(byte);
+                continue;
+            }
+            if !bytes.is_empty() {
+                let decoded = String::from_utf8(std::mem::take(&mut bytes)).map_err(|_| {
+                    LlamaError::InvalidMetadata {
+                        key: "tokenizer.ggml.tokens",
+                        value: "byte fallback is not valid UTF-8".to_owned(),
+                    }
+                })?;
+                output.push_str(&decoded);
+            }
+            output.push_str(&token.replace('▁', " "));
+        }
+        if !bytes.is_empty() {
+            let decoded = String::from_utf8(bytes).map_err(|_| LlamaError::InvalidMetadata {
+                key: "tokenizer.ggml.tokens",
+                value: "byte fallback is not valid UTF-8".to_owned(),
+            })?;
+            output.push_str(&decoded);
+        }
+        Ok(output)
+    }
+}
+
+fn normalize_sentencepiece(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len() + 3);
+    let mut needs_boundary = true;
+    for character in text.chars() {
+        if character.is_whitespace() {
+            needs_boundary = true;
+        } else {
+            if needs_boundary {
+                normalized.push('▁');
+                needs_boundary = false;
+            }
+            normalized.push(character);
+        }
+    }
+    normalized
+}
+
+fn parse_byte_fallback(token: &str) -> Option<u8> {
+    let bytes = token.as_bytes();
+    if bytes.len() != 6
+        || bytes[0] != b'<'
+        || bytes[1] != b'0'
+        || bytes[2] != b'x'
+        || bytes[5] != b'>'
+    {
+        return None;
+    }
+    let high = char::from(bytes[3]).to_digit(16)?;
+    let low = char::from(bytes[4]).to_digit(16)?;
+    u8::try_from((high << 4) | low).ok()
 }
 
 #[derive(Debug, Clone)]
@@ -332,12 +569,18 @@ pub struct LlamaCpuModel {
     output: Tensor,
     output_norm: Tensor,
     layers: Vec<LayerWeights>,
+    tokenizer: Option<LlamaTokenizer>,
 }
 
 impl LlamaCpuModel {
     fn load(model: &LlamaModel) -> Result<Self, LlamaError> {
         let config = model.config.clone();
         let load = |name: &str| model.model.load_f32(name).map_err(LlamaError::from);
+        let tokenizer = match model.tokenizer() {
+            Ok(tokenizer) => Some(tokenizer),
+            Err(LlamaError::MissingMetadata("tokenizer.ggml.tokens")) => None,
+            Err(error) => return Err(error),
+        };
         let token_embedding = load("token_embd.weight")?;
         let output = load("output.weight")?;
         let output_norm = load("output_norm.weight")?;
@@ -362,6 +605,7 @@ impl LlamaCpuModel {
             output,
             output_norm,
             layers,
+            tokenizer,
         })
     }
 
@@ -369,6 +613,22 @@ impl LlamaCpuModel {
     #[must_use]
     pub const fn config(&self) -> &LlamaConfig {
         &self.config
+    }
+
+    /// Returns the tokenizer when the GGUF contains bounded tokenizer tables.
+    #[must_use]
+    pub const fn tokenizer(&self) -> Option<&LlamaTokenizer> {
+        self.tokenizer.as_ref()
+    }
+
+    /// Creates an empty KV-cache session for this model.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured cache width cannot fit the host
+    /// address space.
+    pub fn session(&self) -> Result<LlamaSession<'_>, LlamaError> {
+        LlamaSession::new(self)
     }
 
     /// Runs one position-zero token through the CPU decoder and returns logits.
@@ -382,74 +642,368 @@ impl LlamaCpuModel {
     /// Returns an error when `token_id` is outside the vocabulary or a checked
     /// tensor operation fails.
     pub fn forward_token(&self, token_id: usize) -> Result<Vec<f32>, LlamaError> {
-        if token_id >= self.config.vocab_size {
+        let mut session = self.session()?;
+        session.forward_token(token_id)
+    }
+
+    /// Generates deterministic text from a prompt using the bounded tokenizer.
+    ///
+    /// This uses greedy sampling on the CPU reference path. It is intended for
+    /// correctness smoke tests while higher-performance sampling and Apple
+    /// backend execution are added.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when tokenizer metadata is absent, text cannot be
+    /// encoded, or decoding exceeds the model context.
+    pub fn generate_text(&self, prompt: &str, max_new_tokens: usize) -> Result<String, LlamaError> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or(LlamaError::MissingMetadata("tokenizer.ggml.tokens"))?;
+        let prompt_ids = tokenizer.encode(prompt)?;
+        let mut session = self.session()?;
+        let generated = session.generate_greedy(&prompt_ids, max_new_tokens)?;
+        tokenizer.decode(&generated)
+    }
+}
+
+/// Per-layer key/value storage for incremental decoding.
+#[derive(Debug, Clone)]
+pub struct LlamaKvCache {
+    keys: Vec<Vec<f32>>,
+    values: Vec<Vec<f32>>,
+    capacity: usize,
+    kv_width: usize,
+}
+
+impl LlamaKvCache {
+    /// Allocates a bounded cache for the model's configured context length.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the cached key/value width overflows the host
+    /// address space.
+    pub fn new(config: &LlamaConfig) -> Result<Self, LlamaError> {
+        let kv_width = config
+            .embedding_length
+            .checked_mul(config.head_count_kv)
+            .and_then(|width| width.checked_div(config.head_count))
+            .ok_or_else(|| {
+                LlamaError::InvalidConfig(
+                    "KV cache width overflows the host address space".to_owned(),
+                )
+            })?;
+        Ok(Self {
+            keys: (0..config.block_count).map(|_| Vec::new()).collect(),
+            values: (0..config.block_count).map(|_| Vec::new()).collect(),
+            capacity: config.context_length,
+            kv_width,
+        })
+    }
+
+    /// Returns the number of tokens currently stored.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.keys
+            .first()
+            .map_or(0, |values| values.len() / self.kv_width)
+    }
+
+    /// Returns whether no tokens have been stored.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the configured maximum number of cached tokens.
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
+/// Incremental CPU decoder state with a bounded per-layer KV cache.
+#[derive(Debug)]
+pub struct LlamaSession<'a> {
+    model: &'a LlamaCpuModel,
+    cache: LlamaKvCache,
+    position: usize,
+}
+
+impl<'a> LlamaSession<'a> {
+    fn new(model: &'a LlamaCpuModel) -> Result<Self, LlamaError> {
+        Ok(Self {
+            model,
+            cache: LlamaKvCache::new(&model.config)?,
+            position: 0,
+        })
+    }
+
+    /// Returns the next position that will be decoded.
+    #[must_use]
+    pub const fn position(&self) -> usize {
+        self.position
+    }
+
+    /// Returns the current KV cache.
+    #[must_use]
+    pub const fn cache(&self) -> &LlamaKvCache {
+        &self.cache
+    }
+
+    /// Decodes one token and returns vocabulary logits.
+    ///
+    /// Rotary embeddings are applied at the current position, and attention
+    /// reads all cached keys and values for causal incremental decoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the token or context bound is invalid, or when a
+    /// checked tensor operation produces a non-finite result.
+    #[allow(clippy::too_many_lines)]
+    pub fn forward_token(&mut self, token_id: usize) -> Result<Vec<f32>, LlamaError> {
+        if token_id >= self.model.config.vocab_size {
             return Err(LlamaError::InvalidConfig(format!(
                 "token id {token_id} is outside vocabulary size {}",
-                self.config.vocab_size
+                self.model.config.vocab_size
             )));
         }
-        let embedding_width = self.config.embedding_length;
-        let vocab_size = self.config.vocab_size;
-        let embedding = self.token_embedding.data();
+        if self.position >= self.cache.capacity {
+            return Err(LlamaError::InvalidConfig(format!(
+                "context length {} exceeded",
+                self.cache.capacity
+            )));
+        }
+        let embedding_width = self.model.config.embedding_length;
+        let vocab_size = self.model.config.vocab_size;
+        let embedding = self.model.token_embedding.data();
         let hidden = (0..embedding_width)
             .map(|row| embedding[row * vocab_size + token_id])
             .collect::<Vec<_>>();
         let mut hidden = row_tensor(embedding_width, hidden)?;
-        let head_dim = embedding_width / self.config.head_count;
+        let head_dim = embedding_width / self.model.config.head_count;
         #[allow(clippy::cast_precision_loss)]
         let attention_scale = (head_dim as f32).sqrt().recip();
-        for layer in &self.layers {
-            let normalized = hidden
-                .rms_norm(self.config.rms_norm_epsilon)?
-                .mul(&row_tensor(
-                    embedding_width,
-                    layer.attn_norm.data().to_vec(),
-                )?)?;
+        for (layer_index, layer) in self.model.layers.iter().enumerate() {
+            let normalized =
+                hidden
+                    .rms_norm(self.model.config.rms_norm_epsilon)?
+                    .mul(&row_tensor(
+                        embedding_width,
+                        layer.attn_norm.data().to_vec(),
+                    )?)?;
             let query = normalized.matmul(&layer.attn_q)?;
             let key = normalized.matmul(&layer.attn_k)?;
             let value = normalized.matmul(&layer.attn_v)?;
-            let query_values = query.data();
-            let key_values = key.data();
-            let value_values = value.data();
+            let mut query_values = query.into_data();
+            let mut key_values = key.into_data();
+            let value_values = value.into_data();
+            apply_rope(
+                &mut query_values,
+                self.model.config.head_count,
+                head_dim,
+                self.position,
+                self.model.config.rope_freq_base,
+            )?;
+            apply_rope(
+                &mut key_values,
+                self.model.config.head_count_kv,
+                head_dim,
+                self.position,
+                self.model.config.rope_freq_base,
+            )?;
+            if key_values.len() != self.cache.kv_width {
+                return Err(LlamaError::Tensor(
+                    "key projection width does not match KV cache".to_owned(),
+                ));
+            }
+            self.cache.keys[layer_index].extend_from_slice(&key_values);
+            self.cache.values[layer_index].extend_from_slice(&value_values);
             let mut attended = vec![0.0; embedding_width];
-            let query_groups = self.config.head_count / self.config.head_count_kv;
-            for query_head in 0..self.config.head_count {
+            let query_groups = self.model.config.head_count / self.model.config.head_count_kv;
+            let cached_tokens = self.position + 1;
+            for query_head in 0..self.model.config.head_count {
                 let kv_head = query_head / query_groups;
                 let query_start = query_head * head_dim;
                 let kv_start = kv_head * head_dim;
-                let mut score = 0.0_f32;
-                for offset in 0..head_dim {
-                    score += query_values[query_start + offset] * key_values[kv_start + offset];
+                let mut scores = Vec::with_capacity(cached_tokens);
+                for token_index in 0..cached_tokens {
+                    let cached_key_start = token_index * self.cache.kv_width + kv_start;
+                    let mut score = 0.0_f32;
+                    for offset in 0..head_dim {
+                        score += query_values[query_start + offset]
+                            * self.cache.keys[layer_index][cached_key_start + offset];
+                    }
+                    let scaled = score * attention_scale;
+                    if !scaled.is_finite() {
+                        return Err(LlamaError::Tensor(
+                            "attention score is not finite".to_owned(),
+                        ));
+                    }
+                    scores.push(scaled);
                 }
-                if !(score * attention_scale).is_finite() {
+                let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut denominator = 0.0_f32;
+                let mut probabilities = Vec::with_capacity(cached_tokens);
+                for score in scores {
+                    let probability = (score - maximum).exp();
+                    if !probability.is_finite() {
+                        return Err(LlamaError::Tensor(
+                            "attention probability is not finite".to_owned(),
+                        ));
+                    }
+                    denominator += probability;
+                    probabilities.push(probability);
+                }
+                if !denominator.is_finite() || denominator <= 0.0 {
                     return Err(LlamaError::Tensor(
-                        "attention score is not finite".to_owned(),
+                        "attention probability denominator is invalid".to_owned(),
                     ));
                 }
-                attended[query_start..query_start + head_dim]
-                    .copy_from_slice(&value_values[kv_start..kv_start + head_dim]);
+                for (token_index, probability) in probabilities.into_iter().enumerate() {
+                    let cached_value_start = token_index * self.cache.kv_width + kv_start;
+                    let weight = probability / denominator;
+                    for offset in 0..head_dim {
+                        attended[query_start + offset] +=
+                            weight * self.cache.values[layer_index][cached_value_start + offset];
+                    }
+                }
             }
             let attended = row_tensor(embedding_width, attended)?.matmul(&layer.attn_output)?;
             hidden = hidden.add(&attended)?;
-            let normalized = hidden
-                .rms_norm(self.config.rms_norm_epsilon)?
-                .mul(&row_tensor(
-                    embedding_width,
-                    layer.ffn_norm.data().to_vec(),
-                )?)?;
+            let normalized =
+                hidden
+                    .rms_norm(self.model.config.rms_norm_epsilon)?
+                    .mul(&row_tensor(
+                        embedding_width,
+                        layer.ffn_norm.data().to_vec(),
+                    )?)?;
             let gate = normalized.matmul(&layer.ffn_gate)?.silu()?;
             let up = normalized.matmul(&layer.ffn_up)?;
             let feed_forward = gate.mul(&up)?.matmul(&layer.ffn_down)?;
             hidden = hidden.add(&feed_forward)?;
         }
         let normalized = hidden
-            .rms_norm(self.config.rms_norm_epsilon)?
+            .rms_norm(self.model.config.rms_norm_epsilon)?
             .mul(&row_tensor(
                 embedding_width,
-                self.output_norm.data().to_vec(),
+                self.model.output_norm.data().to_vec(),
             )?)?;
-        Ok(normalized.matmul(&self.output)?.into_data())
+        let logits = normalized.matmul(&self.model.output)?.into_data();
+        self.position += 1;
+        Ok(logits)
     }
+
+    /// Decodes a token sequence and returns logits for every token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any token exceeds the vocabulary or context
+    /// limits, or when a checked tensor operation fails.
+    pub fn decode(&mut self, token_ids: &[usize]) -> Result<Vec<Vec<f32>>, LlamaError> {
+        token_ids
+            .iter()
+            .map(|&token_id| self.forward_token(token_id))
+            .collect()
+    }
+
+    /// Generates up to `max_new_tokens` with deterministic greedy sampling.
+    ///
+    /// The returned ids contain only newly generated tokens. An EOS token ends
+    /// generation and is not included in the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the prompt exceeds the context or the model has
+    /// no valid vocabulary logits.
+    pub fn generate_greedy(
+        &mut self,
+        prompt_ids: &[usize],
+        max_new_tokens: usize,
+    ) -> Result<Vec<usize>, LlamaError> {
+        let mut logits = self
+            .decode(prompt_ids)?
+            .pop()
+            .or_else(|| {
+                self.model
+                    .tokenizer
+                    .as_ref()
+                    .and_then(|tokenizer| tokenizer.bos_token_id)
+                    .and_then(|bos| self.forward_token(bos).ok())
+            })
+            .ok_or_else(|| {
+                LlamaError::InvalidConfig(
+                    "an empty prompt requires a BOS token for generation".to_owned(),
+                )
+            })?;
+        let eos_token_id = self
+            .model
+            .tokenizer
+            .as_ref()
+            .and_then(|tokenizer| tokenizer.eos_token_id);
+        let mut generated = Vec::with_capacity(max_new_tokens);
+        for _ in 0..max_new_tokens {
+            let token_id = argmax_finite(&logits)?;
+            if Some(token_id) == eos_token_id {
+                break;
+            }
+            generated.push(token_id);
+            logits = self.forward_token(token_id)?;
+        }
+        Ok(generated)
+    }
+}
+
+fn apply_rope(
+    values: &mut [f32],
+    head_count: usize,
+    head_dim: usize,
+    position: usize,
+    frequency_base: f32,
+) -> Result<(), LlamaError> {
+    #[allow(clippy::cast_precision_loss)]
+    let position = position as f32;
+    let head_width = head_dim;
+    #[allow(clippy::cast_precision_loss)]
+    let head_dim = head_width as f32;
+    for head in 0..head_count {
+        let start = head * head_width;
+        for pair in 0..head_width / 2 {
+            #[allow(clippy::cast_precision_loss)]
+            let exponent = -2.0 * pair as f32 / head_dim;
+            let angle = position * frequency_base.powf(exponent);
+            let (sine, cosine) = angle.sin_cos();
+            let first = values[start + pair * 2];
+            let second = values[start + pair * 2 + 1];
+            let rotated_first = first * cosine - second * sine;
+            let rotated_second = first * sine + second * cosine;
+            if !rotated_first.is_finite() || !rotated_second.is_finite() {
+                return Err(LlamaError::Tensor(
+                    "rotary embedding is not finite".to_owned(),
+                ));
+            }
+            values[start + pair * 2] = rotated_first;
+            values[start + pair * 2 + 1] = rotated_second;
+        }
+    }
+    Ok(())
+}
+
+fn argmax_finite(values: &[f32]) -> Result<usize, LlamaError> {
+    let mut best: Option<(usize, f32)> = None;
+    for (index, &value) in values.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(LlamaError::Tensor(
+                "logits contain a non-finite value".to_owned(),
+            ));
+        }
+        if best.is_none_or(|(_, current)| value > current) {
+            best = Some((index, value));
+        }
+    }
+    best.map(|(index, _)| index)
+        .ok_or_else(|| LlamaError::InvalidConfig("model returned an empty vocabulary".to_owned()))
 }
 
 fn row_tensor(width: usize, data: Vec<f32>) -> Result<Tensor, LlamaError> {
@@ -606,6 +1160,26 @@ mod tests {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
 
+    fn push_string_array_metadata(bytes: &mut Vec<u8>, key: &str, values: &[&str]) {
+        push_string(bytes, key);
+        bytes.extend_from_slice(&9_u32.to_le_bytes());
+        bytes.extend_from_slice(&8_u32.to_le_bytes());
+        bytes.extend_from_slice(&u64::try_from(values.len()).unwrap().to_le_bytes());
+        for value in values {
+            push_string(bytes, value);
+        }
+    }
+
+    fn push_f32_array_metadata(bytes: &mut Vec<u8>, key: &str, values: &[f32]) {
+        push_string(bytes, key);
+        bytes.extend_from_slice(&9_u32.to_le_bytes());
+        bytes.extend_from_slice(&6_u32.to_le_bytes());
+        bytes.extend_from_slice(&u64::try_from(values.len()).unwrap().to_le_bytes());
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+
     fn llama_fixture() -> Vec<u8> {
         let config = [
             ("token_embd.weight", vec![4_u64, 8]),
@@ -625,7 +1199,7 @@ mod tests {
         bytes.extend_from_slice(b"GGUF");
         bytes.extend_from_slice(&3_u32.to_le_bytes());
         bytes.extend_from_slice(&(config.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&11_u64.to_le_bytes());
+        bytes.extend_from_slice(&13_u64.to_le_bytes());
         push_string(&mut bytes, "general.architecture");
         bytes.extend_from_slice(&8_u32.to_le_bytes());
         push_string(&mut bytes, "llama");
@@ -641,6 +1215,16 @@ mod tests {
         push_string(&mut bytes, "general.name");
         bytes.extend_from_slice(&8_u32.to_le_bytes());
         push_string(&mut bytes, "fixture");
+        push_string_array_metadata(
+            &mut bytes,
+            "tokenizer.ggml.tokens",
+            &["<unk>", "▁a", "▁b", "<eos>", "<0x20>", "x", "y", "z"],
+        );
+        push_f32_array_metadata(
+            &mut bytes,
+            "tokenizer.ggml.scores",
+            &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
         let mut offset = 0_u64;
         for (name, shape) in &config {
             push_string(&mut bytes, name);
@@ -705,10 +1289,37 @@ mod tests {
         let path = write_fixture(&llama_fixture());
         let model = LlamaModel::open(&path, 1 << 20).unwrap();
         let cpu = model.load_cpu().unwrap();
+        let tokenizer = cpu.tokenizer().unwrap();
+        assert_eq!(tokenizer.encode("a b").unwrap(), [1, 2]);
+        assert_eq!(tokenizer.decode(&[1, 2]).unwrap(), " a b");
         let logits = cpu.forward_token(3).unwrap();
         assert_eq!(logits, vec![0.0; 8]);
         let result = cpu.forward_token(8);
         assert!(matches!(result, Err(LlamaError::InvalidConfig(_))));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn greedy_generation_uses_tokenizer_and_stops_at_context_bound() {
+        let path = write_fixture(&llama_fixture());
+        let model = LlamaModel::open(&path, 1 << 20).unwrap();
+        let cpu = model.load_cpu().unwrap();
+        assert_eq!(cpu.generate_text("a", 2).unwrap(), "<unk><unk>");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn session_applies_rope_and_grows_bounded_kv_cache() {
+        let path = write_fixture(&llama_fixture());
+        let model = LlamaModel::open(&path, 1 << 20).unwrap();
+        let cpu = model.load_cpu().unwrap();
+        let mut session = cpu.session().unwrap();
+        let logits = session.decode(&[1, 2, 3]).unwrap();
+        assert_eq!(logits.len(), 3);
+        assert!(logits.iter().all(|values| values == &vec![0.0; 8]));
+        assert_eq!(session.position(), 3);
+        assert_eq!(session.cache().len(), 3);
+        assert_eq!(session.cache().capacity(), 16);
         fs::remove_file(path).unwrap();
     }
 

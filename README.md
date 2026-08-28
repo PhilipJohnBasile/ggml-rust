@@ -8,7 +8,8 @@ The workspace requires Rust 1.98 or newer and pins Rust 1.98.0, with Clippy and 
 
 Current workspace:
 
-- llama-runtime: checked Llama metadata and GGUF tensor-layout admission
+- llama-runtime: checked Llama metadata/layout admission, tokenizer metadata,
+  KV-cache CPU decoding, and deterministic greedy generation
 - `ggml-gguf`: bounded GGUF parser with byte-slice and safe seekable-reader validation paths
 - `ggml-mmap`: explicitly size-bounded, read-only model file mapping
 - `ggml-model`: digest-bound GGUF tensor index with F32, F16, Q4_0, Q4_K, and Q8_0 CPU materialization
@@ -26,4 +27,6 @@ cargo run -p gguf-inspect -- --max-file-bytes 1099511627776 model.gguf
 
 `gguf-inspect` and `ggml-model` default to a 1 TiB file mapping limit. A mapped model must remain immutable while the command is running. The mapping holds a shared advisory file lock, but an uncooperative process can still truncate or rewrite the file. `ggml-mmap` therefore exposes file-backed mapping as an explicit unsafe boundary instead of claiming that the advisory lock makes construction safe.
 
-The runtime will keep stable compatibility surfaces while internal modules migrate. A separate `llama-rust` runtime will consume this workspace once model loading and graph execution are ready.
+The runtime keeps stable compatibility surfaces while internal modules migrate.
+MLXcelerator consumes the Llama admission and CPU smoke contracts; Apple GPU
+execution remains a separate backend layer.
