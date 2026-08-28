@@ -647,22 +647,22 @@ impl LlamaCpuModel {
             Ok::<(), LlamaError>(())
         })?;
         let mut loaded = loaded.into_iter();
-        let token_embedding = next_tensor(&mut loaded, "token_embd.weight")?;
-        let output = next_tensor(&mut loaded, "output.weight")?;
+        let token_embedding = next_matrix(&mut loaded, "token_embd.weight")?;
+        let output = next_matrix(&mut loaded, "output.weight")?;
         let output_norm = next_tensor(&mut loaded, "output_norm.weight")?;
         let mut layers = Vec::with_capacity(config.block_count);
         for layer in 0..config.block_count {
             let prefix = format!("blk.{layer}");
             layers.push(LayerWeights {
                 attn_norm: next_tensor(&mut loaded, &format!("{prefix}.attn_norm.weight"))?,
-                attn_q: next_tensor(&mut loaded, &format!("{prefix}.attn_q.weight"))?,
-                attn_k: next_tensor(&mut loaded, &format!("{prefix}.attn_k.weight"))?,
-                attn_v: next_tensor(&mut loaded, &format!("{prefix}.attn_v.weight"))?,
-                attn_output: next_tensor(&mut loaded, &format!("{prefix}.attn_output.weight"))?,
+                attn_q: next_matrix(&mut loaded, &format!("{prefix}.attn_q.weight"))?,
+                attn_k: next_matrix(&mut loaded, &format!("{prefix}.attn_k.weight"))?,
+                attn_v: next_matrix(&mut loaded, &format!("{prefix}.attn_v.weight"))?,
+                attn_output: next_matrix(&mut loaded, &format!("{prefix}.attn_output.weight"))?,
                 ffn_norm: next_tensor(&mut loaded, &format!("{prefix}.ffn_norm.weight"))?,
-                ffn_gate: next_tensor(&mut loaded, &format!("{prefix}.ffn_gate.weight"))?,
-                ffn_down: next_tensor(&mut loaded, &format!("{prefix}.ffn_down.weight"))?,
-                ffn_up: next_tensor(&mut loaded, &format!("{prefix}.ffn_up.weight"))?,
+                ffn_gate: next_matrix(&mut loaded, &format!("{prefix}.ffn_gate.weight"))?,
+                ffn_down: next_matrix(&mut loaded, &format!("{prefix}.ffn_down.weight"))?,
+                ffn_up: next_matrix(&mut loaded, &format!("{prefix}.ffn_up.weight"))?,
             });
         }
         Ok(Self {
@@ -846,10 +846,9 @@ impl<'a> LlamaSession<'a> {
             )));
         }
         let embedding_width = self.model.config.embedding_length;
-        let vocab_size = self.model.config.vocab_size;
         let embedding = self.model.token_embedding.data();
         let hidden = (0..embedding_width)
-            .map(|row| embedding[row * vocab_size + token_id])
+            .map(|row| embedding[row * self.model.config.vocab_size + token_id])
             .collect::<Vec<_>>();
         let mut hidden = row_tensor(embedding_width, hidden)?;
         let head_dim = embedding_width / self.model.config.head_count;
@@ -1113,6 +1112,30 @@ fn next_tensor(
         .next()
         .flatten()
         .ok_or_else(|| LlamaError::Tensor(format!("GGUF loader did not return {name}")))
+}
+
+fn next_matrix(
+    tensors: &mut impl Iterator<Item = Option<Tensor>>,
+    name: &str,
+) -> Result<Tensor, LlamaError> {
+    transpose_ggml_matrix(next_tensor(tensors, name)?)
+}
+
+fn transpose_ggml_matrix(tensor: Tensor) -> Result<Tensor, LlamaError> {
+    let shape = tensor.shape();
+    if shape.len() != 2 {
+        return Ok(tensor);
+    }
+    let rows = shape[0];
+    let columns = shape[1];
+    let data = tensor.into_data();
+    let mut transposed = vec![0.0; data.len()];
+    for row in 0..rows {
+        for column in 0..columns {
+            transposed[row * columns + column] = data[column * rows + row];
+        }
+    }
+    Tensor::from_data([rows, columns], transposed).map_err(LlamaError::from)
 }
 
 fn as_usize(value: MetadataScalar) -> Result<usize, String> {
@@ -1405,6 +1428,14 @@ mod tests {
         assert_eq!(session.cache().len(), 3);
         assert_eq!(session.cache().capacity(), 16);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn normalizes_first_dimension_contiguous_ggml_matrices() {
+        let tensor = Tensor::from_data([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let normalized = transpose_ggml_matrix(tensor).unwrap();
+        assert_eq!(normalized.shape(), &[2, 3]);
+        assert_eq!(normalized.data(), &[1.0, 3.0, 5.0, 2.0, 4.0, 6.0]);
     }
 
     #[test]
