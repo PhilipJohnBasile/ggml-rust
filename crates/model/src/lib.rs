@@ -21,6 +21,23 @@ pub struct TensorDescriptor {
     byte_len: u64,
 }
 
+/// An owned scalar GGUF metadata value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetadataScalar {
+    U8(u8),
+    I8(i8),
+    U16(u16),
+    I16(i16),
+    U32(u32),
+    I32(i32),
+    F32(f32),
+    Bool(bool),
+    String(String),
+    U64(u64),
+    I64(i64),
+    F64(f64),
+}
+
 impl TensorDescriptor {
     /// Returns the GGUF tensor name.
     #[must_use]
@@ -79,6 +96,7 @@ pub enum ModelError {
     Shape(String),
     ContentChanged,
     InvalidUtf8Metadata(&'static str),
+    MetadataArray(String),
 }
 
 impl fmt::Display for ModelError {
@@ -102,6 +120,9 @@ impl fmt::Display for ModelError {
             }
             Self::InvalidUtf8Metadata(key) => {
                 write!(formatter, "GGUF metadata {key} is not a UTF-8 string")
+            }
+            Self::MetadataArray(key) => {
+                write!(formatter, "GGUF metadata {key} is an array, not a scalar")
             }
         }
     }
@@ -209,6 +230,32 @@ impl GgufModel {
     #[must_use]
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
+    }
+
+    /// Reads one scalar metadata value while enforcing the model digest.
+    ///
+    /// Array metadata is intentionally rejected here because callers that
+    /// need tokenizer tables must request and validate those arrays through a
+    /// dedicated bounded API rather than copying an unbounded value implicitly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model changed, the mapped bytes are invalid,
+    /// or the requested metadata value is an array.
+    pub fn metadata_scalar(&self, key: &str) -> Result<Option<MetadataScalar>, ModelError> {
+        let mapped = map_model(&self.path, self.max_file_bytes)?;
+        let bytes = mapped.as_bytes();
+        if digest_bytes(bytes) != self.digest {
+            return Err(ModelError::ContentChanged);
+        }
+        let gguf = Gguf::from_bytes(bytes).map_err(|error| ModelError::Parse(error.to_string()))?;
+        let Some(value) = gguf.metadata_value(key) else {
+            return Ok(None);
+        };
+        match value {
+            ggml_gguf::MetadataValue::Scalar(value) => Ok(Some(owned_scalar(*value))),
+            ggml_gguf::MetadataValue::Array(_) => Err(ModelError::MetadataArray(key.to_owned())),
+        }
     }
 
     /// Returns all indexed tensor descriptors in GGUF order.
@@ -438,6 +485,23 @@ fn metadata_string(gguf: &Gguf<'_>, key: &'static str) -> Result<Option<String>,
     }
 }
 
+fn owned_scalar(value: ggml_gguf::ScalarValue<'_>) -> MetadataScalar {
+    match value {
+        ggml_gguf::ScalarValue::U8(value) => MetadataScalar::U8(value),
+        ggml_gguf::ScalarValue::I8(value) => MetadataScalar::I8(value),
+        ggml_gguf::ScalarValue::U16(value) => MetadataScalar::U16(value),
+        ggml_gguf::ScalarValue::I16(value) => MetadataScalar::I16(value),
+        ggml_gguf::ScalarValue::U32(value) => MetadataScalar::U32(value),
+        ggml_gguf::ScalarValue::I32(value) => MetadataScalar::I32(value),
+        ggml_gguf::ScalarValue::F32(value) => MetadataScalar::F32(value),
+        ggml_gguf::ScalarValue::Bool(value) => MetadataScalar::Bool(value),
+        ggml_gguf::ScalarValue::String(value) => MetadataScalar::String(value.to_owned()),
+        ggml_gguf::ScalarValue::U64(value) => MetadataScalar::U64(value),
+        ggml_gguf::ScalarValue::I64(value) => MetadataScalar::I64(value),
+        ggml_gguf::ScalarValue::F64(value) => MetadataScalar::F64(value),
+    }
+}
+
 fn digest_bytes(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
@@ -517,6 +581,10 @@ mod tests {
         let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
         assert_eq!(model.architecture(), Some("llama"));
         assert_eq!(model.name(), Some("fixture"));
+        assert_eq!(
+            model.metadata_scalar("general.name").unwrap(),
+            Some(MetadataScalar::String("fixture".to_owned()))
+        );
         assert_eq!(model.tensors().len(), 1);
         assert_eq!(model.tensor("probe.tensor").unwrap().shape(), &[2, 2]);
         assert_eq!(model.load_f32("probe.tensor").unwrap().data(), &values);

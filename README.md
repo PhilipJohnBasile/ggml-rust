@@ -8,6 +8,7 @@ The workspace requires Rust 1.98 or newer and pins Rust 1.98.0, with Clippy and 
 
 Current workspace:
 
+- llama-runtime: checked Llama metadata and GGUF tensor-layout admission
 - `ggml-gguf`: bounded GGUF parser with byte-slice and safe seekable-reader validation paths
 - `ggml-mmap`: explicitly size-bounded, read-only model file mapping
 - `ggml-model`: digest-bound GGUF tensor index with F32, F16, Q4_0, Q4_K, and Q8_0 CPU materialization
