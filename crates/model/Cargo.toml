@@ -9,9 +9,9 @@ repository.workspace = true
 description = "Digest-bound GGUF model indexing and CPU tensor materialization"
 
 [dependencies]
-ggml-gguf = { path = "../gguf" }
-ggml-mmap = { path = "../mmap" }
-ggml-tensor = { path = "../tensor" }
+ggml-gguf = { version = "0.1.0", path = "../gguf" }
+ggml-mmap = { version = "0.1.0", path = "../mmap" }
+ggml-tensor = { version = "0.1.0", path = "../tensor" }
 sha2.workspace = true
 
 [lints]
