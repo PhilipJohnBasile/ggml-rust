@@ -473,7 +473,7 @@ mod tests {
         let mut offset = 0_u64;
         for (name, shape) in &config {
             push_string(&mut bytes, name);
-            bytes.extend_from_slice(&(shape.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&u32::try_from(shape.len()).unwrap().to_le_bytes());
             for dimension in shape {
                 bytes.extend_from_slice(&dimension.to_le_bytes());
             }
@@ -481,12 +481,12 @@ mod tests {
             bytes.extend_from_slice(&offset.to_le_bytes());
             let elements = shape.iter().product::<u64>();
             let byte_len = elements * 4;
-            offset += (byte_len + 31) / 32 * 32;
+            offset += byte_len.div_ceil(32) * 32;
         }
         while bytes.len() % 32 != 0 {
             bytes.push(0);
         }
-        bytes.resize(bytes.len() + offset as usize, 0);
+        bytes.resize(bytes.len() + usize::try_from(offset).unwrap(), 0);
         bytes
     }
 
