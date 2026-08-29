@@ -8,18 +8,13 @@ use ggml_model::{GgufModel, MetadataScalar, ModelError, QuantizedMatrix};
 use ggml_tensor::{Tensor, TensorError};
 
 /// Position scaling applied before rotary phase calculation.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum LlamaRopeScaling {
     /// Use the unscaled token position.
+    #[default]
     None,
     /// Divide token positions by the configured linear factor.
     Linear { factor: f32 },
-}
-
-impl Default for LlamaRopeScaling {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl LlamaRopeScaling {
@@ -137,6 +132,11 @@ impl LlamaConfig {
     }
 
     /// Creates a validated Llama configuration with rotary width and scaling.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when dimensions, numerical parameters, or the scaling
+    /// factor are invalid.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_rope_scaling(
         context_length: usize,
@@ -2260,8 +2260,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.rope_scaling().kind(), "linear");
-        assert_eq!(config.rope_scaling_factor(), 2.0);
-        assert_eq!(config.scaled_rope_position(7), 3.5);
+        assert!((config.rope_scaling_factor() - 2.0).abs() < f32::EPSILON);
+        assert!((config.scaled_rope_position(7) - 3.5).abs() < f32::EPSILON);
         assert!(
             LlamaConfig::new_with_rope_scaling(
                 16,
