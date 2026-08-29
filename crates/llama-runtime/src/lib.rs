@@ -490,6 +490,28 @@ impl LlamaConfig {
         }
     }
 
+    /// Returns the physical KV-cache capacity required by one decoder layer.
+    ///
+    /// Layers using a sliding window can use a bounded ring instead of
+    /// reserving the full model context. Dense layers retain the full context
+    /// so mixed local and global attention remains exact.
+    #[must_use]
+    pub fn kv_cache_capacity_for_layer(&self, layer: usize) -> usize {
+        let uses_window = self
+            .attention_window_pattern
+            .as_ref()
+            .and_then(|pattern| pattern.get(layer))
+            .copied()
+            .unwrap_or(true);
+        if uses_window {
+            self.attention_window.map_or(self.context_length, |window| {
+                window.min(self.context_length)
+            })
+        } else {
+            self.context_length
+        }
+    }
+
     /// Converts a token index to the rotary position used by this model.
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
@@ -1841,11 +1863,98 @@ impl LlamaCpuModel {
     }
 }
 
+/// Bounded ring storage for one decoder layer's key/value rows.
+#[derive(Debug, Clone)]
+struct LayerKvCache {
+    keys: Vec<f32>,
+    values: Vec<f32>,
+    capacity: usize,
+    kv_width: usize,
+    start_position: usize,
+    length: usize,
+}
+
+impl LayerKvCache {
+    fn new(capacity: usize, kv_width: usize) -> Result<Self, LlamaError> {
+        if capacity == 0 || kv_width == 0 {
+            return Err(LlamaError::InvalidConfig(
+                "KV cache dimensions must be greater than zero".to_owned(),
+            ));
+        }
+        Ok(Self {
+            keys: Vec::new(),
+            values: Vec::new(),
+            capacity,
+            kv_width,
+            start_position: 0,
+            length: 0,
+        })
+    }
+
+    fn end_position(&self) -> usize {
+        self.start_position + self.length
+    }
+
+    fn physical_offset(&self, position: usize) -> usize {
+        (position % self.capacity) * self.kv_width
+    }
+
+    fn append(&mut self, position: usize, keys: &[f32], values: &[f32]) -> Result<(), LlamaError> {
+        if keys.len() != self.kv_width || values.len() != self.kv_width {
+            return Err(LlamaError::Tensor(
+                "KV cache row width does not match configuration".to_owned(),
+            ));
+        }
+        if keys.iter().chain(values).any(|value| !value.is_finite()) {
+            return Err(LlamaError::Tensor(
+                "KV cache rows must contain finite values".to_owned(),
+            ));
+        }
+        if position != self.end_position() {
+            return Err(LlamaError::InvalidConfig(format!(
+                "KV cache position {position} is not the next position {}",
+                self.end_position()
+            )));
+        }
+        let total_elements = self
+            .capacity
+            .checked_mul(self.kv_width)
+            .ok_or_else(|| LlamaError::InvalidConfig("KV cache size overflows usize".to_owned()))?;
+        if self.keys.is_empty() {
+            self.keys
+                .try_reserve_exact(total_elements)
+                .map_err(|error| {
+                    LlamaError::Tensor(format!("could not allocate KV key cache: {error}"))
+                })?;
+            self.keys.resize(total_elements, 0.0);
+            self.values
+                .try_reserve_exact(total_elements)
+                .map_err(|error| {
+                    LlamaError::Tensor(format!("could not allocate KV value cache: {error}"))
+                })?;
+            self.values.resize(total_elements, 0.0);
+        }
+        let offset = self.physical_offset(position);
+        self.keys[offset..offset + self.kv_width].copy_from_slice(keys);
+        self.values[offset..offset + self.kv_width].copy_from_slice(values);
+        if self.length == self.capacity {
+            self.start_position += 1;
+        } else {
+            self.length += 1;
+        }
+        Ok(())
+    }
+
+    fn row_offset(&self, position: usize) -> Option<usize> {
+        (position >= self.start_position && position < self.end_position())
+            .then(|| self.physical_offset(position))
+    }
+}
+
 /// Per-layer key/value storage for incremental decoding.
 #[derive(Debug, Clone)]
 pub struct LlamaKvCache {
-    keys: Vec<Vec<f32>>,
-    values: Vec<Vec<f32>>,
+    layers: Vec<LayerKvCache>,
     capacity: usize,
     kv_width: usize,
 }
@@ -1867,9 +1976,15 @@ impl LlamaKvCache {
                     "KV cache width overflows the host address space".to_owned(),
                 )
             })?;
+        let mut layers = Vec::with_capacity(config.block_count);
+        for layer in 0..config.block_count {
+            layers.push(LayerKvCache::new(
+                config.kv_cache_capacity_for_layer(layer),
+                kv_width,
+            )?);
+        }
         Ok(Self {
-            keys: (0..config.block_count).map(|_| Vec::new()).collect(),
-            values: (0..config.block_count).map(|_| Vec::new()).collect(),
+            layers,
             capacity: config.context_length,
             kv_width,
         })
@@ -1878,9 +1993,7 @@ impl LlamaKvCache {
     /// Returns the number of tokens currently stored.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.keys
-            .first()
-            .map_or(0, |values| values.len() / self.kv_width)
+        self.layers.first().map_or(0, |layer| layer.length)
     }
 
     /// Returns whether no tokens have been stored.
@@ -1893,6 +2006,18 @@ impl LlamaKvCache {
     #[must_use]
     pub const fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// Returns the number of rows currently retained for one layer.
+    #[must_use]
+    pub fn layer_len(&self, layer: usize) -> Option<usize> {
+        self.layers.get(layer).map(|cache| cache.length)
+    }
+
+    /// Returns the absolute position of the oldest retained row for one layer.
+    #[must_use]
+    pub fn layer_start_position(&self, layer: usize) -> Option<usize> {
+        self.layers.get(layer).map(|cache| cache.start_position)
     }
 }
 
@@ -1989,26 +2114,32 @@ impl<'a> LlamaSession<'a> {
                     "key projection width does not match KV cache".to_owned(),
                 ));
             }
-            self.cache.keys[layer_index].extend_from_slice(&key_values);
-            self.cache.values[layer_index].extend_from_slice(&value_values);
+            let layer_cache = self.cache.layers.get_mut(layer_index).ok_or_else(|| {
+                LlamaError::InvalidConfig("KV layer index is out of range".to_owned())
+            })?;
+            layer_cache.append(self.position, &key_values, &value_values)?;
             let mut attended = vec![0.0; embedding_width];
             let query_groups = self.model.config.head_count / self.model.config.head_count_kv;
-            let cached_tokens = self.position + 1;
+            let cached_tokens = layer_cache.end_position();
             let attention_start = self
                 .model
                 .config
-                .attention_start_for_layer(layer_index, cached_tokens);
+                .attention_start_for_layer(layer_index, cached_tokens)
+                .max(layer_cache.start_position);
             for query_head in 0..self.model.config.head_count {
                 let kv_head = query_head / query_groups;
                 let query_start = query_head * head_dim;
                 let kv_start = kv_head * head_dim;
                 let mut scores = Vec::with_capacity(cached_tokens - attention_start);
                 for token_index in attention_start..cached_tokens {
-                    let cached_key_start = token_index * self.cache.kv_width + kv_start;
+                    let cached_key_start =
+                        layer_cache.row_offset(token_index).ok_or_else(|| {
+                            LlamaError::Tensor("KV cache row is not retained".to_owned())
+                        })? + kv_start;
                     let mut score = 0.0_f32;
                     for offset in 0..head_dim {
                         score += query_values[query_start + offset]
-                            * self.cache.keys[layer_index][cached_key_start + offset];
+                            * layer_cache.keys[cached_key_start + offset];
                     }
                     let scaled = score * attention_scale;
                     if !scaled.is_finite() {
@@ -2038,11 +2169,14 @@ impl<'a> LlamaSession<'a> {
                 }
                 for (offset, probability) in probabilities.into_iter().enumerate() {
                     let token_index = attention_start + offset;
-                    let cached_value_start = token_index * self.cache.kv_width + kv_start;
+                    let cached_value_start =
+                        layer_cache.row_offset(token_index).ok_or_else(|| {
+                            LlamaError::Tensor("KV cache row is not retained".to_owned())
+                        })? + kv_start;
                     let weight = probability / denominator;
                     for offset in 0..head_dim {
                         attended[query_start + offset] +=
-                            weight * self.cache.values[layer_index][cached_value_start + offset];
+                            weight * layer_cache.values[cached_value_start + offset];
                     }
                 }
             }
@@ -3031,6 +3165,8 @@ mod tests {
         assert_eq!(config.attention_window_pattern(), Some(&[true, false][..]));
         assert_eq!(config.attention_start_for_layer(0, 7), 3);
         assert_eq!(config.attention_start_for_layer(1, 7), 0);
+        assert_eq!(config.kv_cache_capacity_for_layer(0), 4);
+        assert_eq!(config.kv_cache_capacity_for_layer(1), 16);
         assert!(
             LlamaConfig::new_with_rope_scaling_and_attention_window_and_pattern(
                 16,
@@ -3257,6 +3393,42 @@ mod tests {
         assert_eq!(session.cache().len(), 3);
         assert_eq!(session.cache().capacity(), 16);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn sliding_window_cache_evicts_oldest_rows_without_growing() {
+        let config = LlamaConfig::new_with_rope_scaling_and_attention_window(
+            8,
+            8,
+            1,
+            2,
+            1,
+            16,
+            32,
+            1.0e-5,
+            10_000.0,
+            4,
+            LlamaRopeScaling::None,
+            Some(2),
+        )
+        .unwrap();
+        let mut cache = LlamaKvCache::new(&config).unwrap();
+        let row_a = [1.0, 2.0, 3.0, 4.0];
+        let row_b = [5.0, 6.0, 7.0, 8.0];
+        let row_c = [9.0, 10.0, 11.0, 12.0];
+        cache.layers[0].append(0, &row_a, &row_a).unwrap();
+        cache.layers[0].append(1, &row_b, &row_b).unwrap();
+        cache.layers[0].append(2, &row_c, &row_c).unwrap();
+        let layer = &cache.layers[0];
+        assert_eq!(cache.capacity(), 8);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.layer_len(0), Some(2));
+        assert_eq!(cache.layer_start_position(0), Some(1));
+        assert_eq!(layer.keys[layer.row_offset(1).unwrap()..][..4], row_b);
+        assert_eq!(layer.keys[layer.row_offset(2).unwrap()..][..4], row_c);
+        assert!(layer.row_offset(0).is_none());
+        assert_eq!(layer.keys.len(), 2 * 4);
+        assert_eq!(layer.values.len(), 2 * 4);
     }
 
     #[test]
