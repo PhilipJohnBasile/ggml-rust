@@ -1772,6 +1772,94 @@ mod tests {
         bytes
     }
 
+    fn llama_quantized_fixture() -> Vec<u8> {
+        let config = vec![
+            ("token_embd.weight", vec![32_u64, 32], 2_u32),
+            ("output.weight", vec![32, 32], 2),
+            ("output_norm.weight", vec![32], 0),
+            ("blk.0.attn_norm.weight", vec![32], 0),
+            ("blk.0.attn_q.weight", vec![32, 32], 2),
+            ("blk.0.attn_k.weight", vec![32, 8], 2),
+            ("blk.0.attn_v.weight", vec![32, 8], 2),
+            ("blk.0.attn_output.weight", vec![32, 32], 2),
+            ("blk.0.ffn_norm.weight", vec![32], 0),
+            ("blk.0.ffn_gate.weight", vec![32, 64], 2),
+            ("blk.0.ffn_down.weight", vec![64, 32], 2),
+            ("blk.0.ffn_up.weight", vec![32, 64], 2),
+        ];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&(config.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&13_u64.to_le_bytes());
+        push_string(&mut bytes, "general.architecture");
+        bytes.extend_from_slice(&8_u32.to_le_bytes());
+        push_string(&mut bytes, "llama");
+        push_u32_metadata(&mut bytes, "llama.context_length", 16);
+        push_u32_metadata(&mut bytes, "llama.embedding_length", 32);
+        push_u32_metadata(&mut bytes, "llama.block_count", 1);
+        push_u32_metadata(&mut bytes, "llama.attention.head_count", 4);
+        push_u32_metadata(&mut bytes, "llama.attention.head_count_kv", 1);
+        push_u32_metadata(&mut bytes, "llama.feed_forward_length", 64);
+        push_u32_metadata(&mut bytes, "llama.vocab_size", 32);
+        push_f32_metadata(&mut bytes, "llama.attention.layer_norm_rms_epsilon", 1.0e-5);
+        push_f32_metadata(&mut bytes, "llama.rope.freq_base", 10_000.0);
+        push_string(&mut bytes, "general.name");
+        bytes.extend_from_slice(&8_u32.to_le_bytes());
+        push_string(&mut bytes, "quantized-fixture");
+        let tokens = [
+            "<unk>", "▁a", "▁b", "<eos>", "x", "y", "z", "q", "r", "s", "t", "u", "v", "w", "m",
+            "n", "o", "p", "i", "j", "k", "l", "c", "d", "e", "f", "g", "h", "aa", "bb", "cc",
+            "dd",
+        ];
+        push_string_array_metadata(&mut bytes, "tokenizer.ggml.tokens", &tokens);
+        push_f32_array_metadata(&mut bytes, "tokenizer.ggml.scores", &[0.0; 32]);
+        let mut offset = 0_u64;
+        for (name, shape, value_type) in &config {
+            push_string(&mut bytes, name);
+            bytes.extend_from_slice(&u32::try_from(shape.len()).unwrap().to_le_bytes());
+            for dimension in shape {
+                bytes.extend_from_slice(&dimension.to_le_bytes());
+            }
+            bytes.extend_from_slice(&value_type.to_le_bytes());
+            bytes.extend_from_slice(&offset.to_le_bytes());
+            let elements = shape.iter().product::<u64>();
+            let byte_len = if *value_type == 2 {
+                elements / 32 * 18
+            } else {
+                elements * 4
+            };
+            offset += byte_len.div_ceil(32) * 32;
+        }
+        while bytes.len() % 32 != 0 {
+            bytes.push(0);
+        }
+        let data_start = bytes.len();
+        bytes.resize(data_start + usize::try_from(offset).unwrap(), 0);
+        let mut data_offset = 0_usize;
+        for (_, shape, value_type) in &config {
+            let elements = usize::try_from(shape.iter().product::<u64>()).unwrap();
+            let byte_len = if *value_type == 2 {
+                elements / 32 * 18
+            } else {
+                elements * 4
+            };
+            let start = data_start + data_offset;
+            if *value_type == 2 {
+                for block in bytes[start..start + byte_len].as_chunks_mut::<18>().0 {
+                    block[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+                    block[2..].fill(0x99);
+                }
+            } else {
+                for value in bytes[start..start + byte_len].as_chunks_mut::<4>().0 {
+                    value.copy_from_slice(&1.0_f32.to_le_bytes());
+                }
+            }
+            data_offset += byte_len.div_ceil(32) * 32;
+        }
+        bytes
+    }
+
     fn write_fixture(bytes: &[u8]) -> PathBuf {
         let id = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("llama-runtime-{id}.gguf"));
@@ -1861,6 +1949,18 @@ mod tests {
         assert_eq!(logits, vec![0.0; 8]);
         let result = cpu.forward_token(8);
         assert!(matches!(result, Err(LlamaError::InvalidConfig(_))));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn loads_quantized_cpu_model_without_f32_expansion() {
+        let path = write_fixture(&llama_quantized_fixture());
+        let model = LlamaModel::open(&path, 1 << 20).unwrap();
+        let cpu = model.load_cpu_quantized().unwrap();
+        assert!(cpu.uses_quantized_weights());
+        let logits = cpu.forward_token(1).unwrap();
+        assert_eq!(logits.len(), 32);
+        assert!(logits.iter().all(|value| value.is_finite()));
         fs::remove_file(path).unwrap();
     }
 
