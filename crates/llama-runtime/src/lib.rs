@@ -2625,71 +2625,38 @@ impl<'a> LlamaSession<'a> {
                 LlamaError::InvalidConfig("KV layer index is out of range".to_owned())
             })?;
             layer_cache.append(self.position, &key_values, &value_values)?;
-            let mut attended = vec![0.0; attention_width];
-            let query_groups = self.model.config.head_count / self.model.config.head_count_kv;
             let cached_tokens = layer_cache.end_position();
             let attention_start = self
                 .model
                 .config
                 .attention_start_for_layer(layer_index, cached_tokens)
                 .max(layer_cache.start_position);
-            for query_head in 0..self.model.config.head_count {
-                let kv_head = query_head / query_groups;
-                let query_start = query_head * head_dim;
-                let kv_start = kv_head * head_dim;
-                let mut scores = Vec::with_capacity(cached_tokens - attention_start);
-                for token_index in attention_start..cached_tokens {
-                    let cached_key_start =
-                        layer_cache.row_offset(token_index).ok_or_else(|| {
-                            LlamaError::Tensor("KV cache row is not retained".to_owned())
-                        })? + kv_start;
-                    let mut score = 0.0_f32;
-                    for offset in 0..head_dim {
-                        score += query_values[query_start + offset]
-                            * layer_cache.keys[cached_key_start + offset];
-                    }
-                    let scaled = score * attention_scale;
-                    if !scaled.is_finite() {
-                        return Err(LlamaError::Tensor(
-                            "attention score is not finite".to_owned(),
-                        ));
-                    }
-                    scores.push(scaled);
-                }
-                let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let mut denominator = 0.0_f32;
-                let mut probabilities = Vec::with_capacity(cached_tokens - attention_start);
-                for score in scores {
-                    let probability = (score - maximum).exp();
-                    if !probability.is_finite() {
-                        return Err(LlamaError::Tensor(
-                            "attention probability is not finite".to_owned(),
-                        ));
-                    }
-                    denominator += probability;
-                    probabilities.push(probability);
-                }
-                if !denominator.is_finite() || denominator <= 0.0 {
-                    return Err(LlamaError::Tensor(
-                        "attention probability denominator is invalid".to_owned(),
-                    ));
-                }
-                for (offset, probability) in probabilities.into_iter().enumerate() {
-                    let token_index = attention_start + offset;
-                    let cached_value_start =
-                        layer_cache.row_offset(token_index).ok_or_else(|| {
-                            LlamaError::Tensor("KV cache row is not retained".to_owned())
-                        })? + kv_start;
-                    let weight = probability / denominator;
-                    for offset in 0..head_dim {
-                        attended[query_start + offset] +=
-                            weight * layer_cache.values[cached_value_start + offset];
-                    }
+            let retained_tokens = cached_tokens - attention_start;
+            let kv_heads = self.model.config.head_count_kv;
+            let mut retained_keys = Vec::with_capacity(retained_tokens * self.cache.kv_width);
+            let mut retained_values = Vec::with_capacity(retained_tokens * self.cache.kv_width);
+            for token_index in attention_start..cached_tokens {
+                let row_start = layer_cache
+                    .row_offset(token_index)
+                    .ok_or_else(|| LlamaError::Tensor("KV cache row is not retained".to_owned()))?;
+                for head in 0..kv_heads {
+                    let head_start = row_start + head * head_dim;
+                    let head_end = head_start + head_dim;
+                    retained_keys.extend_from_slice(&layer_cache.keys[head_start..head_end]);
+                    retained_values.extend_from_slice(&layer_cache.values[head_start..head_end]);
                 }
             }
-            let attended = layer
-                .attn_output
-                .matmul_tensor(&row_tensor(embedding_width, attended)?)?;
+            let query =
+                Tensor::from_data([1, self.model.config.head_count, 1, head_dim], query_values)?;
+            let keys = Tensor::from_data([1, kv_heads, retained_tokens, head_dim], retained_keys)?;
+            let values = Tensor::from_data(
+                [1, kv_heads, retained_tokens, self.model.config.value_length],
+                retained_values,
+            )?;
+            let attended =
+                query.scaled_dot_product_attention(&keys, &values, attention_scale, true)?;
+            let attended = row_tensor(attention_width, attended.into_data())?;
+            let attended = layer.attn_output.matmul_tensor(&attended)?;
             let mut attended = attended.into_data();
             add_projection_bias(
                 &mut attended,

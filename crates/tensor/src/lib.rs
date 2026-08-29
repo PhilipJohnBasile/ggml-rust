@@ -39,8 +39,14 @@ pub enum TensorError {
         left: Vec<usize>,
         right: Vec<usize>,
     },
+    AttentionShapeMismatch {
+        queries: Vec<usize>,
+        keys: Vec<usize>,
+        values: Vec<usize>,
+    },
     ZeroDimension,
     InvalidEpsilon,
+    InvalidScale,
     NonFiniteInput {
         index: usize,
     },
@@ -70,10 +76,19 @@ impl fmt::Display for TensorError {
                     "matrix shapes cannot be multiplied: {left:?} and {right:?}"
                 )
             }
+            Self::AttentionShapeMismatch {
+                queries,
+                keys,
+                values,
+            } => write!(
+                formatter,
+                "attention shapes are incompatible: queries {queries:?}, keys {keys:?}, values {values:?}"
+            ),
             Self::ZeroDimension => formatter.write_str("tensor dimensions must be nonzero"),
             Self::InvalidEpsilon => {
                 formatter.write_str("RMSNorm epsilon must be finite and nonnegative")
             }
+            Self::InvalidScale => formatter.write_str("attention scale must be finite"),
             Self::NonFiniteInput { index } => {
                 write!(formatter, "tensor input at index {index} is not finite")
             }
@@ -209,6 +224,83 @@ impl Tensor {
         Ok(self)
     }
 
+    /// Transposes a rank-2 tensor by copying its values into row-major order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tensor is not rank 2 or the output size
+    /// overflows.
+    pub fn transpose_2d(&self) -> Result<Self, TensorError> {
+        if self.rank() != 2 {
+            return Err(TensorError::RankMismatch {
+                expected: 2,
+                actual: self.rank(),
+            });
+        }
+        let rows = self.shape[0];
+        let columns = self.shape[1];
+        let output_len = rows
+            .checked_mul(columns)
+            .ok_or(TensorError::ElementCountOverflow)?;
+        let mut result = vec![0.0; output_len];
+        for row in 0..rows {
+            for column in 0..columns {
+                result[column * rows + row] = self.data[row * columns + column];
+            }
+        }
+        checked_output(vec![columns, rows], result, "transpose")
+    }
+
+    /// Broadcasts this tensor to a larger, right-aligned shape by copying
+    /// values. A source dimension must equal the destination dimension or be
+    /// one, matching MLX's broadcasting rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the destination rank is smaller than the source
+    /// rank, a dimension is incompatible, or the output size overflows.
+    pub fn broadcast_to<I>(&self, shape: I) -> Result<Self, TensorError>
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        let destination = shape.into_iter().collect::<Vec<_>>();
+        validate_shape(&destination)?;
+        if destination.len() < self.rank() {
+            return Err(TensorError::ShapeMismatch {
+                left: self.shape.clone(),
+                right: destination,
+            });
+        }
+        let offset = destination.len() - self.rank();
+        for (axis, &source_dimension) in self.shape.iter().enumerate() {
+            let target_dimension = destination[offset + axis];
+            if source_dimension != target_dimension && source_dimension != 1 {
+                return Err(TensorError::ShapeMismatch {
+                    left: self.shape.clone(),
+                    right: destination,
+                });
+            }
+        }
+        let output_len = element_count(&destination)?;
+        let mut result = Vec::with_capacity(output_len);
+        let mut coordinates = vec![0_usize; destination.len()];
+        for _ in 0..output_len {
+            let mut source_index = 0_usize;
+            for (axis, &source_dimension) in self.shape.iter().enumerate() {
+                let destination_axis = offset + axis;
+                let coordinate = if source_dimension == 1 {
+                    0
+                } else {
+                    coordinates[destination_axis]
+                };
+                source_index = source_index * source_dimension + coordinate;
+            }
+            result.push(self.data[source_index]);
+            increment_index(&mut coordinates, &destination);
+        }
+        checked_output(destination, result, "broadcast")
+    }
+
     /// Checks every value for finiteness.
     ///
     /// # Errors
@@ -331,7 +423,7 @@ impl Tensor {
     ///
     /// Returns an error when epsilon is invalid or an output value is
     /// non-finite.
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
     pub fn rms_norm(&self, epsilon: f32) -> Result<Self, TensorError> {
         if !epsilon.is_finite() || epsilon < 0.0 {
             return Err(TensorError::InvalidEpsilon);
@@ -379,6 +471,134 @@ impl Tensor {
         checked_output(self.shape.clone(), result, "softmax")
     }
 
+    /// Computes scaled dot-product attention for rank-4 tensors.
+    ///
+    /// Inputs use MLX's `[batch, heads, sequence, features]` convention.
+    /// Query heads may be grouped over fewer key/value heads, matching
+    /// grouped-query attention. With `causal` enabled, each query can read
+    /// keys through its aligned absolute position, including a prefix when
+    /// the key sequence is longer than the query sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when ranks, batch sizes, head counts, feature widths,
+    /// or sequence lengths are incompatible, the scale is non-finite, an input
+    /// is non-finite, or the operation produces a non-finite value.
+    #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+    pub fn scaled_dot_product_attention(
+        &self,
+        keys: &Self,
+        values: &Self,
+        scale: f32,
+        causal: bool,
+    ) -> Result<Self, TensorError> {
+        if !scale.is_finite() {
+            return Err(TensorError::InvalidScale);
+        }
+        if self.rank() != 4 || keys.rank() != 4 || values.rank() != 4 {
+            return Err(TensorError::AttentionShapeMismatch {
+                queries: self.shape.clone(),
+                keys: keys.shape.clone(),
+                values: values.shape.clone(),
+            });
+        }
+        if self.shape[0] != keys.shape[0]
+            || self.shape[0] != values.shape[0]
+            || self.shape[3] != keys.shape[3]
+            || keys.shape[1] != values.shape[1]
+            || !self.shape[1].is_multiple_of(keys.shape[1])
+            || self.shape[2] > keys.shape[2]
+        {
+            return Err(TensorError::AttentionShapeMismatch {
+                queries: self.shape.clone(),
+                keys: keys.shape.clone(),
+                values: values.shape.clone(),
+            });
+        }
+        self.validate_finite()?;
+        keys.validate_finite()?;
+        values.validate_finite()?;
+
+        let batch = self.shape[0];
+        let query_heads = self.shape[1];
+        let query_length = self.shape[2];
+        let query_width = self.shape[3];
+        let key_heads = keys.shape[1];
+        let key_length = keys.shape[2];
+        let value_width = values.shape[3];
+        let head_repeats = query_heads / key_heads;
+        let prefix = key_length - query_length;
+        let output_shape = vec![batch, query_heads, query_length, value_width];
+        let mut result = vec![0.0; element_count(&output_shape)?];
+
+        for batch_index in 0..batch {
+            for query_head in 0..query_heads {
+                let key_head = query_head / head_repeats;
+                for query_index in 0..query_length {
+                    let query_start = ((batch_index * query_heads + query_head) * query_length
+                        + query_index)
+                        * query_width;
+                    let allowed_end = if causal {
+                        (prefix + query_index + 1).min(key_length)
+                    } else {
+                        key_length
+                    };
+                    if allowed_end == 0 {
+                        return Err(TensorError::AttentionShapeMismatch {
+                            queries: self.shape.clone(),
+                            keys: keys.shape.clone(),
+                            values: values.shape.clone(),
+                        });
+                    }
+                    let mut scores = vec![f32::NEG_INFINITY; key_length];
+                    let mut maximum = f32::NEG_INFINITY;
+                    for (key_index, score) in scores.iter_mut().enumerate().take(allowed_end) {
+                        let key_start = ((batch_index * key_heads + key_head) * key_length
+                            + key_index)
+                            * query_width;
+                        let mut dot = 0.0_f32;
+                        for offset in 0..query_width {
+                            dot += self.data[query_start + offset] * keys.data[key_start + offset];
+                        }
+                        *score = dot * scale;
+                        if !score.is_finite() {
+                            return Err(TensorError::NonFiniteOutput {
+                                operation: "scaled_dot_product_attention",
+                                index: query_start,
+                            });
+                        }
+                        maximum = maximum.max(*score);
+                    }
+                    let mut denominator = 0.0_f32;
+                    for score in scores.iter_mut().take(allowed_end) {
+                        *score = (*score - maximum).exp();
+                        denominator += *score;
+                    }
+                    if !denominator.is_finite() || denominator <= 0.0 {
+                        return Err(TensorError::NonFiniteOutput {
+                            operation: "scaled_dot_product_attention",
+                            index: query_start,
+                        });
+                    }
+                    let output_start = ((batch_index * query_heads + query_head) * query_length
+                        + query_index)
+                        * value_width;
+                    for (key_index, score) in scores.iter().enumerate().take(allowed_end) {
+                        let weight = *score / denominator;
+                        let value_start = ((batch_index * key_heads + key_head) * key_length
+                            + key_index)
+                            * value_width;
+                        for offset in 0..value_width {
+                            result[output_start + offset] +=
+                                weight * values.data[value_start + offset];
+                        }
+                    }
+                }
+            }
+        }
+        checked_output(output_shape, result, "scaled_dot_product_attention")
+    }
+
     fn binary_op<F>(
         &self,
         rhs: &Self,
@@ -418,6 +638,16 @@ fn element_count(shape: &[usize]) -> Result<usize, TensorError> {
         .ok_or(TensorError::ElementCountOverflow)
 }
 
+fn increment_index(index: &mut [usize], shape: &[usize]) {
+    for axis in (0..index.len()).rev() {
+        index[axis] += 1;
+        if index[axis] < shape[axis] {
+            return;
+        }
+        index[axis] = 0;
+    }
+}
+
 fn checked_output(
     shape: Vec<usize>,
     data: Vec<f32>,
@@ -443,6 +673,25 @@ mod tests {
             .unwrap();
         assert_eq!(tensor.shape(), &[4]);
         assert_eq!(tensor.data(), &[1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn transposes_rank_two_data() {
+        let tensor = Tensor::from_data([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .unwrap()
+            .transpose_2d()
+            .unwrap();
+        assert_eq!(tensor.shape(), &[3, 2]);
+        assert_eq!(tensor.data(), &[1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+
+    #[test]
+    fn broadcasts_singleton_dimensions() {
+        let tensor = Tensor::from_data([2, 1], [1.0, 2.0])
+            .unwrap()
+            .broadcast_to([2, 3])
+            .unwrap();
+        assert_eq!(tensor.data(), &[1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
     }
 
     #[test]
@@ -501,6 +750,33 @@ mod tests {
             assert!((row.iter().sum::<f32>() - 1.0).abs() < 1e-6);
         }
         assert!(probabilities.data().iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn attention_supports_grouped_heads_and_causal_prefixes() {
+        let queries = Tensor::from_data([1, 2, 2, 1], [0.0; 4]).unwrap();
+        let keys = Tensor::from_data([1, 1, 3, 1], [0.0; 3]).unwrap();
+        let values = Tensor::from_data([1, 1, 3, 1], [1.0, 3.0, 5.0]).unwrap();
+        let output = queries
+            .scaled_dot_product_attention(&keys, &values, 1.0, true)
+            .unwrap();
+        assert_eq!(output.shape(), &[1, 2, 2, 1]);
+        assert_eq!(output.data(), &[2.0, 3.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn attention_rejects_incompatible_shapes_and_scale() {
+        let queries = Tensor::from_data([1, 1, 1, 2], [0.0, 0.0]).unwrap();
+        let keys = Tensor::from_data([1, 1, 1, 1], [0.0]).unwrap();
+        let values = Tensor::from_data([1, 1, 1, 1], [0.0]).unwrap();
+        assert!(matches!(
+            queries.scaled_dot_product_attention(&keys, &values, 1.0, false),
+            Err(TensorError::AttentionShapeMismatch { .. })
+        ));
+        assert_eq!(
+            queries.scaled_dot_product_attention(&queries, &values, f32::NAN, false),
+            Err(TensorError::InvalidScale)
+        );
     }
 
     #[test]
