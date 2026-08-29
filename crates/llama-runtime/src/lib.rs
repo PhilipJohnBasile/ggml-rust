@@ -780,8 +780,12 @@ impl LlamaTokenizer {
     ///
     /// # Errors
     ///
-    /// Returns an error when a token id is outside the vocabulary or byte
-    /// fallback pieces are not valid UTF-8.
+    /// Invalid UTF-8 assembled from byte-fallback pieces is replaced with
+    /// U+FFFD so arbitrary sampled token sequences remain decodable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a token id is outside the vocabulary.
     pub fn decode(&self, token_ids: &[usize]) -> Result<String, LlamaError> {
         let mut output = String::new();
         let mut bytes = Vec::new();
@@ -801,22 +805,13 @@ impl LlamaTokenizer {
                 continue;
             }
             if !bytes.is_empty() {
-                let decoded = String::from_utf8(std::mem::take(&mut bytes)).map_err(|_| {
-                    LlamaError::InvalidMetadata {
-                        key: "tokenizer.ggml.tokens",
-                        value: "byte fallback is not valid UTF-8".to_owned(),
-                    }
-                })?;
-                output.push_str(&decoded);
+                output.push_str(&String::from_utf8_lossy(&bytes));
+                bytes.clear();
             }
             output.push_str(&token.replace('▁', " "));
         }
         if !bytes.is_empty() {
-            let decoded = String::from_utf8(bytes).map_err(|_| LlamaError::InvalidMetadata {
-                key: "tokenizer.ggml.tokens",
-                value: "byte fallback is not valid UTF-8".to_owned(),
-            })?;
-            output.push_str(&decoded);
+            output.push_str(&String::from_utf8_lossy(&bytes));
         }
         Ok(output)
     }
@@ -2206,6 +2201,7 @@ mod tests {
         };
         assert_eq!(tokenizer.encode("é").unwrap(), [0, 1, 2]);
         assert_eq!(tokenizer.decode(&[0, 1, 2]).unwrap(), " é");
+        assert_eq!(tokenizer.decode(&[1]).unwrap(), "�");
     }
 
     #[test]
