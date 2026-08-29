@@ -866,17 +866,30 @@ impl GgufModel {
                 .get(start..end)
                 .ok_or_else(|| ModelError::Parse("tensor range is outside the file".to_owned()))?;
             let mut output = Vec::with_capacity(columns);
+            let column_bytes = expected_bytes
+                .checked_div(columns)
+                .ok_or_else(|| ModelError::Shape("quantized column width is zero".to_owned()))?;
             for column in 0..columns {
+                let column_start = column.checked_mul(column_bytes).ok_or_else(|| {
+                    ModelError::Shape("quantized matrix index overflows".to_owned())
+                })?;
+                let column_end = column_start.checked_add(column_bytes).ok_or_else(|| {
+                    ModelError::Shape("quantized matrix range overflows".to_owned())
+                })?;
+                let weights = decode_values(
+                    descriptor.value_type,
+                    tensor_bytes.get(column_start..column_end).ok_or_else(|| {
+                        ModelError::Parse("quantized column range is outside the tensor".to_owned())
+                    })?,
+                )?;
+                if weights.len() != rows {
+                    return Err(ModelError::Shape(format!(
+                        "quantized column decoded {} values, expected {rows}",
+                        weights.len()
+                    )));
+                }
                 let mut sum = 0.0_f32;
-                for (row, &value) in input.iter().enumerate() {
-                    let flat_index = column
-                        .checked_mul(rows)
-                        .and_then(|base| base.checked_add(row))
-                        .ok_or_else(|| {
-                            ModelError::Shape("quantized matrix index overflows".to_owned())
-                        })?;
-                    let weight =
-                        quantized_value_at(descriptor.value_type, tensor_bytes, flat_index)?;
+                for (&value, &weight) in input.iter().zip(&weights) {
                     if !weight.is_finite() {
                         return Err(ModelError::Shape(
                             "quantized matmul decoded a non-finite value".to_owned(),
