@@ -79,6 +79,9 @@ enum Operation {
     RmsNorm {
         epsilon: f32,
     },
+    RmsNormWeighted {
+        epsilon: f32,
+    },
     Silu,
     SoftmaxLastDim,
     Rotary {
@@ -212,6 +215,25 @@ impl Graph {
         self.unary(Operation::RmsNorm { epsilon }, input)
     }
 
+    /// Adds a weighted `RMSNorm` node.
+    ///
+    /// The weight must evaluate to a rank-1 tensor whose length matches the
+    /// input's final dimension.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either handle is invalid.
+    pub fn rms_norm_with_weight(
+        &mut self,
+        input: ValueId,
+        weight: ValueId,
+        epsilon: f32,
+    ) -> Result<ValueId, GraphError> {
+        self.require(input)?;
+        self.require(weight)?;
+        Ok(self.push(Operation::RmsNormWeighted { epsilon }, vec![input, weight]))
+    }
+
     /// Adds a `SiLU` node.
     ///
     /// # Errors
@@ -336,6 +358,8 @@ impl Graph {
                     Operation::RmsNorm { epsilon } => {
                         values[self.input_index(node, 0)?].rms_norm(*epsilon)?
                     }
+                    Operation::RmsNormWeighted { epsilon } => values[self.input_index(node, 0)?]
+                        .rms_norm_with_weight(&values[self.input_index(node, 1)?], *epsilon)?,
                     Operation::Silu => values[self.input_index(node, 0)?].silu()?,
                     Operation::SoftmaxLastDim => {
                         values[self.input_index(node, 0)?].softmax_last_dim()?
@@ -484,6 +508,24 @@ mod tests {
         assert!((result[0].data()[1] - 0.841_470_96).abs() < 1.0e-5);
         assert!((result[0].data()[2] + 0.841_470_96).abs() < 1.0e-5);
         assert!((result[0].data()[3] - 0.540_302_3).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn evaluates_weighted_rms_norm_graph() {
+        let mut graph = Graph::new();
+        let input = graph.input([2, 2]).unwrap();
+        let weight = graph.constant(Tensor::from_data([2], [2.0, 3.0]).unwrap());
+        let normalized = graph.rms_norm_with_weight(input, weight, 0.0).unwrap();
+        let result = graph
+            .evaluate(
+                &[Tensor::from_data([2, 2], [1.0, 1.0, 1.0, 1.0]).unwrap()],
+                &[normalized],
+            )
+            .unwrap();
+        assert!((result[0].data()[0] - 2.0).abs() < 1.0e-6);
+        assert!((result[0].data()[1] - 3.0).abs() < 1.0e-6);
+        assert!((result[0].data()[2] - 2.0).abs() < 1.0e-6);
+        assert!((result[0].data()[3] - 3.0).abs() < 1.0e-6);
     }
 
     #[test]
