@@ -192,10 +192,9 @@ impl QuantizedMatrix {
     /// Returns an error when the output size overflows, an index is outside
     /// the matrix, or a decoded value is malformed or non-finite.
     pub fn gather_columns(&self, columns: &[usize]) -> Result<Vec<f32>, ModelError> {
-        let output_len = columns
-            .len()
-            .checked_mul(self.rows)
-            .ok_or_else(|| ModelError::Shape("quantized column gather size overflows".to_owned()))?;
+        let output_len = columns.len().checked_mul(self.rows).ok_or_else(|| {
+            ModelError::Shape("quantized column gather size overflows".to_owned())
+        })?;
         let mut output = Vec::with_capacity(output_len);
         for &column in columns {
             output.extend(self.decode_column(column)?);
