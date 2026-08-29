@@ -3588,6 +3588,18 @@ fn validate_layout(model: &GgufModel, config: &LlamaConfig) -> Result<(), LlamaE
         ] {
             require_shape(model, &format!("{prefix}.{suffix}"), &shape)?;
         }
+        if architecture == "qwen3" {
+            require_shape(
+                model,
+                &format!("{prefix}.attn_q_norm.weight"),
+                &[config.key_length],
+            )?;
+            require_shape(
+                model,
+                &format!("{prefix}.attn_k_norm.weight"),
+                &[config.key_length],
+            )?;
+        }
         for (suffix, width) in [
             ("attn_q.bias", query_width),
             ("attn_k.bias", kv_width),
@@ -3696,8 +3708,9 @@ mod tests {
         llama_fixture_for("llama")
     }
 
+    #[allow(clippy::too_many_lines)]
     fn llama_fixture_for(architecture: &str) -> Vec<u8> {
-        let config = [
+        let mut config = vec![
             ("token_embd.weight", vec![4_u64, 8]),
             ("output.weight", vec![4, 8]),
             ("output_norm.weight", vec![4]),
@@ -3711,6 +3724,19 @@ mod tests {
             ("blk.0.ffn_down.weight", vec![8, 4]),
             ("blk.0.ffn_up.weight", vec![4, 8]),
         ];
+        if architecture == "qwen3" {
+            config.extend([
+                ("blk.0.attn_q_norm.weight", vec![2]),
+                ("blk.0.attn_k_norm.weight", vec![2]),
+            ]);
+        }
+        if architecture == "mistral3" {
+            config.extend([
+                ("blk.0.ffn_gate.bias", vec![8]),
+                ("blk.0.ffn_down.bias", vec![4]),
+                ("blk.0.ffn_up.bias", vec![8]),
+            ]);
+        }
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"GGUF");
         bytes.extend_from_slice(&3_u32.to_le_bytes());
