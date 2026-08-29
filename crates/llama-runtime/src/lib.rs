@@ -1835,9 +1835,13 @@ impl CpuMatrix {
 struct LayerWeights {
     attn_norm: Tensor,
     attn_q: CpuMatrix,
+    attn_q_bias: Option<Vec<f32>>,
     attn_k: CpuMatrix,
+    attn_k_bias: Option<Vec<f32>>,
     attn_v: CpuMatrix,
+    attn_v_bias: Option<Vec<f32>>,
     attn_output: CpuMatrix,
+    attn_output_bias: Option<Vec<f32>>,
     ffn_norm: Tensor,
     ffn_gate: CpuMatrix,
     ffn_down: CpuMatrix,
@@ -1898,6 +1902,17 @@ impl LlamaCpuModel {
                 format!("{prefix}.attn_norm.weight"),
                 format!("{prefix}.ffn_norm.weight"),
             ]);
+            for suffix in [
+                "attn_q.bias",
+                "attn_k.bias",
+                "attn_v.bias",
+                "attn_output.bias",
+            ] {
+                let name = format!("{prefix}.{suffix}");
+                if model.model.tensor(&name).is_some() {
+                    vector_names.push(name);
+                }
+            }
             matrix_names.extend([
                 format!("{prefix}.attn_q.weight"),
                 format!("{prefix}.attn_k.weight"),
@@ -1969,9 +1984,29 @@ impl LlamaCpuModel {
             layers.push(LayerWeights {
                 attn_norm: take_vector(&mut vectors, &format!("{prefix}.attn_norm.weight"))?,
                 attn_q: take_matrix(&mut matrices, &format!("{prefix}.attn_q.weight"))?,
+                attn_q_bias: take_optional_bias(
+                    &mut vectors,
+                    &format!("{prefix}.attn_q.bias"),
+                    config.embedding_length,
+                )?,
                 attn_k: take_matrix(&mut matrices, &format!("{prefix}.attn_k.weight"))?,
+                attn_k_bias: take_optional_bias(
+                    &mut vectors,
+                    &format!("{prefix}.attn_k.bias"),
+                    config.head_count_kv * (config.embedding_length / config.head_count),
+                )?,
                 attn_v: take_matrix(&mut matrices, &format!("{prefix}.attn_v.weight"))?,
+                attn_v_bias: take_optional_bias(
+                    &mut vectors,
+                    &format!("{prefix}.attn_v.bias"),
+                    config.head_count_kv * (config.embedding_length / config.head_count),
+                )?,
                 attn_output: take_matrix(&mut matrices, &format!("{prefix}.attn_output.weight"))?,
+                attn_output_bias: take_optional_bias(
+                    &mut vectors,
+                    &format!("{prefix}.attn_output.bias"),
+                    config.embedding_length,
+                )?,
                 ffn_norm: take_vector(&mut vectors, &format!("{prefix}.ffn_norm.weight"))?,
                 ffn_gate: take_matrix(&mut matrices, &format!("{prefix}.ffn_gate.weight"))?,
                 ffn_down: take_matrix(&mut matrices, &format!("{prefix}.ffn_down.weight"))?,
@@ -2016,6 +2051,17 @@ impl LlamaCpuModel {
                 "ffn_up.weight",
             ] {
                 names.push(format!("{prefix}.{suffix}"));
+            }
+            for suffix in [
+                "attn_q.bias",
+                "attn_k.bias",
+                "attn_v.bias",
+                "attn_output.bias",
+            ] {
+                let name = format!("{prefix}.{suffix}");
+                if model.model.tensor(&name).is_some() {
+                    names.push(name);
+                }
             }
         }
         let has_output_bias = model.model.tensor("output.bias").is_some();
@@ -2072,6 +2118,11 @@ impl LlamaCpuModel {
                             ))
                         })?,
                 )?,
+                attn_q_bias: take_optional_loaded_bias(
+                    &mut loaded,
+                    &format!("{prefix}.attn_q.bias"),
+                    config.embedding_length,
+                )?,
                 attn_k: CpuMatrix::from_tensor(
                     loaded
                         .remove(&format!("{prefix}.attn_k.weight"))
@@ -2080,6 +2131,11 @@ impl LlamaCpuModel {
                                 "GGUF loader did not return {prefix}.attn_k.weight"
                             ))
                         })?,
+                )?,
+                attn_k_bias: take_optional_loaded_bias(
+                    &mut loaded,
+                    &format!("{prefix}.attn_k.bias"),
+                    config.head_count_kv * (config.embedding_length / config.head_count),
                 )?,
                 attn_v: CpuMatrix::from_tensor(
                     loaded
@@ -2090,6 +2146,11 @@ impl LlamaCpuModel {
                             ))
                         })?,
                 )?,
+                attn_v_bias: take_optional_loaded_bias(
+                    &mut loaded,
+                    &format!("{prefix}.attn_v.bias"),
+                    config.head_count_kv * (config.embedding_length / config.head_count),
+                )?,
                 attn_output: CpuMatrix::from_tensor(
                     loaded
                         .remove(&format!("{prefix}.attn_output.weight"))
@@ -2098,6 +2159,11 @@ impl LlamaCpuModel {
                                 "GGUF loader did not return {prefix}.attn_output.weight"
                             ))
                         })?,
+                )?,
+                attn_output_bias: take_optional_loaded_bias(
+                    &mut loaded,
+                    &format!("{prefix}.attn_output.bias"),
+                    config.embedding_length,
                 )?,
                 ffn_norm: loaded
                     .remove(&format!("{prefix}.ffn_norm.weight"))
@@ -2468,7 +2534,22 @@ impl<'a> LlamaSession<'a> {
             let value = layer.attn_v.matmul_tensor(&normalized)?;
             let mut query_values = query.into_data();
             let mut key_values = key.into_data();
-            let value_values = value.into_data();
+            let mut value_values = value.into_data();
+            add_projection_bias(
+                &mut query_values,
+                layer.attn_q_bias.as_deref(),
+                "attention query",
+            )?;
+            add_projection_bias(
+                &mut key_values,
+                layer.attn_k_bias.as_deref(),
+                "attention key",
+            )?;
+            add_projection_bias(
+                &mut value_values,
+                layer.attn_v_bias.as_deref(),
+                "attention value",
+            )?;
             apply_rope_with_scaling(
                 &mut query_values,
                 self.model.config.head_count,
@@ -2561,6 +2642,13 @@ impl<'a> LlamaSession<'a> {
             let attended = layer
                 .attn_output
                 .matmul_tensor(&row_tensor(embedding_width, attended)?)?;
+            let mut attended = attended.into_data();
+            add_projection_bias(
+                &mut attended,
+                layer.attn_output_bias.as_deref(),
+                "attention output",
+            )?;
+            let attended = row_tensor(embedding_width, attended)?;
             hidden = hidden.add(&attended)?;
             let normalized =
                 hidden
@@ -3100,6 +3188,60 @@ fn take_vector(vectors: &mut HashMap<String, Tensor>, name: &str) -> Result<Tens
         .ok_or_else(|| LlamaError::Tensor(format!("GGUF loader did not return {name}")))
 }
 
+fn take_optional_bias(
+    vectors: &mut HashMap<String, Tensor>,
+    name: &str,
+    width: usize,
+) -> Result<Option<Vec<f32>>, LlamaError> {
+    vectors
+        .remove(name)
+        .map(|tensor| {
+            let data = tensor.into_data();
+            if data.len() != width {
+                return Err(LlamaError::TensorShape {
+                    name: name.to_owned(),
+                    expected: vec![width],
+                    actual: vec![data.len()],
+                });
+            }
+            Ok(data)
+        })
+        .transpose()
+}
+
+fn take_optional_loaded_bias(
+    loaded: &mut HashMap<String, Tensor>,
+    name: &str,
+    width: usize,
+) -> Result<Option<Vec<f32>>, LlamaError> {
+    take_optional_bias(loaded, name, width)
+}
+
+fn add_projection_bias(
+    values: &mut [f32],
+    bias: Option<&[f32]>,
+    operation: &str,
+) -> Result<(), LlamaError> {
+    if let Some(bias) = bias {
+        if values.len() != bias.len() {
+            return Err(LlamaError::Tensor(format!(
+                "{operation} bias width {} does not match projection width {}",
+                bias.len(),
+                values.len()
+            )));
+        }
+        for (value, offset) in values.iter_mut().zip(bias) {
+            *value += *offset;
+        }
+    }
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(LlamaError::Tensor(format!(
+            "{operation} projection is not finite after bias"
+        )));
+    }
+    Ok(())
+}
+
 fn transpose_ggml_matrix(tensor: Tensor) -> Result<Tensor, LlamaError> {
     let shape = tensor.shape();
     if shape.len() != 2 {
@@ -3222,12 +3364,19 @@ fn validate_layout(model: &GgufModel, config: &LlamaConfig) -> Result<(), LlamaE
         ] {
             require_shape(model, &format!("{prefix}.{suffix}"), &shape)?;
         }
+        for (suffix, width) in [
+            ("attn_q.bias", config.embedding_length),
+            ("attn_k.bias", kv_width),
+            ("attn_v.bias", kv_width),
+            ("attn_output.bias", config.embedding_length),
+        ] {
+            let name = format!("{prefix}.{suffix}");
+            if model.tensor(&name).is_some() {
+                require_shape(model, &name, &[width])?;
+            }
+        }
         for suffix in [
-            "attn_q.bias",
-            "attn_k.bias",
-            "attn_v.bias",
             "attn_qkv.bias",
-            "attn_output.bias",
             "ffn_gate.bias",
             "ffn_down.bias",
             "ffn_up.bias",
