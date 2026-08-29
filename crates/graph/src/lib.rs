@@ -77,6 +77,7 @@ enum Operation {
     Matmul,
     Reshape(Vec<usize>),
     Transpose2d,
+    Permute(Vec<usize>),
     GatherRows(Vec<usize>),
     Broadcast(Vec<usize>),
     RmsNorm {
@@ -96,6 +97,8 @@ enum Operation {
     Logarithm,
     Tanh,
     Sigmoid,
+    SumLastDim,
+    MeanLastDim,
     Clamp {
         minimum: f32,
         maximum: f32,
@@ -225,6 +228,24 @@ impl Graph {
     /// Returns an error when the input handle is invalid.
     pub fn transpose_2d(&mut self, input: ValueId) -> Result<ValueId, GraphError> {
         self.unary(Operation::Transpose2d, input)
+    }
+
+    /// Adds an arbitrary-rank axis permutation node.
+    ///
+    /// `axes[i]` identifies the source axis that becomes output axis `i`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid or `axes` is not a
+    /// permutation of the input rank. Rank validation is completed during
+    /// evaluation because graph values are shape-polymorphic until then.
+    pub fn permute(
+        &mut self,
+        input: ValueId,
+        axes: impl Into<Vec<usize>>,
+    ) -> Result<ValueId, GraphError> {
+        self.require(input)?;
+        Ok(self.push(Operation::Permute(axes.into()), vec![input]))
     }
 
     /// Adds a row-gather node for embedding and lookup tables.
@@ -403,6 +424,24 @@ impl Graph {
         self.unary(Operation::SoftmaxLastDim, input)
     }
 
+    /// Adds a final-dimension sum reduction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid.
+    pub fn sum_last_dim(&mut self, input: ValueId) -> Result<ValueId, GraphError> {
+        self.unary(Operation::SumLastDim, input)
+    }
+
+    /// Adds a final-dimension mean reduction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid.
+    pub fn mean_last_dim(&mut self, input: ValueId) -> Result<ValueId, GraphError> {
+        self.unary(Operation::MeanLastDim, input)
+    }
+
     /// Adds an interleaved rotary position embedding node.
     ///
     /// The input must evaluate to `[heads, head_dim]`; only the leading
@@ -461,6 +500,7 @@ impl Graph {
     ///
     /// Returns an error when input count or shape validation fails, a requested
     /// value is invalid, or one of the tensor operations fails.
+    #[allow(clippy::too_many_lines)]
     pub fn evaluate(
         &self,
         inputs: &[Tensor],
@@ -507,6 +547,7 @@ impl Graph {
                         .clone()
                         .reshape(shape.clone())?,
                     Operation::Transpose2d => values[self.input_index(node, 0)?].transpose_2d()?,
+                    Operation::Permute(axes) => values[self.input_index(node, 0)?].permute(axes)?,
                     Operation::GatherRows(indices) => {
                         values[self.input_index(node, 0)?].gather_rows(indices)?
                     }
@@ -536,6 +577,8 @@ impl Graph {
                     Operation::SoftmaxLastDim => {
                         values[self.input_index(node, 0)?].softmax_last_dim()?
                     }
+                    Operation::SumLastDim => values[self.input_index(node, 0)?].sum_last_dim()?,
+                    Operation::MeanLastDim => values[self.input_index(node, 0)?].mean_last_dim()?,
                     Operation::Rotary {
                         rotary_dimension,
                         position,
@@ -713,6 +756,25 @@ mod tests {
             .unwrap();
         assert_eq!(result[0].shape(), &[2, 2]);
         assert_eq!(result[0].data(), &[5.0, 6.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn evaluates_arbitrary_permutation_graph() {
+        let mut graph = Graph::new();
+        let input = graph.input([2, 3, 2]).unwrap();
+        let permuted = graph.permute(input, vec![2, 0, 1]).unwrap();
+        let result = graph
+            .evaluate(
+                &[Tensor::from_data(
+                    [2, 3, 2],
+                    (0..12).map(|value| value as f32).collect::<Vec<_>>(),
+                )
+                .unwrap()],
+                &[permuted],
+            )
+            .unwrap();
+        assert_eq!(result[0].shape(), &[2, 2, 3]);
+        assert_eq!(result[0].data()[..6], [0.0, 2.0, 4.0, 6.0, 8.0, 10.0]);
     }
 
     #[test]

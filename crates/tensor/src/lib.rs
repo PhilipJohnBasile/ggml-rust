@@ -39,6 +39,10 @@ pub enum TensorError {
         left: Vec<usize>,
         right: Vec<usize>,
     },
+    InvalidPermutation {
+        axes: Vec<usize>,
+        rank: usize,
+    },
     AttentionShapeMismatch {
         queries: Vec<usize>,
         keys: Vec<usize>,
@@ -84,6 +88,12 @@ impl fmt::Display for TensorError {
                 write!(
                     formatter,
                     "matrix shapes cannot be multiplied: {left:?} and {right:?}"
+                )
+            }
+            Self::InvalidPermutation { axes, rank } => {
+                write!(
+                    formatter,
+                    "axes {axes:?} are not a permutation of rank {rank}"
                 )
             }
             Self::AttentionShapeMismatch {
@@ -272,6 +282,58 @@ impl Tensor {
             }
         }
         checked_output(vec![columns, rows], result, "transpose")
+    }
+
+    /// Permutes tensor axes by copying values into row-major order.
+    ///
+    /// `axes[i]` identifies the source axis that becomes output axis `i`.
+    /// Arbitrary ranks are supported, including the scalar rank zero case.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `axes` is not a permutation of the tensor rank or
+    /// an output value is non-finite.
+    pub fn permute(&self, axes: &[usize]) -> Result<Self, TensorError> {
+        let rank = self.rank();
+        if axes.len() != rank {
+            return Err(TensorError::InvalidPermutation {
+                axes: axes.to_vec(),
+                rank,
+            });
+        }
+        let mut seen = vec![false; rank];
+        for &axis in axes {
+            if axis >= rank || seen[axis] {
+                return Err(TensorError::InvalidPermutation {
+                    axes: axes.to_vec(),
+                    rank,
+                });
+            }
+            seen[axis] = true;
+        }
+        if rank == 0 {
+            return Ok(self.clone());
+        }
+        let output_shape = axes
+            .iter()
+            .map(|&axis| self.shape[axis])
+            .collect::<Vec<_>>();
+        let output_len = element_count(&output_shape)?;
+        let mut result = Vec::with_capacity(output_len);
+        let mut coordinates = vec![0_usize; rank];
+        for _ in 0..output_len {
+            let mut source_coordinates = vec![0_usize; rank];
+            for (output_axis, &source_axis) in axes.iter().enumerate() {
+                source_coordinates[source_axis] = coordinates[output_axis];
+            }
+            let mut source_index = 0_usize;
+            for (axis, &dimension) in self.shape.iter().enumerate() {
+                source_index = source_index * dimension + source_coordinates[axis];
+            }
+            result.push(self.data[source_index]);
+            increment_index(&mut coordinates, &output_shape);
+        }
+        checked_output(output_shape, result, "permute")
     }
 
     /// Gathers rows from a rank-2 table by integer index.
@@ -744,6 +806,55 @@ impl Tensor {
         checked_output(self.shape.clone(), result, "softmax")
     }
 
+    /// Sums values independently along the final dimension.
+    ///
+    /// The output removes the final dimension. A rank-1 input therefore
+    /// produces a one-element rank-1 tensor rather than a scalar tensor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tensor is scalar or an output value is
+    /// non-finite.
+    pub fn sum_last_dim(&self) -> Result<Self, TensorError> {
+        let width = *self.shape.last().ok_or(TensorError::ZeroDimension)?;
+        let rows = self.data.len() / width;
+        let result = self
+            .data
+            .chunks_exact(width)
+            .map(|row| row.iter().sum::<f32>())
+            .collect::<Vec<_>>();
+        let mut shape = self.shape[..self.shape.len() - 1].to_vec();
+        if shape.is_empty() {
+            shape.push(1);
+        }
+        debug_assert_eq!(rows, result.len());
+        checked_output(shape, result, "sum")
+    }
+
+    /// Computes the arithmetic mean independently along the final dimension.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tensor is scalar or an output value is
+    /// non-finite.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn mean_last_dim(&self) -> Result<Self, TensorError> {
+        let width = *self.shape.last().ok_or(TensorError::ZeroDimension)?;
+        let rows = self.data.len() / width;
+        let divisor = width as f32;
+        let result = self
+            .data
+            .chunks_exact(width)
+            .map(|row| row.iter().sum::<f32>() / divisor)
+            .collect::<Vec<_>>();
+        let mut shape = self.shape[..self.shape.len() - 1].to_vec();
+        if shape.is_empty() {
+            shape.push(1);
+        }
+        debug_assert_eq!(rows, result.len());
+        checked_output(shape, result, "mean")
+    }
+
     /// Computes scaled dot-product attention for rank-4 tensors.
     ///
     /// Inputs use MLX's `[batch, heads, sequence, features]` convention.
@@ -967,6 +1078,28 @@ mod tests {
     }
 
     #[test]
+    fn permutes_arbitrary_rank_data() {
+        let tensor = Tensor::from_data(
+            [2, 3, 2],
+            (0..12).map(|value| value as f32).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let permuted = tensor.permute(&[2, 0, 1]).unwrap();
+        assert_eq!(permuted.shape(), &[2, 2, 3]);
+        assert_eq!(
+            permuted.data(),
+            &[0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 1.0, 3.0, 5.0, 7.0, 9.0, 11.0]
+        );
+        assert_eq!(
+            tensor.permute(&[0, 0, 1]).unwrap_err(),
+            TensorError::InvalidPermutation {
+                axes: vec![0, 0, 1],
+                rank: 3,
+            }
+        );
+    }
+
+    #[test]
     fn gathers_rows_in_requested_order() {
         let table = Tensor::from_data([3, 2], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let gathered = table.gather_rows(&[2, 0, 2]).unwrap();
@@ -1089,6 +1222,17 @@ mod tests {
             assert!((row.iter().sum::<f32>() - 1.0).abs() < 1e-6);
         }
         assert!(probabilities.data().iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn reduces_sum_and_mean_along_the_final_dimension() {
+        let tensor = Tensor::from_data([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 7.0]).unwrap();
+        assert_eq!(tensor.sum_last_dim().unwrap().shape(), &[2]);
+        assert_eq!(tensor.sum_last_dim().unwrap().data(), &[6.0, 16.0]);
+        assert_eq!(tensor.mean_last_dim().unwrap().data(), &[2.0, 16.0 / 3.0]);
+        let vector = Tensor::from_data([3], [1.0, 2.0, 6.0]).unwrap();
+        assert_eq!(vector.sum_last_dim().unwrap().shape(), &[1]);
+        assert_eq!(vector.sum_last_dim().unwrap().data(), &[9.0]);
     }
 
     #[test]
