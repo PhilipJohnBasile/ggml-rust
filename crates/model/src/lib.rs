@@ -1073,6 +1073,7 @@ impl GgufModel {
                 | 22
                 | 23
                 | 21
+                | 29
                 | 30
                 | 39
                 | 40
@@ -5104,6 +5105,7 @@ fn decode_values(value_type: TensorType, bytes: &[u8]) -> Result<Vec<f32>, Model
         18 => decode_iq3_xxs(bytes),
         19 => decode_iq1_s(bytes),
         21 => decode_iq3_s(bytes),
+        29 => decode_iq1_m(bytes),
         20 => decode_iq4_nl(bytes),
         23 => decode_iq4_xs(bytes),
         39 => decode_mxfp4(bytes),
@@ -5175,7 +5177,7 @@ fn affine_quantized_candidate(descriptor: &TensorDescriptor, group_size: usize) 
     descriptor.shape.len() == 2
         && matches!(
             descriptor.value_type.raw(),
-            2 | 3 | 6 | 7 | 8 | 16 | 17 | 18 | 20 | 22 | 23 | 34 | 35 | 39 | 40
+            2 | 3 | 6 | 7 | 8 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 29 | 34 | 35 | 39 | 40
         )
         && quantized_block_layout(descriptor.value_type).is_some()
         && descriptor.shape[0].is_multiple_of(group_size)
@@ -5399,6 +5401,7 @@ fn quantized_block_layout(value_type: TensorType) -> Option<(usize, usize)> {
         22 => Some((256, 82)),
         18 => Some((256, 98)),
         19 => Some((256, 50)),
+        29 => Some((256, 56)),
         23 => Some((256, 136)),
         39 => Some((32, 17)),
         40 => Some((64, 36)),
@@ -5488,6 +5491,7 @@ fn quantized_value_at(
         18 => iq3_xxs_value_at(bytes, index),
         19 => iq1_s_value_at(bytes, index),
         21 => iq3_s_value_at(bytes, index),
+        29 => iq1_m_value_at(bytes, index),
         20 => iq4_nl_value_at(bytes, index),
         23 => iq4_xs_value_at(bytes, index),
         39 => mxfp4_value_at(bytes, index),
@@ -5930,6 +5934,71 @@ fn decode_iq1_s_block(block: &[u8; 50]) -> [f32; 256] {
             let grid = IQ1_S_GRID[grid_index].to_le_bytes();
             for &magnitude in &grid {
                 values[value_index] = block_scale * (f32::from(magnitude.cast_signed()) + delta);
+                value_index += 1;
+            }
+        }
+    }
+    values
+}
+
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn decode_iq1_m(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
+    const BLOCK_BYTES: usize = 56;
+    const BLOCK_VALUES: usize = 256;
+    let (blocks, remainder) = bytes.as_chunks::<BLOCK_BYTES>();
+    if !remainder.is_empty() {
+        return Err(ModelError::Shape(
+            "IQ1_M tensor byte length is not block aligned".to_owned(),
+        ));
+    }
+    let mut values = Vec::with_capacity(blocks.len() * BLOCK_VALUES);
+    for block in blocks {
+        values.extend(decode_iq1_m_block(block));
+    }
+    Ok(values)
+}
+
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn decode_iq1_m_block(block: &[u8; 56]) -> [f32; 256] {
+    let scales = &block[48..56];
+    let scale_words = [
+        u16::from_le_bytes([scales[0], scales[1]]),
+        u16::from_le_bytes([scales[2], scales[3]]),
+        u16::from_le_bytes([scales[4], scales[5]]),
+        u16::from_le_bytes([scales[6], scales[7]]),
+    ];
+    let packed_scale = (scale_words[0] >> 12)
+        | ((scale_words[1] >> 8) & 0x00f0)
+        | ((scale_words[2] >> 4) & 0x0f00)
+        | (scale_words[3] & 0xf000);
+    let scale = f16_to_f32(packed_scale);
+    let qs = &block[0..32];
+    let qh = &block[32..48];
+    let mut values = [0.0_f32; 256];
+    let mut value_index = 0;
+    for ib in 0..8 {
+        let scale_word = scale_words[ib / 2];
+        let shift = 6 * (ib % 2);
+        let block_scales = [
+            scale * (2.0 * f32::from((scale_word >> shift) & 0x07) + 1.0),
+            scale * (2.0 * f32::from((scale_word >> (shift + 3)) & 0x07) + 1.0),
+        ];
+        for group in 0..4 {
+            let q_offset = ib * 4 + group;
+            let qh_byte = qh[ib * 2 + group / 2];
+            let high_shift = if group.is_multiple_of(2) { 8 } else { 4 };
+            let grid_index = usize::from(qs[q_offset])
+                | usize::from((u16::from(qh_byte) >> high_shift) & 0x07) << 8;
+            let grid = IQ1_S_GRID[grid_index].to_le_bytes();
+            let delta_bit = if group.is_multiple_of(2) { 0x08 } else { 0x80 };
+            let delta = if qh_byte & delta_bit != 0 {
+                -0.125
+            } else {
+                0.125
+            };
+            let group_scale = block_scales[usize::from(group >= 2)];
+            for &magnitude in &grid {
+                values[value_index] = group_scale * (f32::from(magnitude.cast_signed()) + delta);
                 value_index += 1;
             }
         }
@@ -6471,6 +6540,60 @@ fn iq1_s_value_at(bytes: &[u8], index: usize) -> Result<f32, ModelError> {
         usize::from(block[2 + ib32 * 4 + group]) | usize::from((high >> (3 * group)) & 0x07) << 8;
     let grid = IQ1_S_GRID[grid_index].to_le_bytes();
     Ok(block_scale * (f32::from(grid[index_in_group].cast_signed()) + delta))
+}
+
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn iq1_m_value_at(bytes: &[u8], index: usize) -> Result<f32, ModelError> {
+    const BLOCK_BYTES: usize = 56;
+    let block_index = index / 256;
+    let offset = index % 256;
+    let start = block_index
+        .checked_mul(BLOCK_BYTES)
+        .ok_or_else(|| ModelError::Shape("IQ1_M index overflows".to_owned()))?;
+    let end = start
+        .checked_add(BLOCK_BYTES)
+        .ok_or_else(|| ModelError::Shape("IQ1_M block range overflows".to_owned()))?;
+    let block = bytes
+        .get(start..end)
+        .and_then(|slice| <&[u8; 56]>::try_from(slice).ok())
+        .ok_or_else(|| ModelError::Shape("IQ1_M block is outside the tensor".to_owned()))?;
+    let scale_words = [
+        u16::from_le_bytes([block[48], block[49]]),
+        u16::from_le_bytes([block[50], block[51]]),
+        u16::from_le_bytes([block[52], block[53]]),
+        u16::from_le_bytes([block[54], block[55]]),
+    ];
+    let packed_scale = (scale_words[0] >> 12)
+        | ((scale_words[1] >> 8) & 0x00f0)
+        | ((scale_words[2] >> 4) & 0x0f00)
+        | (scale_words[3] & 0xf000);
+    let scale = f16_to_f32(packed_scale);
+    let ib = offset / 32;
+    let group = (offset % 32) / 8;
+    let index_in_group = offset % 8;
+    let scale_word = scale_words[ib / 2];
+    let shift = 6 * (ib % 2);
+    let group_scale = scale
+        * (2.0
+            * f32::from(if group < 2 {
+                (scale_word >> shift) & 0x07
+            } else {
+                (scale_word >> (shift + 3)) & 0x07
+            })
+            + 1.0);
+    let q_offset = 2 + ib * 4 + group;
+    let qh_byte = block[32 + ib * 2 + group / 2];
+    let high_shift = if group.is_multiple_of(2) { 8 } else { 4 };
+    let grid_index =
+        usize::from(block[q_offset]) | usize::from((u16::from(qh_byte) >> high_shift) & 0x07) << 8;
+    let grid = IQ1_S_GRID[grid_index].to_le_bytes();
+    let delta_bit = if group.is_multiple_of(2) { 0x08 } else { 0x80 };
+    let delta = if qh_byte & delta_bit != 0 {
+        -0.125
+    } else {
+        0.125
+    };
+    Ok(group_scale * (f32::from(grid[index_in_group].cast_signed()) + delta))
 }
 
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
@@ -7356,6 +7479,21 @@ mod tests {
     }
 
     #[test]
+    fn materializes_iq1_m_tensor() {
+        let mut encoded = vec![0_u8; 56];
+        encoded[52..54].copy_from_slice(&0xc000_u16.to_le_bytes());
+        encoded[54..56].copy_from_slice(&0x3000_u16.to_le_bytes());
+        let path = write_fixture(&fixture(29, &[256, 1], &encoded));
+        let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
+        let values = model.load_f32("probe.tensor").unwrap();
+        assert_eq!(values.data(), &[-0.875; 256]);
+        let matrix = model.load_quantized("probe.tensor").unwrap();
+        assert_eq!(matrix.value_type().raw(), 29);
+        assert_eq!(matrix.column(0).unwrap(), values.data());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn materializes_iq3_xxs_tensor() {
         let mut encoded = vec![0x00, 0x3c];
         encoded.extend(std::iter::repeat_n(0, 96));
@@ -7874,7 +8012,7 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_tensor_materialization() {
-        let path = write_fixture(&fixture(29, &[256], &[0; 128]));
+        let path = write_fixture(&fixture(24, &[256], &[0; 256]));
         let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
         assert!(matches!(
             model.load_f32("probe.tensor"),
