@@ -257,6 +257,36 @@ fn metadata_keys(architecture: &str) -> Option<LlamaMetadataKeys> {
             attention_window: "qwen2.attention.sliding_window",
             attention_window_pattern: "qwen2.attention.sliding_window_pattern",
         }),
+        "qwen3" => Some(LlamaMetadataKeys {
+            context_length: "qwen3.context_length",
+            embedding_length: "qwen3.embedding_length",
+            block_count: "qwen3.block_count",
+            head_count: "qwen3.attention.head_count",
+            head_count_kv: "qwen3.attention.head_count_kv",
+            attention_key_length: "qwen3.attention.key_length",
+            attention_value_length: "qwen3.attention.value_length",
+            feed_forward_length: "qwen3.feed_forward_length",
+            vocab_size: "qwen3.vocab_size",
+            rms_norm_epsilon: "qwen3.attention.layer_norm_rms_epsilon",
+            rope_freq_base: "qwen3.rope.freq_base",
+            rope_dimension_count: "qwen3.rope.dimension_count",
+            rope_scaling_type: "qwen3.rope.scaling.type",
+            rope_scaling_factor: "qwen3.rope.scaling.factor",
+            rope_scaling_attn_factor: "qwen3.rope.scaling.attn_factor",
+            rope_scaling_original_context_length: "qwen3.rope.scaling.original_context_length",
+            rope_scaling_yarn_log_multiplier: "qwen3.rope.scaling.yarn_log_multiplier",
+            rope_scaling_yarn_ext_factor: "qwen3.rope.scaling.yarn_ext_factor",
+            rope_scaling_yarn_attn_factor: "qwen3.rope.scaling.yarn_attn_factor",
+            rope_scaling_yarn_beta_fast: "qwen3.rope.scaling.yarn_beta_fast",
+            rope_scaling_yarn_beta_slow: "qwen3.rope.scaling.yarn_beta_slow",
+            rope_scaling_beta_fast_legacy: "qwen3.rope.scaling.beta_fast",
+            rope_scaling_beta_slow_legacy: "qwen3.rope.scaling.beta_slow",
+            rope_scaling_mscale_all_dim_legacy: "qwen3.rope.scaling.mscale_all_dim",
+            rope_scaling_beta_legacy: "qwen3.rope.scaling_beta",
+            attention_temperature_scale: "qwen3.attention.temperature_scale",
+            attention_window: "qwen3.attention.sliding_window",
+            attention_window_pattern: "qwen3.attention.sliding_window_pattern",
+        }),
         "mistral" => Some(LlamaMetadataKeys {
             context_length: "mistral.context_length",
             embedding_length: "mistral.embedding_length",
@@ -3346,7 +3376,7 @@ fn validate_layout(model: &GgufModel, config: &LlamaConfig) -> Result<(), LlamaE
             "output.weight",
             &[config.embedding_length, config.vocab_size],
         )?;
-    } else if architecture != "qwen2" {
+    } else if !matches!(architecture, "qwen2" | "qwen3") {
         return Err(LlamaError::MissingTensor("output.weight".to_owned()));
     }
     if let Some(output_bias) = model.tensor("output.bias")
@@ -3358,9 +3388,11 @@ fn validate_layout(model: &GgufModel, config: &LlamaConfig) -> Result<(), LlamaE
             actual: output_bias.shape().to_vec(),
         });
     }
-    if architecture == "qwen2" && config.rope_dimension_count() != config.key_length() {
+    if matches!(architecture, "qwen2" | "qwen3")
+        && config.rope_dimension_count() != config.key_length()
+    {
         return Err(LlamaError::InvalidConfig(
-            "qwen2 requires rotary embeddings across the full attention head".to_owned(),
+            "qwen2 and qwen3 require rotary embeddings across the full attention head".to_owned(),
         ));
     }
     require_shape(model, "output_norm.weight", &[config.embedding_length])?;
@@ -4028,6 +4060,17 @@ mod tests {
         assert!((model.config().rope_scaling_factor() - 4.0).abs() < f32::EPSILON);
         assert!((model.config().attention_temperature_scale() - 0.1).abs() < f32::EPSILON);
         assert_eq!(model.config().kv_cache_capacity_for_layer(0), 16);
+        let cpu = model.load_cpu().unwrap();
+        assert_eq!(cpu.forward_token(1).unwrap().len(), 8);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn opens_qwen3_standard_layout() {
+        let path = write_fixture(&llama_fixture_for("qwen3"));
+        let model = LlamaModel::open(&path, 1 << 20).unwrap();
+        assert_eq!(model.config().embedding_length(), 4);
+        assert_eq!(model.config().head_count_kv(), 1);
         let cpu = model.load_cpu().unwrap();
         assert_eq!(cpu.forward_token(1).unwrap().len(), 8);
         fs::remove_file(path).unwrap();
