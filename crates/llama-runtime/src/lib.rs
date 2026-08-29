@@ -2567,6 +2567,23 @@ fn validate_layout(model: &GgufModel, config: &LlamaConfig) -> Result<(), LlamaE
         ] {
             require_shape(model, &format!("{prefix}.{suffix}"), &shape)?;
         }
+        for suffix in [
+            "attn_q.bias",
+            "attn_k.bias",
+            "attn_v.bias",
+            "attn_qkv.bias",
+            "attn_output.bias",
+            "ffn_gate.bias",
+            "ffn_down.bias",
+            "ffn_up.bias",
+        ] {
+            let name = format!("{prefix}.{suffix}");
+            if model.tensor(&name).is_some() {
+                return Err(LlamaError::InvalidConfig(format!(
+                    "unsupported decoder bias tensor {name}"
+                )));
+            }
+        }
     }
     Ok(())
 }
