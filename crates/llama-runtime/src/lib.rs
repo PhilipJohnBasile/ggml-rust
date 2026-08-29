@@ -60,6 +60,86 @@ pub struct LlamaConfig {
     rope_freq_base: f32,
     rope_dimension_count: usize,
     rope_scaling: LlamaRopeScaling,
+    attention_window: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LlamaMetadataKeys {
+    context_length: &'static str,
+    embedding_length: &'static str,
+    block_count: &'static str,
+    head_count: &'static str,
+    head_count_kv: &'static str,
+    feed_forward_length: &'static str,
+    vocab_size: &'static str,
+    rms_norm_epsilon: &'static str,
+    rope_freq_base: &'static str,
+    rope_dimension_count: &'static str,
+    rope_scaling_type: &'static str,
+    rope_scaling_factor: &'static str,
+    attention_window: &'static str,
+}
+
+fn metadata_keys(architecture: &str) -> Option<LlamaMetadataKeys> {
+    let prefix = match architecture {
+        "llama" => "llama",
+        "mistral" => "mistral",
+        _ => return None,
+    };
+    Some(LlamaMetadataKeys {
+        context_length: match prefix {
+            "llama" => "llama.context_length",
+            _ => "mistral.context_length",
+        },
+        embedding_length: match prefix {
+            "llama" => "llama.embedding_length",
+            _ => "mistral.embedding_length",
+        },
+        block_count: match prefix {
+            "llama" => "llama.block_count",
+            _ => "mistral.block_count",
+        },
+        head_count: match prefix {
+            "llama" => "llama.attention.head_count",
+            _ => "mistral.attention.head_count",
+        },
+        head_count_kv: match prefix {
+            "llama" => "llama.attention.head_count_kv",
+            _ => "mistral.attention.head_count_kv",
+        },
+        feed_forward_length: match prefix {
+            "llama" => "llama.feed_forward_length",
+            _ => "mistral.feed_forward_length",
+        },
+        vocab_size: match prefix {
+            "llama" => "llama.vocab_size",
+            _ => "mistral.vocab_size",
+        },
+        rms_norm_epsilon: match prefix {
+            "llama" => "llama.attention.layer_norm_rms_epsilon",
+            _ => "mistral.attention.layer_norm_rms_epsilon",
+        },
+        rope_freq_base: match prefix {
+            "llama" => "llama.rope.freq_base",
+            _ => "mistral.rope.freq_base",
+        },
+        rope_dimension_count: match prefix {
+            "llama" => "llama.rope.dimension_count",
+            _ => "mistral.rope.dimension_count",
+        },
+        rope_scaling_type: match prefix {
+            "llama" => "llama.rope.scaling.type",
+            _ => "mistral.rope.scaling.type",
+        },
+        rope_scaling_factor: match prefix {
+            "llama" => "llama.rope.scaling.factor",
+            _ => "mistral.rope.scaling.factor",
+        },
+        attention_window: match prefix {
+            "llama" => "llama.attention.sliding_window",
+            _ => "mistral.attention.sliding_window",
+        },
+    })
 }
 
 impl LlamaConfig {
@@ -151,6 +231,44 @@ impl LlamaConfig {
         rope_dimension_count: usize,
         rope_scaling: LlamaRopeScaling,
     ) -> Result<Self, LlamaError> {
+        Self::new_with_rope_scaling_and_attention_window(
+            context_length,
+            embedding_length,
+            block_count,
+            head_count,
+            head_count_kv,
+            feed_forward_length,
+            vocab_size,
+            rms_norm_epsilon,
+            rope_freq_base,
+            rope_dimension_count,
+            rope_scaling,
+            None,
+        )
+    }
+
+    /// Creates a validated Llama-compatible configuration with rotary scaling
+    /// and an optional sliding attention window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when dimensions, numerical parameters, scaling, or the
+    /// attention window are invalid.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_rope_scaling_and_attention_window(
+        context_length: usize,
+        embedding_length: usize,
+        block_count: usize,
+        head_count: usize,
+        head_count_kv: usize,
+        feed_forward_length: usize,
+        vocab_size: usize,
+        rms_norm_epsilon: f32,
+        rope_freq_base: f32,
+        rope_dimension_count: usize,
+        rope_scaling: LlamaRopeScaling,
+        attention_window: Option<usize>,
+    ) -> Result<Self, LlamaError> {
         let config = Self {
             context_length,
             embedding_length,
@@ -163,74 +281,79 @@ impl LlamaConfig {
             rope_freq_base,
             rope_dimension_count,
             rope_scaling,
+            attention_window,
         };
         config.validate()?;
         Ok(config)
     }
 
-    /// Builds a configuration from the canonical Llama GGUF metadata keys.
+    /// Builds a configuration from canonical Llama-compatible GGUF metadata.
     ///
     /// # Errors
     ///
     /// Returns an error when metadata is missing, malformed, or the model
-    /// architecture is not Llama.
+    /// architecture is unsupported or not Llama-compatible.
     pub fn from_model(model: &GgufModel) -> Result<Self, LlamaError> {
-        if model.architecture() != Some("llama") {
-            return Err(LlamaError::UnsupportedArchitecture(
-                model.architecture().unwrap_or("missing").to_owned(),
-            ));
-        }
-        let keys = [
-            "llama.context_length",
-            "llama.embedding_length",
-            "llama.block_count",
-            "llama.attention.head_count",
-            "llama.attention.head_count_kv",
-            "llama.feed_forward_length",
-            "llama.vocab_size",
-            "llama.attention.layer_norm_rms_epsilon",
-            "llama.rope.freq_base",
+        let architecture = model.architecture().unwrap_or("missing");
+        let keys = metadata_keys(architecture)
+            .ok_or_else(|| LlamaError::UnsupportedArchitecture(architecture.to_owned()))?;
+        let metadata = [
+            keys.context_length,
+            keys.embedding_length,
+            keys.block_count,
+            keys.head_count,
+            keys.head_count_kv,
+            keys.feed_forward_length,
+            keys.vocab_size,
+            keys.rms_norm_epsilon,
+            keys.rope_freq_base,
         ];
-        let values = model.metadata_scalars(&keys)?;
+        let values = model.metadata_scalars(&metadata)?;
         let mut values = values.into_iter();
-        let context_length = required_usize_value(values.next().flatten(), keys[0])?;
-        let embedding_length = required_usize_value(values.next().flatten(), keys[1])?;
-        let block_count = required_usize_value(values.next().flatten(), keys[2])?;
-        let head_count = required_usize_value(values.next().flatten(), keys[3])?;
-        let head_count_kv =
-            optional_usize_value(values.next().flatten(), keys[4])?.unwrap_or(head_count);
-        let feed_forward_length = required_usize_value(values.next().flatten(), keys[5])?;
+        let context_length = required_usize_value(values.next().flatten(), keys.context_length)?;
+        let embedding_length =
+            required_usize_value(values.next().flatten(), keys.embedding_length)?;
+        let block_count = required_usize_value(values.next().flatten(), keys.block_count)?;
+        let head_count = required_usize_value(values.next().flatten(), keys.head_count)?;
+        let head_count_kv = optional_usize_value(values.next().flatten(), keys.head_count_kv)?
+            .unwrap_or(head_count);
+        let feed_forward_length =
+            required_usize_value(values.next().flatten(), keys.feed_forward_length)?;
         let vocab_size = match values.next().flatten() {
             Some(value) => as_usize(value).map_err(|value| LlamaError::InvalidMetadata {
-                key: keys[6],
+                key: keys.vocab_size,
                 value,
             })?,
             None => model
                 .metadata_string_array("tokenizer.ggml.tokens", MAX_TOKENIZER_ELEMENTS)?
-                .ok_or(LlamaError::MissingMetadata(keys[6]))?
+                .ok_or(LlamaError::MissingMetadata(keys.vocab_size))?
                 .len(),
         };
         let rms_norm_epsilon =
-            optional_f32_value(values.next().flatten(), keys[7])?.unwrap_or(1.0e-5);
+            optional_f32_value(values.next().flatten(), keys.rms_norm_epsilon)?.unwrap_or(1.0e-5);
         let rope_freq_base =
-            optional_f32_value(values.next().flatten(), keys[8])?.unwrap_or(10_000.0);
+            optional_f32_value(values.next().flatten(), keys.rope_freq_base)?.unwrap_or(10_000.0);
         let rope_dimension_count = model
-            .metadata_scalar("llama.rope.dimension_count")?
+            .metadata_scalar(keys.rope_dimension_count)?
             .map(|value| {
                 as_usize(value).map_err(|value| LlamaError::InvalidMetadata {
-                    key: "llama.rope.dimension_count",
+                    key: keys.rope_dimension_count,
                     value,
                 })
             })
             .transpose()?
             .unwrap_or_else(|| embedding_length.checked_div(head_count).unwrap_or(0));
-        let rope_scaling_type = model.metadata_scalar("llama.rope.scaling.type")?;
+        let rope_scaling_type = model.metadata_scalar(keys.rope_scaling_type)?;
         let rope_scaling_factor = optional_f32_value(
-            model.metadata_scalar("llama.rope.scaling.factor")?,
-            "llama.rope.scaling.factor",
+            model.metadata_scalar(keys.rope_scaling_factor)?,
+            keys.rope_scaling_factor,
         )?;
         let rope_scaling = parse_rope_scaling(rope_scaling_type, rope_scaling_factor)?;
-        Self::new_with_rope_scaling(
+        let attention_window = optional_usize_value(
+            model.metadata_scalar(keys.attention_window)?,
+            keys.attention_window,
+        )?;
+        Self::new_with_rope_scaling_and_attention_window(
             context_length,
             embedding_length,
             block_count,
@@ -242,6 +365,7 @@ impl LlamaConfig {
             rope_freq_base,
             rope_dimension_count,
             rope_scaling,
+            attention_window,
         )
     }
 
@@ -317,6 +441,19 @@ impl LlamaConfig {
         self.rope_scaling.factor()
     }
 
+    /// Returns the optional causal attention window in tokens.
+    #[must_use]
+    pub const fn attention_window(&self) -> Option<usize> {
+        self.attention_window
+    }
+
+    /// Returns the first cached token visible to the current attention step.
+    #[must_use]
+    pub fn attention_start(&self, cached_tokens: usize) -> usize {
+        self.attention_window
+            .map_or(0, |window| cached_tokens.saturating_sub(window))
+    }
+
     /// Converts a token index to the rotary position used by this model.
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
@@ -378,6 +515,11 @@ impl LlamaConfig {
             ));
         }
         self.rope_scaling.validate()?;
+        if self.attention_window == Some(0) {
+            return Err(LlamaError::InvalidConfig(
+                "attention_window must be greater than zero".to_owned(),
+            ));
+        }
         Ok(())
     }
 }
@@ -579,10 +721,9 @@ impl LlamaModel {
     /// Returns an error when the architecture or required tensor layout does
     /// not match the configuration.
     pub fn from_model(model: GgufModel, config: LlamaConfig) -> Result<Self, LlamaError> {
-        if model.architecture() != Some("llama") {
-            return Err(LlamaError::UnsupportedArchitecture(
-                model.architecture().unwrap_or("missing").to_owned(),
-            ));
+        let architecture = model.architecture().unwrap_or("missing");
+        if metadata_keys(architecture).is_none() {
+            return Err(LlamaError::UnsupportedArchitecture(architecture.to_owned()));
         }
         validate_layout(&model, &config)?;
         Ok(Self { model, config })
@@ -1456,12 +1597,13 @@ impl<'a> LlamaSession<'a> {
             let mut attended = vec![0.0; embedding_width];
             let query_groups = self.model.config.head_count / self.model.config.head_count_kv;
             let cached_tokens = self.position + 1;
+            let attention_start = self.model.config.attention_start(cached_tokens);
             for query_head in 0..self.model.config.head_count {
                 let kv_head = query_head / query_groups;
                 let query_start = query_head * head_dim;
                 let kv_start = kv_head * head_dim;
-                let mut scores = Vec::with_capacity(cached_tokens);
-                for token_index in 0..cached_tokens {
+                let mut scores = Vec::with_capacity(cached_tokens - attention_start);
+                for token_index in attention_start..cached_tokens {
                     let cached_key_start = token_index * self.cache.kv_width + kv_start;
                     let mut score = 0.0_f32;
                     for offset in 0..head_dim {
@@ -1478,7 +1620,7 @@ impl<'a> LlamaSession<'a> {
                 }
                 let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 let mut denominator = 0.0_f32;
-                let mut probabilities = Vec::with_capacity(cached_tokens);
+                let mut probabilities = Vec::with_capacity(cached_tokens - attention_start);
                 for score in scores {
                     let probability = (score - maximum).exp();
                     if !probability.is_finite() {
@@ -1494,7 +1636,8 @@ impl<'a> LlamaSession<'a> {
                         "attention probability denominator is invalid".to_owned(),
                     ));
                 }
-                for (token_index, probability) in probabilities.into_iter().enumerate() {
+                for (offset, probability) in probabilities.into_iter().enumerate() {
+                    let token_index = attention_start + offset;
                     let cached_value_start = token_index * self.cache.kv_width + kv_start;
                     let weight = probability / denominator;
                     for offset in 0..head_dim {
@@ -2051,6 +2194,10 @@ mod tests {
     }
 
     fn llama_fixture() -> Vec<u8> {
+        llama_fixture_for("llama")
+    }
+
+    fn llama_fixture_for(architecture: &str) -> Vec<u8> {
         let config = [
             ("token_embd.weight", vec![4_u64, 8]),
             ("output.weight", vec![4, 8]),
@@ -2072,16 +2219,36 @@ mod tests {
         bytes.extend_from_slice(&13_u64.to_le_bytes());
         push_string(&mut bytes, "general.architecture");
         bytes.extend_from_slice(&8_u32.to_le_bytes());
-        push_string(&mut bytes, "llama");
-        push_u32_metadata(&mut bytes, "llama.context_length", 16);
-        push_u32_metadata(&mut bytes, "llama.embedding_length", 4);
-        push_u32_metadata(&mut bytes, "llama.block_count", 1);
-        push_u32_metadata(&mut bytes, "llama.attention.head_count", 2);
-        push_u32_metadata(&mut bytes, "llama.attention.head_count_kv", 1);
-        push_u32_metadata(&mut bytes, "llama.feed_forward_length", 8);
-        push_u32_metadata(&mut bytes, "llama.vocab_size", 8);
-        push_f32_metadata(&mut bytes, "llama.attention.layer_norm_rms_epsilon", 1.0e-5);
-        push_f32_metadata(&mut bytes, "llama.rope.freq_base", 10_000.0);
+        push_string(&mut bytes, architecture);
+        push_u32_metadata(&mut bytes, &format!("{architecture}.context_length"), 16);
+        push_u32_metadata(&mut bytes, &format!("{architecture}.embedding_length"), 4);
+        push_u32_metadata(&mut bytes, &format!("{architecture}.block_count"), 1);
+        push_u32_metadata(
+            &mut bytes,
+            &format!("{architecture}.attention.head_count"),
+            2,
+        );
+        push_u32_metadata(
+            &mut bytes,
+            &format!("{architecture}.attention.head_count_kv"),
+            1,
+        );
+        push_u32_metadata(
+            &mut bytes,
+            &format!("{architecture}.feed_forward_length"),
+            8,
+        );
+        push_u32_metadata(&mut bytes, &format!("{architecture}.vocab_size"), 8);
+        push_f32_metadata(
+            &mut bytes,
+            &format!("{architecture}.attention.layer_norm_rms_epsilon"),
+            1.0e-5,
+        );
+        push_f32_metadata(
+            &mut bytes,
+            &format!("{architecture}.rope.freq_base"),
+            10_000.0,
+        );
         push_string(&mut bytes, "general.name");
         bytes.extend_from_slice(&8_u32.to_le_bytes());
         push_string(&mut bytes, "fixture");
@@ -2281,6 +2448,45 @@ mod tests {
     }
 
     #[test]
+    fn applies_a_bounded_sliding_attention_window() {
+        let config = LlamaConfig::new_with_rope_scaling_and_attention_window(
+            16,
+            8,
+            1,
+            2,
+            1,
+            16,
+            32,
+            1.0e-5,
+            10_000.0,
+            4,
+            LlamaRopeScaling::None,
+            Some(4),
+        )
+        .unwrap();
+        assert_eq!(config.attention_window(), Some(4));
+        assert_eq!(config.attention_start(3), 0);
+        assert_eq!(config.attention_start(7), 3);
+        assert!(
+            LlamaConfig::new_with_rope_scaling_and_attention_window(
+                16,
+                8,
+                1,
+                2,
+                1,
+                16,
+                32,
+                1.0e-5,
+                10_000.0,
+                4,
+                LlamaRopeScaling::None,
+                Some(0),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn parses_supported_rope_scaling_metadata() {
         assert_eq!(
             parse_rope_scaling(Some(MetadataScalar::String("linear".to_owned())), Some(4.0))
@@ -2348,6 +2554,16 @@ mod tests {
         assert_eq!(model.config().context_length(), 16);
         assert_eq!(model.config().head_count_kv(), 1);
         assert_eq!(model.model().tensors().len(), 12);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn opens_mistral_metadata_with_the_shared_decoder_layout() {
+        let path = write_fixture(&llama_fixture_for("mistral"));
+        let model = LlamaModel::open(&path, 1 << 20).unwrap();
+        assert_eq!(model.model().architecture(), Some("mistral"));
+        assert_eq!(model.config().embedding_length(), 4);
+        assert_eq!(model.config().attention_window(), None);
         fs::remove_file(path).unwrap();
     }
 
