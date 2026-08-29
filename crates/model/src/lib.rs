@@ -180,6 +180,29 @@ impl QuantizedMatrix {
         self.decode_column(column)
     }
 
+    /// Returns selected logical input columns in request order.
+    ///
+    /// Each selected column contributes [`Self::rows`] contiguous F32 values
+    /// to the output. Duplicate column indices are preserved. The compact
+    /// matrix remains encoded, so token embedding lookup does not materialize
+    /// unrelated vocabulary rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the output size overflows, an index is outside
+    /// the matrix, or a decoded value is malformed or non-finite.
+    pub fn gather_columns(&self, columns: &[usize]) -> Result<Vec<f32>, ModelError> {
+        let output_len = columns
+            .len()
+            .checked_mul(self.rows)
+            .ok_or_else(|| ModelError::Shape("quantized column gather size overflows".to_owned()))?;
+        let mut output = Vec::with_capacity(output_len);
+        for &column in columns {
+            output.extend(self.decode_column(column)?);
+        }
+        Ok(output)
+    }
+
     /// Computes a row-vector product directly from the encoded matrix.
     ///
     /// The input length must equal [`Self::rows`]. No complete F32 matrix is
@@ -8012,6 +8035,15 @@ mod tests {
         assert_eq!(matrix.value_type().raw(), 2);
         assert_eq!(matrix.column(0).unwrap(), vec![1.0; 32]);
         assert_eq!(matrix.column(1).unwrap(), vec![2.0; 32]);
+        assert_eq!(
+            matrix.gather_columns(&[1, 0, 1]).unwrap(),
+            [vec![2.0; 32], vec![1.0; 32], vec![2.0; 32]].concat()
+        );
+        assert!(matrix.gather_columns(&[]).unwrap().is_empty());
+        assert!(matches!(
+            matrix.gather_columns(&[2]),
+            Err(ModelError::Shape(message)) if message.contains("outside 2 columns")
+        ));
         assert_eq!(matrix.matmul_f32(&[1.0; 32]).unwrap(), &[32.0, 64.0]);
         let batched = model
             .load_quantized_many(&["probe.tensor", "probe.tensor"])
