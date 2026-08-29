@@ -61,6 +61,13 @@ name = "ggml-gguf"
 version = "0.1.0"
 
 [[package]]
+name = "ggml-graph"
+version = "0.1.0"
+dependencies = [
+ "ggml-tensor",
+]
+
+[[package]]
 name = "ggml-mmap"
 version = "0.1.0"
 dependencies = [
