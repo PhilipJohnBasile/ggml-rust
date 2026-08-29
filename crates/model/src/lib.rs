@@ -656,55 +656,39 @@ impl GgufModel {
     /// Returns an error when the tensor is missing, not a supported quantized
     /// matrix, malformed, or the model bytes changed after indexing.
     pub fn load_quantized(&self, name: &str) -> Result<QuantizedMatrix, ModelError> {
-        let descriptor = self
-            .tensor(name)
-            .ok_or_else(|| ModelError::TensorNotFound(name.to_owned()))?;
-        let (rows, columns) = match descriptor.shape.as_slice() {
-            [rows, columns] => (*rows, *columns),
-            shape => {
-                return Err(ModelError::Shape(format!(
-                    "quantized matrix requires rank 2, got {shape:?}"
-                )));
-            }
-        };
-        let (block_values, block_bytes) = quantized_block_layout(descriptor.value_type)
-            .ok_or_else(|| ModelError::UnsupportedTensorType {
-                name: descriptor.name.clone(),
-                value_type: descriptor.value_type,
-            })?;
-        if !rows.is_multiple_of(block_values) {
-            return Err(ModelError::Shape(format!(
-                "quantized matrix rows must be a multiple of {block_values}"
-            )));
-        }
-        let expected_bytes = rows
-            .checked_mul(columns)
-            .and_then(|elements| elements.checked_div(block_values))
-            .and_then(|blocks| blocks.checked_mul(block_bytes))
-            .ok_or_else(|| {
-                ModelError::Shape("quantized matrix byte length overflows".to_owned())
-            })?;
-        if usize::try_from(descriptor.byte_len).ok() != Some(expected_bytes) {
-            return Err(ModelError::Shape(format!(
-                "quantized matrix byte length {}, expected {expected_bytes}",
-                descriptor.byte_len
-            )));
+        let mut matrices = self.load_quantized_many(&[name])?;
+        matrices
+            .pop()
+            .ok_or_else(|| ModelError::TensorNotFound(name.to_owned()))
+    }
+
+    /// Loads several rank-2 quantized GGUF matrices through one validated
+    /// mapping without expanding them to F32.
+    ///
+    /// The returned matrices preserve the order of `names`. Each encoded
+    /// tensor is copied once into an owned buffer, while the GGUF is mapped and
+    /// digest-checked only once for the whole batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any tensor is missing, not a supported quantized
+    /// matrix, malformed, or the model bytes changed after indexing.
+    pub fn load_quantized_many(&self, names: &[&str]) -> Result<Vec<QuantizedMatrix>, ModelError> {
+        let descriptors = names
+            .iter()
+            .map(|name| {
+                self.tensor(name)
+                    .ok_or_else(|| ModelError::TensorNotFound((*name).to_owned()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for descriptor in &descriptors {
+            validate_quantized_matrix_descriptor(descriptor)?;
         }
         self.with_validated_bytes(|bytes| {
-            let start = usize::try_from(descriptor.byte_offset)
-                .map_err(|_| ModelError::Shape("tensor offset exceeds usize".to_owned()))?;
-            let end = start
-                .checked_add(expected_bytes)
-                .ok_or_else(|| ModelError::Shape("tensor range overflows usize".to_owned()))?;
-            let tensor_bytes = bytes
-                .get(start..end)
-                .ok_or_else(|| ModelError::Parse("tensor range is outside the file".to_owned()))?;
-            Ok(QuantizedMatrix {
-                rows,
-                columns,
-                value_type: descriptor.value_type,
-                bytes: tensor_bytes.to_vec(),
-            })
+            descriptors
+                .iter()
+                .map(|descriptor| materialize_quantized(bytes, descriptor))
+                .collect()
         })
     }
 
@@ -1219,6 +1203,64 @@ fn quantized_block_layout(value_type: TensorType) -> Option<(usize, usize)> {
         15 => Some((256, 292)),
         _ => None,
     }
+}
+
+fn validate_quantized_matrix_descriptor(
+    descriptor: &TensorDescriptor,
+) -> Result<(usize, usize, usize), ModelError> {
+    let (rows, columns) = match descriptor.shape.as_slice() {
+        [rows, columns] => (*rows, *columns),
+        shape => {
+            return Err(ModelError::Shape(format!(
+                "quantized matrix requires rank 2, got {shape:?}"
+            )));
+        }
+    };
+    let (block_values, block_bytes) =
+        quantized_block_layout(descriptor.value_type).ok_or_else(|| {
+            ModelError::UnsupportedTensorType {
+                name: descriptor.name.clone(),
+                value_type: descriptor.value_type,
+            }
+        })?;
+    if !rows.is_multiple_of(block_values) {
+        return Err(ModelError::Shape(format!(
+            "quantized matrix rows must be a multiple of {block_values}"
+        )));
+    }
+    let expected_bytes = rows
+        .checked_mul(columns)
+        .and_then(|elements| elements.checked_div(block_values))
+        .and_then(|blocks| blocks.checked_mul(block_bytes))
+        .ok_or_else(|| ModelError::Shape("quantized matrix byte length overflows".to_owned()))?;
+    if usize::try_from(descriptor.byte_len).ok() != Some(expected_bytes) {
+        return Err(ModelError::Shape(format!(
+            "quantized matrix byte length {}, expected {expected_bytes}",
+            descriptor.byte_len
+        )));
+    }
+    Ok((rows, columns, expected_bytes))
+}
+
+fn materialize_quantized(
+    bytes: &[u8],
+    descriptor: &TensorDescriptor,
+) -> Result<QuantizedMatrix, ModelError> {
+    let (rows, columns, expected_bytes) = validate_quantized_matrix_descriptor(descriptor)?;
+    let start = usize::try_from(descriptor.byte_offset)
+        .map_err(|_| ModelError::Shape("tensor offset exceeds usize".to_owned()))?;
+    let end = start
+        .checked_add(expected_bytes)
+        .ok_or_else(|| ModelError::Shape("tensor range overflows usize".to_owned()))?;
+    let tensor_bytes = bytes
+        .get(start..end)
+        .ok_or_else(|| ModelError::Parse("tensor range is outside the file".to_owned()))?;
+    Ok(QuantizedMatrix {
+        rows,
+        columns,
+        value_type: descriptor.value_type,
+        bytes: tensor_bytes.to_vec(),
+    })
 }
 
 fn quantized_value_at(
@@ -2193,6 +2235,10 @@ mod tests {
         assert_eq!(matrix.column(0).unwrap(), vec![1.0; 32]);
         assert_eq!(matrix.column(1).unwrap(), vec![2.0; 32]);
         assert_eq!(matrix.matmul_f32(&[1.0; 32]).unwrap(), &[32.0, 64.0]);
+        let batched = model
+            .load_quantized_many(&["probe.tensor", "probe.tensor"])
+            .unwrap();
+        assert_eq!(batched, vec![matrix.clone(), matrix]);
         fs::remove_file(path).unwrap();
     }
 

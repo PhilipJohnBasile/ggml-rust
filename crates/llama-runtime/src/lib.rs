@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 
@@ -799,22 +800,6 @@ impl CpuMatrix {
         Ok(Self::F32(transpose_ggml_matrix(tensor)?))
     }
 
-    fn from_model(model: &GgufModel, name: &str, use_quantized: bool) -> Result<Self, LlamaError> {
-        let descriptor = model
-            .tensor(name)
-            .ok_or_else(|| LlamaError::MissingTensor(name.to_owned()))?;
-        if use_quantized
-            && descriptor.shape().len() == 2
-            && matches!(
-                descriptor.value_type().raw(),
-                2 | 3 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15
-            )
-        {
-            return Ok(Self::Quantized(model.load_quantized(name)?));
-        }
-        Ok(Self::F32(transpose_ggml_matrix(model.load_f32(name)?)?))
-    }
-
     fn matmul(&self, input: &[f32]) -> Result<Vec<f32>, LlamaError> {
         match self {
             Self::F32(tensor) => row_tensor(input.len(), input.to_vec())?
@@ -896,53 +881,81 @@ impl LlamaCpuModel {
         if !use_quantized {
             return Self::load_f32_weights(model, config, tokenizer);
         }
-        let token_embedding =
-            CpuMatrix::from_model(&model.model, "token_embd.weight", use_quantized)?;
-        let output = CpuMatrix::from_model(&model.model, "output.weight", use_quantized)?;
-        let output_norm = model.model.load_f32("output_norm.weight")?;
+        Self::load_quantized_weights(model, config, tokenizer)
+    }
+
+    fn load_quantized_weights(
+        model: &LlamaModel,
+        config: LlamaConfig,
+        tokenizer: Option<LlamaTokenizer>,
+    ) -> Result<Self, LlamaError> {
+        let mut matrix_names = vec!["token_embd.weight".to_owned(), "output.weight".to_owned()];
+        let mut vector_names = vec!["output_norm.weight".to_owned()];
+        for layer in 0..config.block_count {
+            let prefix = format!("blk.{layer}");
+            vector_names.extend([
+                format!("{prefix}.attn_norm.weight"),
+                format!("{prefix}.ffn_norm.weight"),
+            ]);
+            matrix_names.extend([
+                format!("{prefix}.attn_q.weight"),
+                format!("{prefix}.attn_k.weight"),
+                format!("{prefix}.attn_v.weight"),
+                format!("{prefix}.attn_output.weight"),
+                format!("{prefix}.ffn_gate.weight"),
+                format!("{prefix}.ffn_down.weight"),
+                format!("{prefix}.ffn_up.weight"),
+            ]);
+        }
+        let mut quantized_names = Vec::new();
+        let mut f32_names = Vec::new();
+        for name in &matrix_names {
+            let descriptor = model
+                .model
+                .tensor(name)
+                .ok_or_else(|| LlamaError::MissingTensor(name.clone()))?;
+            if descriptor.shape().len() == 2
+                && matches!(
+                    descriptor.value_type().raw(),
+                    2 | 3 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15
+                )
+            {
+                quantized_names.push(name.as_str());
+            } else {
+                f32_names.push(name.as_str());
+            }
+        }
+        let quantized = model.model.load_quantized_many(&quantized_names)?;
+        let f32_matrices = model.model.load_f32_many(&f32_names)?;
+        let mut matrices = HashMap::with_capacity(matrix_names.len());
+        for (name, matrix) in quantized_names.into_iter().zip(quantized) {
+            matrices.insert(name.to_owned(), CpuMatrix::Quantized(matrix));
+        }
+        for (name, tensor) in f32_names.into_iter().zip(f32_matrices) {
+            matrices.insert(name.to_owned(), CpuMatrix::from_tensor(tensor)?);
+        }
+        let vector_refs = vector_names.iter().map(String::as_str).collect::<Vec<_>>();
+        let vector_values = model.model.load_f32_many(&vector_refs)?;
+        let mut vectors = vector_names
+            .into_iter()
+            .zip(vector_values)
+            .collect::<HashMap<_, _>>();
+        let token_embedding = take_matrix(&mut matrices, "token_embd.weight")?;
+        let output = take_matrix(&mut matrices, "output.weight")?;
+        let output_norm = take_vector(&mut vectors, "output_norm.weight")?;
         let mut layers = Vec::with_capacity(config.block_count);
         for layer in 0..config.block_count {
             let prefix = format!("blk.{layer}");
             layers.push(LayerWeights {
-                attn_norm: model
-                    .model
-                    .load_f32(&format!("{prefix}.attn_norm.weight"))?,
-                attn_q: CpuMatrix::from_model(
-                    &model.model,
-                    &format!("{prefix}.attn_q.weight"),
-                    use_quantized,
-                )?,
-                attn_k: CpuMatrix::from_model(
-                    &model.model,
-                    &format!("{prefix}.attn_k.weight"),
-                    use_quantized,
-                )?,
-                attn_v: CpuMatrix::from_model(
-                    &model.model,
-                    &format!("{prefix}.attn_v.weight"),
-                    use_quantized,
-                )?,
-                attn_output: CpuMatrix::from_model(
-                    &model.model,
-                    &format!("{prefix}.attn_output.weight"),
-                    use_quantized,
-                )?,
-                ffn_norm: model.model.load_f32(&format!("{prefix}.ffn_norm.weight"))?,
-                ffn_gate: CpuMatrix::from_model(
-                    &model.model,
-                    &format!("{prefix}.ffn_gate.weight"),
-                    use_quantized,
-                )?,
-                ffn_down: CpuMatrix::from_model(
-                    &model.model,
-                    &format!("{prefix}.ffn_down.weight"),
-                    use_quantized,
-                )?,
-                ffn_up: CpuMatrix::from_model(
-                    &model.model,
-                    &format!("{prefix}.ffn_up.weight"),
-                    use_quantized,
-                )?,
+                attn_norm: take_vector(&mut vectors, &format!("{prefix}.attn_norm.weight"))?,
+                attn_q: take_matrix(&mut matrices, &format!("{prefix}.attn_q.weight"))?,
+                attn_k: take_matrix(&mut matrices, &format!("{prefix}.attn_k.weight"))?,
+                attn_v: take_matrix(&mut matrices, &format!("{prefix}.attn_v.weight"))?,
+                attn_output: take_matrix(&mut matrices, &format!("{prefix}.attn_output.weight"))?,
+                ffn_norm: take_vector(&mut vectors, &format!("{prefix}.ffn_norm.weight"))?,
+                ffn_gate: take_matrix(&mut matrices, &format!("{prefix}.ffn_gate.weight"))?,
+                ffn_down: take_matrix(&mut matrices, &format!("{prefix}.ffn_down.weight"))?,
+                ffn_up: take_matrix(&mut matrices, &format!("{prefix}.ffn_up.weight"))?,
             });
         }
         Ok(Self {
@@ -952,7 +965,7 @@ impl LlamaCpuModel {
             output_norm,
             layers,
             tokenizer,
-            use_quantized,
+            use_quantized: true,
         })
     }
 
@@ -1638,6 +1651,21 @@ fn next_tensor(
 ) -> Result<Tensor, LlamaError> {
     tensors
         .next()
+        .ok_or_else(|| LlamaError::Tensor(format!("GGUF loader did not return {name}")))
+}
+
+fn take_matrix(
+    matrices: &mut HashMap<String, CpuMatrix>,
+    name: &str,
+) -> Result<CpuMatrix, LlamaError> {
+    matrices
+        .remove(name)
+        .ok_or_else(|| LlamaError::Tensor(format!("GGUF loader did not return {name}")))
+}
+
+fn take_vector(vectors: &mut HashMap<String, Tensor>, name: &str) -> Result<Tensor, LlamaError> {
+    vectors
+        .remove(name)
         .ok_or_else(|| LlamaError::Tensor(format!("GGUF loader did not return {name}")))
 }
 
