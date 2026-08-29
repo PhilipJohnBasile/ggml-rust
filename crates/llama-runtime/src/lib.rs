@@ -19,6 +19,7 @@ pub struct LlamaConfig {
     vocab_size: usize,
     rms_norm_epsilon: f32,
     rope_freq_base: f32,
+    rope_dimension_count: usize,
 }
 
 impl LlamaConfig {
@@ -39,6 +40,42 @@ impl LlamaConfig {
         rms_norm_epsilon: f32,
         rope_freq_base: f32,
     ) -> Result<Self, LlamaError> {
+        let rope_dimension_count = embedding_length.checked_div(head_count).unwrap_or(0);
+        Self::new_with_rope_dimension(
+            context_length,
+            embedding_length,
+            block_count,
+            head_count,
+            head_count_kv,
+            feed_forward_length,
+            vocab_size,
+            rms_norm_epsilon,
+            rope_freq_base,
+            rope_dimension_count,
+        )
+    }
+
+    /// Creates a validated Llama configuration with an explicit rotary width.
+    ///
+    /// `rope_dimension_count` may be smaller than the attention head width for
+    /// architectures that rotate only a prefix of each head.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when dimensions or numerical parameters are invalid.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_rope_dimension(
+        context_length: usize,
+        embedding_length: usize,
+        block_count: usize,
+        head_count: usize,
+        head_count_kv: usize,
+        feed_forward_length: usize,
+        vocab_size: usize,
+        rms_norm_epsilon: f32,
+        rope_freq_base: f32,
+        rope_dimension_count: usize,
+    ) -> Result<Self, LlamaError> {
         let config = Self {
             context_length,
             embedding_length,
@@ -49,6 +86,7 @@ impl LlamaConfig {
             vocab_size,
             rms_norm_epsilon,
             rope_freq_base,
+            rope_dimension_count,
         };
         config.validate()?;
         Ok(config)
@@ -100,7 +138,17 @@ impl LlamaConfig {
             optional_f32_value(values.next().flatten(), keys[7])?.unwrap_or(1.0e-5);
         let rope_freq_base =
             optional_f32_value(values.next().flatten(), keys[8])?.unwrap_or(10_000.0);
-        Self::new(
+        let rope_dimension_count = model
+            .metadata_scalar("llama.rope.dimension_count")?
+            .map(|value| {
+                as_usize(value).map_err(|value| LlamaError::InvalidMetadata {
+                    key: "llama.rope.dimension_count",
+                    value,
+                })
+            })
+            .transpose()?
+            .unwrap_or_else(|| embedding_length.checked_div(head_count).unwrap_or(0));
+        Self::new_with_rope_dimension(
             context_length,
             embedding_length,
             block_count,
@@ -110,6 +158,7 @@ impl LlamaConfig {
             vocab_size,
             rms_norm_epsilon,
             rope_freq_base,
+            rope_dimension_count,
         )
     }
 
@@ -167,6 +216,12 @@ impl LlamaConfig {
         self.rope_freq_base
     }
 
+    /// Returns the number of values rotated in each attention head.
+    #[must_use]
+    pub const fn rope_dimension_count(&self) -> usize {
+        self.rope_dimension_count
+    }
+
     fn validate(&self) -> Result<(), LlamaError> {
         for (name, value) in [
             ("context_length", self.context_length),
@@ -195,9 +250,19 @@ impl LlamaConfig {
                 "embedding_length must be divisible by head_count".to_owned(),
             ));
         }
-        if !(self.embedding_length / self.head_count).is_multiple_of(2) {
+        let head_dim = self.embedding_length / self.head_count;
+        if !head_dim.is_multiple_of(2) {
             return Err(LlamaError::InvalidConfig(
                 "head dimension must be even for rotary embeddings".to_owned(),
+            ));
+        }
+        if self.rope_dimension_count == 0
+            || self.rope_dimension_count > head_dim
+            || !self.rope_dimension_count.is_multiple_of(2)
+        {
+            return Err(LlamaError::InvalidConfig(
+                "rope_dimension_count must be positive, even, and no larger than head dimension"
+                    .to_owned(),
             ));
         }
         if !self.rms_norm_epsilon.is_finite() || self.rms_norm_epsilon <= 0.0 {
@@ -1271,6 +1336,7 @@ impl<'a> LlamaSession<'a> {
                 &mut query_values,
                 self.model.config.head_count,
                 head_dim,
+                self.model.config.rope_dimension_count,
                 self.position,
                 self.model.config.rope_freq_base,
             )?;
@@ -1278,6 +1344,7 @@ impl<'a> LlamaSession<'a> {
                 &mut key_values,
                 self.model.config.head_count_kv,
                 head_dim,
+                self.model.config.rope_dimension_count,
                 self.position,
                 self.model.config.rope_freq_base,
             )?;
@@ -1449,6 +1516,7 @@ fn apply_rope(
     values: &mut [f32],
     head_count: usize,
     head_dim: usize,
+    rope_dimension_count: usize,
     position: usize,
     frequency_base: f32,
 ) -> Result<(), LlamaError> {
@@ -1459,7 +1527,7 @@ fn apply_rope(
     let head_dim = head_width as f32;
     for head in 0..head_count {
         let start = head * head_width;
-        for pair in 0..head_width / 2 {
+        for pair in 0..rope_dimension_count / 2 {
             #[allow(clippy::cast_precision_loss)]
             let exponent = -2.0 * pair as f32 / head_dim;
             let angle = position * frequency_base.powf(exponent);
