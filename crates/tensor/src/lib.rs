@@ -640,60 +640,111 @@ impl Tensor {
         checked_output(self.shape.clone(), result, "clamp")
     }
 
-    /// Multiplies two row-major rank-2 matrices.
+    /// Multiplies row-major matrices, including broadcasted batch dimensions.
+    ///
+    /// The final two dimensions are interpreted as matrix dimensions. Leading
+    /// dimensions are broadcast with the same right-aligned singleton rules as
+    /// elementwise arithmetic.
     ///
     /// # Errors
     ///
-    /// Returns an error when either tensor is not rank 2, inner dimensions do
-    /// not match, or a matrix product is non-finite.
+    /// Returns an error when either tensor has rank below two, inner
+    /// dimensions or batch dimensions do not match, or a matrix product is
+    /// non-finite.
     pub fn matmul(&self, rhs: &Self) -> Result<Self, TensorError> {
-        const TILE: usize = 32;
-        if self.rank() != 2 {
+        if self.rank() < 2 {
             return Err(TensorError::RankMismatch {
                 expected: 2,
                 actual: self.rank(),
             });
         }
-        if rhs.rank() != 2 {
+        if rhs.rank() < 2 {
             return Err(TensorError::RankMismatch {
                 expected: 2,
                 actual: rhs.rank(),
             });
         }
-        let rows = self.shape[0];
-        let inner = self.shape[1];
-        let rhs_inner = rhs.shape[0];
-        let columns = rhs.shape[1];
+        let rows = self.shape[self.rank() - 2];
+        let inner = self.shape[self.rank() - 1];
+        let rhs_inner = rhs.shape[rhs.rank() - 2];
+        let columns = rhs.shape[rhs.rank() - 1];
         if inner != rhs_inner {
             return Err(TensorError::MatrixShapeMismatch {
                 left: self.shape.clone(),
                 right: rhs.shape.clone(),
             });
         }
-        let result_len = rows
-            .checked_mul(columns)
-            .ok_or(TensorError::ElementCountOverflow)?;
-        let mut result = vec![0.0; result_len];
-        for row_start in (0..rows).step_by(TILE) {
-            let row_end = (row_start + TILE).min(rows);
-            for inner_start in (0..inner).step_by(TILE) {
-                let inner_end = (inner_start + TILE).min(inner);
-                for column_start in (0..columns).step_by(TILE) {
-                    let column_end = (column_start + TILE).min(columns);
-                    for row in row_start..row_end {
-                        for index in inner_start..inner_end {
-                            let left = self.data[row * inner + index];
-                            let rhs_row = index * columns;
-                            let result_row = row * columns;
-                            for column in column_start..column_end {
-                                result[result_row + column] += left * rhs.data[rhs_row + column];
-                            }
-                        }
+        let batch_rank = self
+            .rank()
+            .saturating_sub(2)
+            .max(rhs.rank().saturating_sub(2));
+        let left_batch_offset = batch_rank - (self.rank() - 2);
+        let right_batch_offset = batch_rank - (rhs.rank() - 2);
+        let mut output_shape = Vec::with_capacity(batch_rank + 2);
+        for axis in 0..batch_rank {
+            let left_dimension = if axis < left_batch_offset {
+                1
+            } else {
+                self.shape[axis - left_batch_offset]
+            };
+            let right_dimension = if axis < right_batch_offset {
+                1
+            } else {
+                rhs.shape[axis - right_batch_offset]
+            };
+            if left_dimension != right_dimension && left_dimension != 1 && right_dimension != 1 {
+                return Err(TensorError::MatrixShapeMismatch {
+                    left: self.shape.clone(),
+                    right: rhs.shape.clone(),
+                });
+            }
+            output_shape.push(left_dimension.max(right_dimension));
+        }
+        output_shape.extend([rows, columns]);
+        let output_len = element_count(&output_shape)?;
+        let mut result = vec![0.0; output_len];
+        let batch_count = output_shape[..batch_rank]
+            .iter()
+            .copied()
+            .product::<usize>();
+        let mut batch_coordinates = vec![0_usize; batch_rank];
+        for batch_index in 0..batch_count {
+            let mut left_batch_index = 0_usize;
+            for (axis, &dimension) in self.shape[..self.rank() - 2].iter().enumerate() {
+                let output_axis = left_batch_offset + axis;
+                let coordinate = if dimension == 1 {
+                    0
+                } else {
+                    batch_coordinates[output_axis]
+                };
+                left_batch_index = left_batch_index * dimension + coordinate;
+            }
+            let mut right_batch_index = 0_usize;
+            for (axis, &dimension) in rhs.shape[..rhs.rank() - 2].iter().enumerate() {
+                let output_axis = right_batch_offset + axis;
+                let coordinate = if dimension == 1 {
+                    0
+                } else {
+                    batch_coordinates[output_axis]
+                };
+                right_batch_index = right_batch_index * dimension + coordinate;
+            }
+            let left_base = left_batch_index * rows * inner;
+            let right_base = right_batch_index * inner * columns;
+            let output_base = batch_index * rows * columns;
+            for row in 0..rows {
+                for column in 0..columns {
+                    let mut sum = 0.0_f32;
+                    for index in 0..inner {
+                        sum += self.data[left_base + row * inner + index]
+                            * rhs.data[right_base + index * columns + column];
                     }
+                    result[output_base + row * columns + column] = sum;
                 }
             }
+            increment_index(&mut batch_coordinates, &output_shape[..batch_rank]);
         }
-        checked_output(vec![rows, columns], result, "matmul")
+        checked_output(output_shape, result, "matmul")
     }
 
     /// Applies `SiLU`, also known as the swish activation, elementwise.
@@ -1256,6 +1307,18 @@ mod tests {
         let result = left.matmul(&right).unwrap();
         assert_eq!(result.shape(), &[2, 2]);
         assert_eq!(result.data(), &[58.0, 64.0, 139.0, 154.0]);
+    }
+
+    #[test]
+    fn matrix_multiplication_broadcasts_batch_dimensions() {
+        let left = Tensor::from_data([2, 2, 1], [1.0, 2.0, 3.0, 4.0]).unwrap();
+        let right = Tensor::from_data([1, 1, 2], [5.0, 6.0]).unwrap();
+        let result = left.matmul(&right).unwrap();
+        assert_eq!(result.shape(), &[2, 2, 2]);
+        assert_eq!(
+            result.data(),
+            &[5.0, 6.0, 10.0, 12.0, 15.0, 18.0, 20.0, 24.0]
+        );
     }
 
     #[test]
