@@ -761,6 +761,42 @@ impl Tensor {
         self.binary_broadcast(rhs, "minimum", f32::min)
     }
 
+    /// Selects values elementwise from `when_true` and `when_false`.
+    ///
+    /// This is the F32 tensor equivalent of MLX `where`: the condition, true
+    /// values, and false values are broadcast together with right-aligned
+    /// singleton broadcasting. A finite condition is false exactly when it is
+    /// zero, including negative zero, and true for every other finite value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the three shapes cannot broadcast to one common
+    /// shape, the output size overflows, or any operand contains a non-finite
+    /// value.
+    pub fn select(&self, when_true: &Self, when_false: &Self) -> Result<Self, TensorError> {
+        self.validate_finite()?;
+        when_true.validate_finite()?;
+        when_false.validate_finite()?;
+
+        let output_shape = broadcasted_shape(&self.shape, &when_true.shape)
+            .and_then(|shape| broadcasted_shape(&shape, &when_false.shape))?;
+        let output_len = element_count(&output_shape)?;
+        let mut result = Vec::with_capacity(output_len);
+        let mut coordinates = vec![0_usize; output_shape.len()];
+        for _ in 0..output_len {
+            let condition_index = broadcast_index(&self.shape, &coordinates);
+            let true_index = broadcast_index(&when_true.shape, &coordinates);
+            let false_index = broadcast_index(&when_false.shape, &coordinates);
+            result.push(if self.data[condition_index] == 0.0 {
+                when_false.data[false_index]
+            } else {
+                when_true.data[true_index]
+            });
+            increment_index(&mut coordinates, &output_shape);
+        }
+        checked_output(output_shape, result, "select")
+    }
+
     /// Multiplies every value by one scalar.
     ///
     /// # Errors
@@ -1662,6 +1698,48 @@ fn element_count(shape: &[usize]) -> Result<usize, TensorError> {
         .ok_or(TensorError::ElementCountOverflow)
 }
 
+fn broadcasted_shape(left: &[usize], right: &[usize]) -> Result<Vec<usize>, TensorError> {
+    let rank = left.len().max(right.len());
+    let left_offset = rank - left.len();
+    let right_offset = rank - right.len();
+    let mut output = Vec::with_capacity(rank);
+    for axis in 0..rank {
+        let left_dimension = if axis < left_offset {
+            1
+        } else {
+            left[axis - left_offset]
+        };
+        let right_dimension = if axis < right_offset {
+            1
+        } else {
+            right[axis - right_offset]
+        };
+        if left_dimension != right_dimension && left_dimension != 1 && right_dimension != 1 {
+            return Err(TensorError::ShapeMismatch {
+                left: left.to_vec(),
+                right: right.to_vec(),
+            });
+        }
+        output.push(left_dimension.max(right_dimension));
+    }
+    Ok(output)
+}
+
+fn broadcast_index(shape: &[usize], output_coordinates: &[usize]) -> usize {
+    let offset = output_coordinates.len() - shape.len();
+    shape
+        .iter()
+        .enumerate()
+        .fold(0_usize, |index, (axis, &dimension)| {
+            let coordinate = if dimension == 1 {
+                0
+            } else {
+                output_coordinates[offset + axis]
+            };
+            index * dimension + coordinate
+        })
+}
+
 fn increment_index(index: &mut [usize], shape: &[usize]) {
     for axis in (0..index.len()).rev() {
         index[axis] += 1;
@@ -1861,6 +1939,71 @@ mod tests {
         let broadcast = left.add(&Tensor::from_data([1, 2], [3.0, 4.0]).unwrap());
         assert_eq!(broadcast.unwrap().data(), &[4.0, 5.0, 5.0, 6.0]);
         assert_eq!(left.add(&Tensor::scalar(2.0)).unwrap().data(), &[3.0, 4.0]);
+    }
+
+    #[test]
+    fn select_broadcasts_condition_and_both_value_tensors() {
+        let condition = Tensor::from_data([2, 1, 1], [1.0, 0.0]).unwrap();
+        let when_true = Tensor::from_data([2, 1, 2], [1.0, 2.0, 3.0, 4.0]).unwrap();
+        let when_false = Tensor::from_data([2, 2, 1], [11.0, 22.0, 33.0, 44.0]).unwrap();
+        let selected = condition.select(&when_true, &when_false).unwrap();
+        assert_eq!(selected.shape(), &[2, 2, 2]);
+        assert_eq!(
+            selected.data(),
+            &[1.0, 2.0, 1.0, 2.0, 33.0, 33.0, 44.0, 44.0]
+        );
+    }
+
+    #[test]
+    fn select_uses_numeric_condition_truth_and_scalar_broadcasting() {
+        let condition = Tensor::from_data([4], [-2.0, -0.0, 0.0, 0.25]).unwrap();
+        let selected = condition
+            .select(&Tensor::scalar(7.0), &Tensor::scalar(-3.0))
+            .unwrap();
+        assert_eq!(selected.data(), &[7.0, -3.0, -3.0, 7.0]);
+
+        let all_true = Tensor::scalar(1.0)
+            .select(
+                &Tensor::from_data([2], [5.0, 6.0]).unwrap(),
+                &Tensor::from_data([2, 1], [8.0, 9.0]).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(all_true.shape(), &[2, 2]);
+        assert_eq!(all_true.data(), &[5.0, 6.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn select_rejects_incompatible_shapes() {
+        let condition = Tensor::from_data([2, 1], [1.0, 0.0]).unwrap();
+        let when_true = Tensor::from_data([3], [1.0, 2.0, 3.0]).unwrap();
+        let when_false = Tensor::from_data([4], [4.0, 5.0, 6.0, 7.0]).unwrap();
+        assert!(matches!(
+            condition.select(&when_true, &when_false),
+            Err(TensorError::ShapeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn select_rejects_non_finite_data_in_every_operand() {
+        let finite = Tensor::scalar(1.0);
+        assert_eq!(
+            Tensor::scalar(f32::NAN)
+                .select(&finite, &finite)
+                .unwrap_err(),
+            TensorError::NonFiniteInput { index: 0 }
+        );
+        assert_eq!(
+            Tensor::scalar(0.0)
+                .select(&Tensor::scalar(f32::INFINITY), &finite)
+                .unwrap_err(),
+            TensorError::NonFiniteInput { index: 0 }
+        );
+        assert_eq!(
+            Tensor::scalar(1.0)
+                .select(&finite, &Tensor::scalar(f32::NEG_INFINITY))
+                .unwrap_err(),
+            TensorError::NonFiniteInput { index: 0 }
+        );
     }
 
     #[test]

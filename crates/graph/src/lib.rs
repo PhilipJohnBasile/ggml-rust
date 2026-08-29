@@ -73,6 +73,7 @@ enum Operation {
     Add,
     Maximum,
     Minimum,
+    Select,
     Subtract,
     Multiply,
     Divide,
@@ -222,6 +223,24 @@ impl Graph {
     /// Returns an error when either input handle is invalid.
     pub fn minimum(&mut self, left: ValueId, right: ValueId) -> Result<ValueId, GraphError> {
         self.binary(Operation::Minimum, left, right)
+    }
+
+    /// Adds an MLX-style elementwise `where` node.
+    ///
+    /// The F32 condition is false for zero, including negative zero, and true
+    /// for any other finite value. The condition and both value tensors use
+    /// right-aligned singleton broadcasting during evaluation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any input handle is invalid.
+    pub fn select(
+        &mut self,
+        condition: ValueId,
+        when_true: ValueId,
+        when_false: ValueId,
+    ) -> Result<ValueId, GraphError> {
+        self.ternary(Operation::Select, condition, when_true, when_false)
     }
 
     /// Adds elementwise multiplication.
@@ -792,6 +811,10 @@ impl Graph {
                     .maximum(&values[self.input_index(node, 1)?])?,
                 Operation::Minimum => values[self.input_index(node, 0)?]
                     .minimum(&values[self.input_index(node, 1)?])?,
+                Operation::Select => values[self.input_index(node, 0)?].select(
+                    &values[self.input_index(node, 1)?],
+                    &values[self.input_index(node, 2)?],
+                )?,
                 Operation::Subtract => {
                     values[self.input_index(node, 0)?].sub(&values[self.input_index(node, 1)?])?
                 }
@@ -955,6 +978,19 @@ impl Graph {
         self.require(right)?;
         Ok(self.push(operation, vec![left, right]))
     }
+
+    fn ternary(
+        &mut self,
+        operation: Operation,
+        first: ValueId,
+        second: ValueId,
+        third: ValueId,
+    ) -> Result<ValueId, GraphError> {
+        self.require(first)?;
+        self.require(second)?;
+        self.require(third)?;
+        Ok(self.push(operation, vec![first, second, third]))
+    }
 }
 
 #[cfg(test)]
@@ -995,6 +1031,49 @@ mod tests {
             .unwrap();
         assert_eq!(result[0].data(), &[-1.0, 2.0, 0.0, 3.0]);
         assert_eq!(result[1].data(), &[0.0, 3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn evaluates_broadcasted_select() {
+        let mut graph = Graph::new();
+        let condition = graph.input([2, 1, 1]).unwrap();
+        let when_true = graph.input([2, 1, 2]).unwrap();
+        let when_false = graph.input([2, 2, 1]).unwrap();
+        let selected = graph.select(condition, when_true, when_false).unwrap();
+        let result = graph
+            .evaluate(
+                &[
+                    Tensor::from_data([2, 1, 1], [1.0, 0.0]).unwrap(),
+                    Tensor::from_data([2, 1, 2], [1.0, 2.0, 3.0, 4.0]).unwrap(),
+                    Tensor::from_data([2, 2, 1], [11.0, 22.0, 33.0, 44.0]).unwrap(),
+                ],
+                &[selected],
+            )
+            .unwrap();
+        assert_eq!(result[0].shape(), &[2, 2, 2]);
+        assert_eq!(
+            result[0].data(),
+            &[1.0, 2.0, 1.0, 2.0, 33.0, 33.0, 44.0, 44.0]
+        );
+    }
+
+    #[test]
+    fn select_builder_rejects_each_invalid_handle() {
+        let invalid = ValueId(usize::MAX);
+        let mut graph = Graph::new();
+        let input = graph.input([]).unwrap();
+        assert_eq!(
+            graph.select(invalid, input, input).unwrap_err(),
+            GraphError::InvalidValue(invalid)
+        );
+        assert_eq!(
+            graph.select(input, invalid, input).unwrap_err(),
+            GraphError::InvalidValue(invalid)
+        );
+        assert_eq!(
+            graph.select(input, input, invalid).unwrap_err(),
+            GraphError::InvalidValue(invalid)
+        );
     }
 
     #[test]
