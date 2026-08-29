@@ -1059,6 +1059,7 @@ impl GgufModel {
                 | 6
                 | 7
                 | 8
+                | 9
                 | 10
                 | 11
                 | 12
@@ -1075,6 +1076,8 @@ impl GgufModel {
                 | 21
                 | 29
                 | 30
+                | 41
+                | 42
                 | 39
                 | 40
                 | 34
@@ -5093,6 +5096,7 @@ fn decode_values(value_type: TensorType, bytes: &[u8]) -> Result<Vec<f32>, Model
         6 => decode_q5_0(bytes),
         7 => decode_q5_1(bytes),
         8 => decode_q8_0(bytes),
+        9 => decode_q8_1(bytes),
         10 => decode_q2_k(bytes),
         11 => decode_q3_k(bytes),
         12 => decode_q4_k(bytes),
@@ -5112,6 +5116,8 @@ fn decode_values(value_type: TensorType, bytes: &[u8]) -> Result<Vec<f32>, Model
         40 => decode_nvfp4(bytes),
         34 => decode_tq1_0(bytes),
         35 => decode_tq2_0(bytes),
+        41 => decode_q1_0(bytes),
+        42 => decode_q2_0(bytes),
         _ => Err(ModelError::UnsupportedTensorType {
             name: "<unknown>".to_owned(),
             value_type,
@@ -5390,6 +5396,7 @@ fn quantized_block_layout(value_type: TensorType) -> Option<(usize, usize)> {
         6 => Some((32, 22)),
         7 => Some((32, 24)),
         8 => Some((32, 34)),
+        9 => Some((32, 36)),
         10 => Some((256, 84)),
         11 | 21 => Some((256, 110)),
         12 => Some((256, 144)),
@@ -5406,6 +5413,8 @@ fn quantized_block_layout(value_type: TensorType) -> Option<(usize, usize)> {
         39 => Some((32, 17)),
         40 => Some((64, 36)),
         34 => Some((256, 54)),
+        41 => Some((128, 18)),
+        42 => Some((64, 18)),
         _ => None,
     }
 }
@@ -5479,6 +5488,7 @@ fn quantized_value_at(
         6 => q5_0_value_at(bytes, index),
         7 => q5_1_value_at(bytes, index),
         8 => q8_0_value_at(bytes, index),
+        9 => q8_1_value_at(bytes, index),
         10 => q2_k_value_at(bytes, index),
         11 => q3_k_value_at(bytes, index),
         12 => q4_k_value_at(bytes, index),
@@ -5498,6 +5508,8 @@ fn quantized_value_at(
         40 => nvfp4_value_at(bytes, index),
         34 => tq1_0_value_at(bytes, index),
         35 => tq2_0_value_at(bytes, index),
+        41 => q1_0_value_at(bytes, index),
+        42 => q2_0_value_at(bytes, index),
         _ => unreachable!("value type validated above"),
     }
 }
@@ -5568,6 +5580,74 @@ fn decode_q8_0(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
                 .iter()
                 .map(|value| f32::from(i8::from_ne_bytes([*value])) * scale),
         );
+    }
+    Ok(values)
+}
+
+fn decode_q8_1(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
+    const BLOCK_BYTES: usize = 36;
+    const BLOCK_VALUES: usize = 32;
+    let (blocks, remainder) = bytes.as_chunks::<BLOCK_BYTES>();
+    if !remainder.is_empty() {
+        return Err(ModelError::Shape(
+            "Q8_1 tensor byte length is not block aligned".to_owned(),
+        ));
+    }
+    let mut values = Vec::with_capacity(blocks.len() * BLOCK_VALUES);
+    for block in blocks {
+        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        values.extend(
+            block[4..]
+                .iter()
+                .map(|value| f32::from(i8::from_ne_bytes([*value])) * scale),
+        );
+    }
+    Ok(values)
+}
+
+fn decode_q1_0(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
+    const BLOCK_BYTES: usize = 18;
+    const BLOCK_VALUES: usize = 128;
+    let (blocks, remainder) = bytes.as_chunks::<BLOCK_BYTES>();
+    if !remainder.is_empty() {
+        return Err(ModelError::Shape(
+            "Q1_0 tensor byte length is not block aligned".to_owned(),
+        ));
+    }
+    let mut values = Vec::with_capacity(blocks.len() * BLOCK_VALUES);
+    for block in blocks {
+        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        for byte in &block[2..] {
+            for bit in 0..8 {
+                values.push(if byte & (1 << bit) == 0 {
+                    -scale
+                } else {
+                    scale
+                });
+            }
+        }
+    }
+    Ok(values)
+}
+
+fn decode_q2_0(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
+    const BLOCK_BYTES: usize = 18;
+    const BLOCK_VALUES: usize = 64;
+    let (blocks, remainder) = bytes.as_chunks::<BLOCK_BYTES>();
+    if !remainder.is_empty() {
+        return Err(ModelError::Shape(
+            "Q2_0 tensor byte length is not block aligned".to_owned(),
+        ));
+    }
+    let mut values = Vec::with_capacity(blocks.len() * BLOCK_VALUES);
+    for block in blocks {
+        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        for byte in &block[2..] {
+            for shift in (0..4).map(|index| index * 2) {
+                let quantized = (byte >> shift) & 0x03;
+                values.push((f32::from(quantized) - 1.0) * scale);
+            }
+        }
     }
     Ok(values)
 }
@@ -6245,6 +6325,59 @@ fn q8_0_value_at(bytes: &[u8], index: usize) -> Result<f32, ModelError> {
         .ok_or_else(|| ModelError::Shape("Q8_0 block is outside the tensor".to_owned()))?;
     let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
     Ok(f32::from(i8::from_ne_bytes([block[2 + offset]])) * scale)
+}
+
+fn q8_1_value_at(bytes: &[u8], index: usize) -> Result<f32, ModelError> {
+    const BLOCK_BYTES: usize = 36;
+    let block_index = index / 32;
+    let offset = index % 32;
+    let start = block_index
+        .checked_mul(BLOCK_BYTES)
+        .ok_or_else(|| ModelError::Shape("Q8_1 index overflows".to_owned()))?;
+    let end = start
+        .checked_add(BLOCK_BYTES)
+        .ok_or_else(|| ModelError::Shape("Q8_1 block range overflows".to_owned()))?;
+    let block = bytes
+        .get(start..end)
+        .ok_or_else(|| ModelError::Shape("Q8_1 block is outside the tensor".to_owned()))?;
+    let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    Ok(f32::from(i8::from_ne_bytes([block[4 + offset]])) * scale)
+}
+
+fn q1_0_value_at(bytes: &[u8], index: usize) -> Result<f32, ModelError> {
+    const BLOCK_BYTES: usize = 18;
+    let block_index = index / 128;
+    let offset = index % 128;
+    let start = block_index
+        .checked_mul(BLOCK_BYTES)
+        .ok_or_else(|| ModelError::Shape("Q1_0 index overflows".to_owned()))?;
+    let end = start
+        .checked_add(BLOCK_BYTES)
+        .ok_or_else(|| ModelError::Shape("Q1_0 block range overflows".to_owned()))?;
+    let block = bytes
+        .get(start..end)
+        .ok_or_else(|| ModelError::Shape("Q1_0 block is outside the tensor".to_owned()))?;
+    let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let bit = (block[2 + offset / 8] >> (offset % 8)) & 1;
+    Ok(if bit == 0 { -scale } else { scale })
+}
+
+fn q2_0_value_at(bytes: &[u8], index: usize) -> Result<f32, ModelError> {
+    const BLOCK_BYTES: usize = 18;
+    let block_index = index / 64;
+    let offset = index % 64;
+    let start = block_index
+        .checked_mul(BLOCK_BYTES)
+        .ok_or_else(|| ModelError::Shape("Q2_0 index overflows".to_owned()))?;
+    let end = start
+        .checked_add(BLOCK_BYTES)
+        .ok_or_else(|| ModelError::Shape("Q2_0 block range overflows".to_owned()))?;
+    let block = bytes
+        .get(start..end)
+        .ok_or_else(|| ModelError::Shape("Q2_0 block is outside the tensor".to_owned()))?;
+    let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let quantized = (block[2 + offset / 4] >> ((offset % 4) * 2)) & 0x03;
+    Ok((f32::from(quantized) - 1.0) * scale)
 }
 
 fn iq4_nl_value_at(bytes: &[u8], index: usize) -> Result<f32, ModelError> {
@@ -7400,6 +7533,34 @@ mod tests {
     }
 
     #[test]
+    fn materializes_q1_0_tensor() {
+        let mut encoded = vec![0x00, 0x3c];
+        encoded.extend(std::iter::repeat_n(0, 16));
+        let path = write_fixture(&fixture(41, &[128, 1], &encoded));
+        let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
+        let values = model.load_f32("probe.tensor").unwrap();
+        assert_eq!(values.data(), &[-1.0; 128]);
+        let matrix = model.load_quantized("probe.tensor").unwrap();
+        assert_eq!(matrix.value_type().raw(), 41);
+        assert_eq!(matrix.column(0).unwrap(), values.data());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn materializes_q2_0_tensor() {
+        let mut encoded = vec![0x00, 0x3c];
+        encoded.extend(std::iter::repeat_n(0xe4, 16));
+        let path = write_fixture(&fixture(42, &[64, 1], &encoded));
+        let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
+        let values = model.load_f32("probe.tensor").unwrap();
+        assert_eq!(&values.data()[..4], &[-1.0, 0.0, 1.0, 2.0]);
+        let matrix = model.load_quantized("probe.tensor").unwrap();
+        assert_eq!(matrix.value_type().raw(), 42);
+        assert_eq!(matrix.column(0).unwrap(), values.data());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn materializes_q4_1_tensor() {
         let mut encoded = vec![0x00, 0x3c, 0x00, 0x3c];
         encoded.extend(std::iter::repeat_n(0x00, 16));
@@ -7419,6 +7580,21 @@ mod tests {
         assert_eq!(values.data()[0].to_bits(), (-128.0_f32).to_bits());
         assert_eq!(values.data()[1].to_bits(), (-127.0_f32).to_bits());
         assert_eq!(values.data()[31].to_bits(), (-97.0_f32).to_bits());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn materializes_q8_1_tensor() {
+        let mut encoded = vec![0x00, 0x3c, 0x00, 0x00];
+        encoded.extend((0_u8..32).map(|value| value.wrapping_add(0xf0)));
+        let path = write_fixture(&fixture(9, &[32, 1], &encoded));
+        let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
+        let values = model.load_f32("probe.tensor").unwrap();
+        assert_eq!(values.data()[0].to_bits(), (-16.0_f32).to_bits());
+        assert_eq!(values.data()[31].to_bits(), (15.0_f32).to_bits());
+        let matrix = model.load_quantized("probe.tensor").unwrap();
+        assert_eq!(matrix.value_type().raw(), 9);
+        assert_eq!(matrix.column(0).unwrap(), values.data());
         fs::remove_file(path).unwrap();
     }
 
