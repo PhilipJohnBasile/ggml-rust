@@ -61,6 +61,7 @@ pub struct LlamaConfig {
     rope_dimension_count: usize,
     rope_scaling: LlamaRopeScaling,
     attention_window: Option<usize>,
+    attention_window_pattern: Option<Vec<bool>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -78,6 +79,7 @@ struct LlamaMetadataKeys {
     rope_scaling_type: &'static str,
     rope_scaling_factor: &'static str,
     attention_window: &'static str,
+    attention_window_pattern: &'static str,
 }
 
 fn metadata_keys(architecture: &str) -> Option<LlamaMetadataKeys> {
@@ -96,6 +98,7 @@ fn metadata_keys(architecture: &str) -> Option<LlamaMetadataKeys> {
             rope_scaling_type: "llama.rope.scaling.type",
             rope_scaling_factor: "llama.rope.scaling.factor",
             attention_window: "llama.attention.sliding_window",
+            attention_window_pattern: "llama.attention.sliding_window_pattern",
         }),
         "qwen2" => Some(LlamaMetadataKeys {
             context_length: "qwen2.context_length",
@@ -111,6 +114,7 @@ fn metadata_keys(architecture: &str) -> Option<LlamaMetadataKeys> {
             rope_scaling_type: "qwen2.rope.scaling.type",
             rope_scaling_factor: "qwen2.rope.scaling.factor",
             attention_window: "qwen2.attention.sliding_window",
+            attention_window_pattern: "qwen2.attention.sliding_window_pattern",
         }),
         _ => None,
     }
@@ -243,6 +247,39 @@ impl LlamaConfig {
         rope_scaling: LlamaRopeScaling,
         attention_window: Option<usize>,
     ) -> Result<Self, LlamaError> {
+        Self::new_with_rope_scaling_and_attention_window_and_pattern(
+            context_length,
+            embedding_length,
+            block_count,
+            head_count,
+            head_count_kv,
+            feed_forward_length,
+            vocab_size,
+            rms_norm_epsilon,
+            rope_freq_base,
+            rope_dimension_count,
+            rope_scaling,
+            attention_window,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_rope_scaling_and_attention_window_and_pattern(
+        context_length: usize,
+        embedding_length: usize,
+        block_count: usize,
+        head_count: usize,
+        head_count_kv: usize,
+        feed_forward_length: usize,
+        vocab_size: usize,
+        rms_norm_epsilon: f32,
+        rope_freq_base: f32,
+        rope_dimension_count: usize,
+        rope_scaling: LlamaRopeScaling,
+        attention_window: Option<usize>,
+        attention_window_pattern: Option<Vec<bool>>,
+    ) -> Result<Self, LlamaError> {
         let config = Self {
             context_length,
             embedding_length,
@@ -256,6 +293,7 @@ impl LlamaConfig {
             rope_dimension_count,
             rope_scaling,
             attention_window,
+            attention_window_pattern,
         };
         config.validate()?;
         Ok(config)
@@ -327,7 +365,9 @@ impl LlamaConfig {
             model.metadata_scalar(keys.attention_window)?,
             keys.attention_window,
         )?;
-        Self::new_with_rope_scaling_and_attention_window(
+        let attention_window_pattern =
+            model.metadata_bool_array(keys.attention_window_pattern, MAX_CONFIG_ARRAY_ELEMENTS)?;
+        Self::new_with_rope_scaling_and_attention_window_and_pattern(
             context_length,
             embedding_length,
             block_count,
@@ -340,6 +380,7 @@ impl LlamaConfig {
             rope_dimension_count,
             rope_scaling,
             attention_window,
+            attention_window_pattern,
         )
     }
 
@@ -421,11 +462,32 @@ impl LlamaConfig {
         self.attention_window
     }
 
+    /// Returns the optional per-layer sliding-window activation pattern.
+    #[must_use]
+    pub fn attention_window_pattern(&self) -> Option<&[bool]> {
+        self.attention_window_pattern.as_deref()
+    }
+
     /// Returns the first cached token visible to the current attention step.
     #[must_use]
     pub fn attention_start(&self, cached_tokens: usize) -> usize {
         self.attention_window
             .map_or(0, |window| cached_tokens.saturating_sub(window))
+    }
+
+    /// Returns the first cached token visible to one layer's attention step.
+    #[must_use]
+    pub fn attention_start_for_layer(&self, layer: usize, cached_tokens: usize) -> usize {
+        if self
+            .attention_window_pattern
+            .as_ref()
+            .and_then(|pattern| pattern.get(layer))
+            .is_some_and(|uses_window| !uses_window)
+        {
+            0
+        } else {
+            self.attention_start(cached_tokens)
+        }
     }
 
     /// Converts a token index to the rotary position used by this model.
@@ -493,6 +555,20 @@ impl LlamaConfig {
             return Err(LlamaError::InvalidConfig(
                 "attention_window must be greater than zero".to_owned(),
             ));
+        }
+        if let Some(pattern) = &self.attention_window_pattern {
+            if pattern.len() != self.block_count {
+                return Err(LlamaError::InvalidConfig(format!(
+                    "attention_window_pattern has {} entries, expected {}",
+                    pattern.len(),
+                    self.block_count
+                )));
+            }
+            if self.attention_window.is_none() {
+                return Err(LlamaError::InvalidConfig(
+                    "attention_window_pattern requires attention_window".to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -753,6 +829,7 @@ impl LlamaModel {
 }
 
 const MAX_TOKENIZER_ELEMENTS: u64 = 16 * 1024 * 1024;
+const MAX_CONFIG_ARRAY_ELEMENTS: u64 = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TokenizerKind {
@@ -1917,7 +1994,10 @@ impl<'a> LlamaSession<'a> {
             let mut attended = vec![0.0; embedding_width];
             let query_groups = self.model.config.head_count / self.model.config.head_count_kv;
             let cached_tokens = self.position + 1;
-            let attention_start = self.model.config.attention_start(cached_tokens);
+            let attention_start = self
+                .model
+                .config
+                .attention_start_for_layer(layer_index, cached_tokens);
             for query_head in 0..self.model.config.head_count {
                 let kv_head = query_head / query_groups;
                 let query_start = query_head * head_dim;

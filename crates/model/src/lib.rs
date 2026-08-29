@@ -648,6 +648,52 @@ impl GgufModel {
         })
     }
 
+    /// Reads a bounded boolean metadata array while enforcing the model digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model changed, the metadata is malformed, the
+    /// array type is not boolean, or the caller's element bound is exceeded.
+    pub fn metadata_bool_array(
+        &self,
+        key: &str,
+        max_elements: u64,
+    ) -> Result<Option<Vec<bool>>, ModelError> {
+        self.with_validated_gguf(|gguf| {
+            let Some(value) = gguf.metadata_value(key) else {
+                return Ok(None);
+            };
+            let ggml_gguf::MetadataValue::Array(array) = value else {
+                return Err(ModelError::MetadataArray(key.to_owned()));
+            };
+            if array.element_type() != ggml_gguf::MetadataType::Bool {
+                return Err(ModelError::MetadataArrayType {
+                    key: key.to_owned(),
+                    expected: "Bool",
+                    actual: format!("{:?}", array.element_type()),
+                });
+            }
+            let length = array.len();
+            if u64::try_from(length).unwrap_or(u64::MAX) > max_elements {
+                return Err(ModelError::MetadataArrayLimit {
+                    key: key.to_owned(),
+                    len: length,
+                    max: max_elements,
+                });
+            }
+            let mut values = Vec::with_capacity(length);
+            for index in 0..length {
+                let Some(ggml_gguf::ScalarValue::Bool(value)) = array.get(index) else {
+                    return Err(ModelError::Parse(format!(
+                        "GGUF metadata {key} boolean array contains an invalid element"
+                    )));
+                };
+                values.push(value);
+            }
+            Ok(Some(values))
+        })
+    }
+
     /// Returns all indexed tensor descriptors in GGUF order.
     #[must_use]
     pub fn tensors(&self) -> &[TensorDescriptor] {
