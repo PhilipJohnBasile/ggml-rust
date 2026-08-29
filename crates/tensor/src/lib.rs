@@ -111,7 +111,7 @@ impl fmt::Display for TensorError {
             ),
             Self::ZeroDimension => formatter.write_str("tensor dimensions must be nonzero"),
             Self::InvalidEpsilon => {
-                formatter.write_str("RMSNorm epsilon must be finite and nonnegative")
+                formatter.write_str("normalization epsilon must be finite and nonnegative")
             }
             Self::InvalidScale => formatter.write_str("attention scale must be finite"),
             Self::InvalidClamp => formatter.write_str("clamp bounds must be finite and ordered"),
@@ -1215,6 +1215,77 @@ impl Tensor {
         checked_output(self.shape.clone(), result, "rms_norm_with_weight")
     }
 
+    /// Applies MLX-style layer normalization along the final dimension.
+    ///
+    /// The population mean and variance are computed independently for every
+    /// final-dimension row. Optional weight and bias tensors must be rank-1
+    /// vectors whose length equals the input's final dimension. Weight and bias
+    /// are independent, so bias-only normalization is supported.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input is scalar, epsilon is invalid, an
+    /// affine parameter has the wrong shape, an input is non-finite, or an
+    /// output value is non-finite.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn layer_norm(
+        &self,
+        weight: Option<&Self>,
+        bias: Option<&Self>,
+        epsilon: f32,
+    ) -> Result<Self, TensorError> {
+        if !epsilon.is_finite() || epsilon < 0.0 {
+            return Err(TensorError::InvalidEpsilon);
+        }
+        let Some(&width) = self.shape.last() else {
+            return Err(TensorError::RankMismatch {
+                expected: 1,
+                actual: 0,
+            });
+        };
+        for parameter in [weight, bias].into_iter().flatten() {
+            if parameter.shape != [width] {
+                return Err(TensorError::ShapeMismatch {
+                    left: parameter.shape.clone(),
+                    right: vec![width],
+                });
+            }
+        }
+        self.validate_finite()?;
+        if let Some(weight) = weight {
+            weight.validate_finite()?;
+        }
+        if let Some(bias) = bias {
+            bias.validate_finite()?;
+        }
+
+        let width_f32 = width as f32;
+        let mut result = Vec::with_capacity(self.data.len());
+        for row in self.data.chunks_exact(width) {
+            let mean = row.iter().sum::<f32>() / width_f32;
+            let variance = row
+                .iter()
+                .map(|value| {
+                    let centered = value - mean;
+                    centered * centered
+                })
+                .sum::<f32>()
+                / width_f32;
+            let inverse = (variance + epsilon).sqrt().recip();
+            result.extend(row.iter().enumerate().map(|(index, value)| {
+                let mut normalized = (value - mean) * inverse;
+                if let Some(weight) = weight {
+                    normalized *= weight.data[index];
+                }
+                if let Some(bias) = bias {
+                    normalized += bias.data[index];
+                }
+                normalized
+            }));
+        }
+        checked_output(self.shape.clone(), result, "layer_norm")
+    }
+
     /// Applies numerically stable softmax independently along the last dimension.
     ///
     /// # Errors
@@ -2071,6 +2142,93 @@ mod tests {
         for (actual, expected) in normalized.data().iter().zip(expected) {
             assert!((actual - expected).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn layer_norm_matches_mlx_affine_reference() {
+        let tensor = Tensor::from_data([2, 3], [1.0, 2.0, 3.0, 2.0, 4.0, 8.0]).unwrap();
+        let weight = Tensor::from_data([3], [1.5, -0.5, 2.0]).unwrap();
+        let bias = Tensor::from_data([3], [0.25, 1.0, -1.0]).unwrap();
+        let normalized = tensor
+            .layer_norm(Some(&weight), Some(&bias), 1.0e-5)
+            .unwrap();
+        let expected = [
+            -1.587_103_5,
+            1.0,
+            1.449_471_4,
+            -1.353_566_2,
+            1.133_630_5,
+            1.672_610_3,
+        ];
+        assert_eq!(normalized.shape(), &[2, 3]);
+        for (actual, expected) in normalized.data().iter().zip(expected) {
+            assert!((actual - expected).abs() < 1.0e-5);
+        }
+    }
+
+    #[test]
+    fn layer_norm_supports_independent_optional_affine_parameters() {
+        let tensor = Tensor::from_data([2, 3], [5.0, 5.0, 5.0, -2.0, -2.0, -2.0]).unwrap();
+        let bias = Tensor::from_data([3], [0.25, -0.5, 1.0]).unwrap();
+        let normalized = tensor.layer_norm(None, Some(&bias), 1.0e-5).unwrap();
+        assert_eq!(normalized.data(), &[0.25, -0.5, 1.0, 0.25, -0.5, 1.0]);
+
+        let tensor = Tensor::from_data([1, 3], [1.0, 2.0, 3.0]).unwrap();
+        let weight = Tensor::from_data([3], [2.0, -0.5, 3.0]).unwrap();
+        let plain = tensor.layer_norm(None, None, 1.0e-5).unwrap();
+        let weighted = tensor.layer_norm(Some(&weight), None, 1.0e-5).unwrap();
+        for (index, (actual, plain)) in weighted.data().iter().zip(plain.data()).enumerate() {
+            assert!((actual - plain * weight.data()[index]).abs() < 1.0e-6);
+        }
+    }
+
+    #[test]
+    fn layer_norm_checks_rank_parameters_epsilon_and_finiteness() {
+        let tensor = Tensor::from_data([2, 3], [1.0; 6]).unwrap();
+        let wrong_rank = Tensor::from_data([1, 3], [1.0; 3]).unwrap();
+        let wrong_width = Tensor::from_data([2], [0.0; 2]).unwrap();
+        assert_eq!(
+            Tensor::scalar(1.0).layer_norm(None, None, 1.0e-5),
+            Err(TensorError::RankMismatch {
+                expected: 1,
+                actual: 0,
+            })
+        );
+        assert_eq!(
+            tensor.layer_norm(Some(&wrong_rank), None, 1.0e-5),
+            Err(TensorError::ShapeMismatch {
+                left: vec![1, 3],
+                right: vec![3],
+            })
+        );
+        assert_eq!(
+            tensor.layer_norm(None, Some(&wrong_width), 1.0e-5),
+            Err(TensorError::ShapeMismatch {
+                left: vec![2],
+                right: vec![3],
+            })
+        );
+        assert_eq!(
+            tensor.layer_norm(None, None, -1.0),
+            Err(TensorError::InvalidEpsilon)
+        );
+        assert_eq!(
+            tensor.layer_norm(None, None, f32::NAN),
+            Err(TensorError::InvalidEpsilon)
+        );
+
+        let non_finite = Tensor::from_data([2], [1.0, f32::INFINITY]).unwrap();
+        assert_eq!(
+            non_finite.layer_norm(None, None, 1.0e-5),
+            Err(TensorError::NonFiniteInput { index: 1 })
+        );
+        assert_eq!(
+            tensor.layer_norm(None, None, 0.0),
+            Err(TensorError::NonFiniteOutput {
+                operation: "layer_norm",
+                index: 0,
+            })
+        );
     }
 
     #[test]

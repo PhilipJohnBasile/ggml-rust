@@ -104,6 +104,11 @@ enum Operation {
     RmsNormWeighted {
         epsilon: f32,
     },
+    LayerNorm {
+        epsilon: f32,
+        has_weight: bool,
+        has_bias: bool,
+    },
     Scale {
         factor: f32,
     },
@@ -458,6 +463,43 @@ impl Graph {
         self.require(input)?;
         self.require(weight)?;
         Ok(self.push(Operation::RmsNormWeighted { epsilon }, vec![input, weight]))
+    }
+
+    /// Adds an MLX-style final-dimension layer normalization node.
+    ///
+    /// Optional weight and bias inputs are independent rank-1 affine vectors.
+    /// Their shapes, the input rank, and epsilon are checked during evaluation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any supplied handle is invalid.
+    pub fn layer_norm(
+        &mut self,
+        input: ValueId,
+        weight: Option<ValueId>,
+        bias: Option<ValueId>,
+        epsilon: f32,
+    ) -> Result<ValueId, GraphError> {
+        self.require(input)?;
+        let has_weight = weight.is_some();
+        let has_bias = bias.is_some();
+        let mut inputs = vec![input];
+        if let Some(weight) = weight {
+            self.require(weight)?;
+            inputs.push(weight);
+        }
+        if let Some(bias) = bias {
+            self.require(bias)?;
+            inputs.push(bias);
+        }
+        Ok(self.push(
+            Operation::LayerNorm {
+                epsilon,
+                has_weight,
+                has_bias,
+            },
+            inputs,
+        ))
     }
 
     /// Adds a scalar multiplication node.
@@ -862,6 +904,31 @@ impl Graph {
                 }
                 Operation::RmsNormWeighted { epsilon } => values[self.input_index(node, 0)?]
                     .rms_norm_with_weight(&values[self.input_index(node, 1)?], *epsilon)?,
+                Operation::LayerNorm {
+                    epsilon,
+                    has_weight,
+                    has_bias,
+                } => {
+                    let input_index = self.input_index(node, 0)?;
+                    let mut parameter_index = 1;
+                    let weight_index = if *has_weight {
+                        let index = self.input_index(node, parameter_index)?;
+                        parameter_index += 1;
+                        Some(index)
+                    } else {
+                        None
+                    };
+                    let bias_index = if *has_bias {
+                        Some(self.input_index(node, parameter_index)?)
+                    } else {
+                        None
+                    };
+                    values[input_index].layer_norm(
+                        weight_index.map(|index| &values[index]),
+                        bias_index.map(|index| &values[index]),
+                        *epsilon,
+                    )?
+                }
                 Operation::Scale { factor } => values[self.input_index(node, 0)?].scale(*factor)?,
                 Operation::Negate => values[self.input_index(node, 0)?].neg()?,
                 Operation::Absolute => values[self.input_index(node, 0)?].abs()?,
@@ -1153,6 +1220,83 @@ mod tests {
         assert!((result[0].data()[1] - 3.0).abs() < 1.0e-6);
         assert!((result[0].data()[2] - 2.0).abs() < 1.0e-6);
         assert!((result[0].data()[3] - 3.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn evaluates_layer_norm_with_independent_affine_inputs() {
+        let mut graph = Graph::new();
+        let input = graph.input([2, 3]).unwrap();
+        let weight = graph.constant(Tensor::from_data([3], [1.5, -0.5, 2.0]).unwrap());
+        let bias = graph.constant(Tensor::from_data([3], [0.25, 1.0, -1.0]).unwrap());
+        let plain = graph.layer_norm(input, None, None, 1.0e-5).unwrap();
+        let weight_only = graph.layer_norm(input, Some(weight), None, 1.0e-5).unwrap();
+        let bias_only = graph.layer_norm(input, None, Some(bias), 1.0e-5).unwrap();
+        let affine = graph
+            .layer_norm(input, Some(weight), Some(bias), 1.0e-5)
+            .unwrap();
+        let result = graph
+            .evaluate(
+                &[Tensor::from_data([2, 3], [1.0, 2.0, 3.0, 2.0, 4.0, 8.0]).unwrap()],
+                &[plain, weight_only, bias_only, affine],
+            )
+            .unwrap();
+
+        for row in result[0].data().as_chunks::<3>().0 {
+            assert!(row.iter().sum::<f32>().abs() < 1.0e-5);
+        }
+        for (index, (actual, plain)) in result[1].data().iter().zip(result[0].data()).enumerate() {
+            let expected_weight = [1.5, -0.5, 2.0][index % 3];
+            assert!((actual - plain * expected_weight).abs() < 1.0e-6);
+        }
+        for (index, (actual, plain)) in result[2].data().iter().zip(result[0].data()).enumerate() {
+            let expected_bias = [0.25, 1.0, -1.0][index % 3];
+            assert!((actual - plain - expected_bias).abs() < 1.0e-6);
+        }
+        let expected = [
+            -1.587_103_5,
+            1.0,
+            1.449_471_4,
+            -1.353_566_2,
+            1.133_630_5,
+            1.672_610_3,
+        ];
+        for (actual, expected) in result[3].data().iter().zip(expected) {
+            assert!((actual - expected).abs() < 1.0e-5);
+        }
+    }
+
+    #[test]
+    fn layer_norm_graph_checks_handles_and_deferred_parameters() {
+        let mut graph = Graph::new();
+        let input = graph.input([2, 3]).unwrap();
+        let invalid = ValueId(usize::MAX);
+        assert_eq!(
+            graph.layer_norm(invalid, None, None, 1.0e-5),
+            Err(GraphError::InvalidValue(invalid))
+        );
+        assert_eq!(
+            graph.layer_norm(input, Some(invalid), None, 1.0e-5),
+            Err(GraphError::InvalidValue(invalid))
+        );
+        assert_eq!(
+            graph.layer_norm(input, None, Some(invalid), 1.0e-5),
+            Err(GraphError::InvalidValue(invalid))
+        );
+
+        let wrong_weight = graph.constant(Tensor::from_data([2], [1.0, 1.0]).unwrap());
+        let normalized = graph
+            .layer_norm(input, Some(wrong_weight), None, 1.0e-5)
+            .unwrap();
+        assert_eq!(
+            graph.evaluate(
+                &[Tensor::from_data([2, 3], [1.0; 6]).unwrap()],
+                &[normalized]
+            ),
+            Err(GraphError::Tensor(TensorError::ShapeMismatch {
+                left: vec![2],
+                right: vec![3],
+            }))
+        );
     }
 
     #[test]
