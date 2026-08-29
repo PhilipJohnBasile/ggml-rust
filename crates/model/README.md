@@ -10,3 +10,6 @@ Quantized formats are decoded into owned F32 values. The `matmul_f32_quantized`
 path computes row-vector products directly from all supported quantized matrices
 without materializing an F32 matrix, while `load_affine_quantized` converts
 eligible matrices directly to MLX's packed affine representation.
+`AffineQuantizedMatrix::quantize_dense` also converts physical row-major F32
+matrices with the exact F32 Metal affine reduction and packing semantics for
+group sizes 32, 64, and 128 and bit widths 2, 3, 4, 5, 6, and 8.

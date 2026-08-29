@@ -96,6 +96,140 @@ pub enum LoadedTensor {
 }
 
 impl AffineQuantizedMatrix {
+    /// Quantizes a physical row-major F32 matrix into MLX Metal affine layout.
+    ///
+    /// `values` must contain `[output_rows, input_columns]` in row-major order.
+    /// Quantization is independent for every final-dimension input group. The
+    /// packed values use MLX's little-endian bit stream, and scales and biases
+    /// use row-major `[output_rows, input_columns / group_size]` layout.
+    ///
+    /// This intentionally matches the F32 Metal kernel, including initializing
+    /// each group's maximum to zero. That detail changes the affine parameters
+    /// for groups containing only negative values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when dimensions or buffer length are invalid, shape
+    /// arithmetic overflows, group size or bit width is unsupported, the input
+    /// dimension is not group-aligned, an input is non-finite, or affine
+    /// parameters become non-finite.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::too_many_lines
+    )]
+    pub fn quantize_dense(
+        values: &[f32],
+        output_rows: usize,
+        input_columns: usize,
+        group_size: usize,
+        bits: usize,
+    ) -> Result<Self, ModelError> {
+        validate_affine_quantization(group_size, bits)?;
+        if output_rows == 0 || input_columns == 0 {
+            return Err(ModelError::Shape(
+                "dense affine quantization requires nonzero rows and columns".to_owned(),
+            ));
+        }
+        if !input_columns.is_multiple_of(group_size) {
+            return Err(ModelError::Shape(format!(
+                "dense affine input dimension {input_columns} is not divisible by group size {group_size}"
+            )));
+        }
+        let expected_len = output_rows
+            .checked_mul(input_columns)
+            .ok_or_else(|| ModelError::Shape("dense affine matrix shape overflows".to_owned()))?;
+        if values.len() != expected_len {
+            return Err(ModelError::Shape(format!(
+                "dense affine matrix contains {} values, expected {expected_len}",
+                values.len()
+            )));
+        }
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(ModelError::Shape(
+                "dense affine matrix contains a non-finite value".to_owned(),
+            ));
+        }
+
+        let packed_columns = input_columns
+            .checked_mul(bits)
+            .and_then(|count| count.checked_div(32))
+            .ok_or_else(|| {
+                ModelError::Shape("dense affine packed matrix shape overflows".to_owned())
+            })?;
+        let groups = input_columns / group_size;
+        let packed_len = output_rows.checked_mul(packed_columns).ok_or_else(|| {
+            ModelError::Shape("dense affine packed matrix length overflows".to_owned())
+        })?;
+        let affine_len = output_rows.checked_mul(groups).ok_or_else(|| {
+            ModelError::Shape("dense affine parameter length overflows".to_owned())
+        })?;
+        let mut packed = vec![0_u32; packed_len];
+        let mut scales = Vec::with_capacity(affine_len);
+        let mut biases = Vec::with_capacity(affine_len);
+        let quantization_levels = f32::from((1_u16 << bits) - 1);
+
+        for output_index in 0..output_rows {
+            let row_start = output_index * input_columns;
+            for group_index in 0..groups {
+                let group_start = row_start + group_index * group_size;
+                let group = &values[group_start..group_start + group_size];
+                let mut minimum = f32::INFINITY;
+                // MLX's F32 Metal kernel starts this reduction at zero rather
+                // than negative infinity. Preserve that observable behavior.
+                let mut maximum = 0.0_f32;
+                for &value in group {
+                    minimum = minimum.min(value);
+                    maximum = maximum.max(value);
+                }
+
+                let mut scale = ((maximum - minimum) / quantization_levels).max(1.0e-7);
+                let negative_side = minimum.abs() > maximum.abs();
+                if !negative_side {
+                    scale = -scale;
+                }
+                let edge = if negative_side { minimum } else { maximum };
+                let zero_point = (edge / scale).round();
+                let affine_bias = if zero_point == 0.0 { 0.0 } else { edge };
+                if zero_point != 0.0 {
+                    scale = edge / zero_point;
+                }
+                if !scale.is_finite() || !affine_bias.is_finite() {
+                    return Err(ModelError::Shape(
+                        "dense affine parameters are non-finite".to_owned(),
+                    ));
+                }
+                scales.push(scale);
+                biases.push(affine_bias);
+
+                let packed_start =
+                    output_index * packed_columns + group_index * (group_size * bits / 32);
+                for (offset, &value) in group.iter().enumerate() {
+                    let quantized = ((value - affine_bias) / scale)
+                        .round()
+                        .clamp(0.0, quantization_levels) as u32;
+                    let bit_offset = offset * bits;
+                    let word = packed_start + bit_offset / 32;
+                    let shift = bit_offset % 32;
+                    packed[word] |= quantized << shift;
+                    if shift + bits > 32 {
+                        packed[word + 1] |= quantized >> (32 - shift);
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            rows: output_rows,
+            columns: input_columns,
+            group_size,
+            bits,
+            packed,
+            scales,
+            biases,
+        })
+    }
+
     /// Number of output rows in the MLX matrix.
     #[must_use]
     pub const fn rows(&self) -> usize {
@@ -7977,6 +8111,150 @@ mod tests {
             vec![1.0; 256]
         );
         fs::remove_file(tq2_path).unwrap();
+    }
+
+    #[test]
+    fn quantizes_all_negative_dense_group_with_mlx_metal_f32_semantics() {
+        let values = (-32_i16..0).map(f32::from).collect::<Vec<_>>();
+        let quantized = AffineQuantizedMatrix::quantize_dense(&values, 1, 32, 32, 4).unwrap();
+        assert_eq!(quantized.rows(), 1);
+        assert_eq!(quantized.columns(), 32);
+        assert_eq!(quantized.group_size(), 32);
+        assert_eq!(quantized.bits(), 4);
+        assert_eq!(
+            quantized.packed(),
+            &[0x3322_1100, 0x7766_5544, 0xbaa9_9887, 0xfeed_dccb]
+        );
+        assert_eq!(quantized.scales()[0].to_bits(), 0x4008_8889);
+        assert_eq!(quantized.biases()[0].to_bits(), 0xc200_0000);
+    }
+
+    #[test]
+    fn quantizes_dense_f32_group_with_exact_mlx_packing_at_every_bit_width() {
+        let values = (0_i16..32).map(f32::from).collect::<Vec<_>>();
+        let cases: &[(usize, &[u32], u32)] = &[
+            (2, &[0xaaaa_afff, 0x0005_5555], 0xc125_5555),
+            (3, &[0x6dbb_6dff, 0x26db_924b, 0x0012_4a49], 0xc08d_b6db),
+            (
+                4,
+                &[0xccdd_eeff, 0x8899_aabb, 0x4455_6677, 0x0011_2233],
+                0xc004_4444,
+            ),
+            (
+                5,
+                &[
+                    0x75be_77df,
+                    0x3a56_d7c6,
+                    0x35cf_8465,
+                    0xc742_54b6,
+                    0x0044_3214,
+                ],
+                0xbf80_0000,
+            ),
+            (
+                6,
+                &[
+                    0x77e7_bf7f,
+                    0xbb6f_c73d,
+                    0x8639_67a6,
+                    0x1661_a71e,
+                    0xa30e_4125,
+                    0x0021_0620,
+                ],
+                0xbefb_efbf,
+            ),
+            (
+                8,
+                &[
+                    0xe6ef_f7ff,
+                    0xc5ce_d6de,
+                    0xa5ad_b5bd,
+                    0x848c_949c,
+                    0x636b_737b,
+                    0x424a_525a,
+                    0x2129_313a,
+                    0x0008_1019,
+                ],
+                0xbdf8_f8f9,
+            ),
+        ];
+        for &(bits, expected_packed, expected_scale) in cases {
+            let quantized =
+                AffineQuantizedMatrix::quantize_dense(&values, 1, 32, 32, bits).unwrap();
+            assert_eq!(quantized.packed(), expected_packed, "bits={bits}");
+            assert_eq!(
+                quantized.scales()[0].to_bits(),
+                expected_scale,
+                "bits={bits}"
+            );
+            assert_eq!(quantized.biases()[0].to_bits(), 0x41f8_0000, "bits={bits}");
+        }
+    }
+
+    #[test]
+    fn quantizes_dense_rows_with_every_supported_group_size() {
+        let values = [vec![0.0_f32; 128], vec![1.0_f32; 128]].concat();
+        for group_size in [32, 64, 128] {
+            let quantized =
+                AffineQuantizedMatrix::quantize_dense(&values, 2, 128, group_size, 4).unwrap();
+            let groups_per_row = 128 / group_size;
+            assert_eq!(quantized.rows(), 2);
+            assert_eq!(quantized.columns(), 128);
+            assert_eq!(quantized.group_size(), group_size);
+            assert_eq!(quantized.packed(), &[0_u32; 32]);
+            assert_eq!(quantized.scales().len(), 2 * groups_per_row);
+            assert!(
+                quantized
+                    .scales()
+                    .iter()
+                    .all(|scale| scale.to_bits() == (-1.0e-7_f32).to_bits())
+            );
+            assert!(
+                quantized.biases()[..groups_per_row]
+                    .iter()
+                    .all(|bias| bias.to_bits() == 0.0_f32.to_bits())
+            );
+            assert!(
+                quantized.biases()[groups_per_row..]
+                    .iter()
+                    .all(|bias| bias.to_bits() == 1.0_f32.to_bits())
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_dense_affine_inputs() {
+        let values = vec![0.0_f32; 32];
+        assert!(matches!(
+            AffineQuantizedMatrix::quantize_dense(&values, 1, 32, 16, 4),
+            Err(ModelError::Shape(_))
+        ));
+        assert!(matches!(
+            AffineQuantizedMatrix::quantize_dense(&values, 1, 32, 32, 7),
+            Err(ModelError::Shape(_))
+        ));
+        assert!(matches!(
+            AffineQuantizedMatrix::quantize_dense(&values, 1, 32, 64, 4),
+            Err(ModelError::Shape(_))
+        ));
+        assert!(matches!(
+            AffineQuantizedMatrix::quantize_dense(&values[..31], 1, 32, 32, 4),
+            Err(ModelError::Shape(_))
+        ));
+        assert!(matches!(
+            AffineQuantizedMatrix::quantize_dense(&[], 0, 32, 32, 4),
+            Err(ModelError::Shape(_))
+        ));
+        assert!(matches!(
+            AffineQuantizedMatrix::quantize_dense(&[], usize::MAX, 32, 32, 4),
+            Err(ModelError::Shape(_))
+        ));
+        let mut non_finite = values;
+        non_finite[7] = f32::NAN;
+        assert!(matches!(
+            AffineQuantizedMatrix::quantize_dense(&non_finite, 1, 32, 32, 4),
+            Err(ModelError::Shape(_))
+        ));
     }
 
     #[test]
