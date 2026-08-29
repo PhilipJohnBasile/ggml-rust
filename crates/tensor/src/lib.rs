@@ -804,6 +804,24 @@ impl Tensor {
         self.unary_op("log", f32::ln)
     }
 
+    /// Computes the sine elementwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an output value is non-finite.
+    pub fn sin(&self) -> Result<Self, TensorError> {
+        self.unary_op("sin", f32::sin)
+    }
+
+    /// Computes the cosine elementwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an output value is non-finite.
+    pub fn cos(&self) -> Result<Self, TensorError> {
+        self.unary_op("cos", f32::cos)
+    }
+
     /// Computes the hyperbolic tangent elementwise.
     ///
     /// # Errors
@@ -1669,6 +1687,17 @@ mod tests {
         let positive = Tensor::from_data([3], [0.5, 1.0, 4.0]).unwrap();
         assert!((positive.exp().unwrap().data()[0] - 0.5_f32.exp()).abs() < 1.0e-6);
         assert!((positive.log().unwrap().data()[1] - 0.0).abs() < 1.0e-6);
+        let angles = Tensor::from_data(
+            [3],
+            [0.0, std::f32::consts::FRAC_PI_2, std::f32::consts::PI],
+        )
+        .unwrap();
+        let sine = angles.sin().unwrap();
+        let cosine = angles.cos().unwrap();
+        assert!(sine.data()[0].abs() < 1.0e-6);
+        assert!((sine.data()[1] - 1.0).abs() < 1.0e-6);
+        assert!(cosine.data()[1].abs() < 1.0e-6);
+        assert!((cosine.data()[2] + 1.0).abs() < 1.0e-6);
         assert!((tensor.tanh().unwrap().data()[1] - 0.5_f32.tanh()).abs() < 1.0e-6);
         assert!((positive.sigmoid().unwrap().data()[0] - 0.622_459_35).abs() < 1.0e-6);
     }

@@ -110,6 +110,8 @@ enum Operation {
     SquareRoot,
     Exponential,
     Logarithm,
+    Sine,
+    Cosine,
     Tanh,
     Sigmoid,
     SumLastDim,
@@ -465,6 +467,24 @@ impl Graph {
         self.unary(Operation::Logarithm, input)
     }
 
+    /// Adds an elementwise sine node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid.
+    pub fn sine(&mut self, input: ValueId) -> Result<ValueId, GraphError> {
+        self.unary(Operation::Sine, input)
+    }
+
+    /// Adds an elementwise cosine node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid.
+    pub fn cosine(&mut self, input: ValueId) -> Result<ValueId, GraphError> {
+        self.unary(Operation::Cosine, input)
+    }
+
     /// Adds an elementwise hyperbolic-tangent node.
     ///
     /// # Errors
@@ -707,6 +727,8 @@ impl Graph {
                     Operation::SquareRoot => values[self.input_index(node, 0)?].sqrt()?,
                     Operation::Exponential => values[self.input_index(node, 0)?].exp()?,
                     Operation::Logarithm => values[self.input_index(node, 0)?].log()?,
+                    Operation::Sine => values[self.input_index(node, 0)?].sin()?,
+                    Operation::Cosine => values[self.input_index(node, 0)?].cos()?,
                     Operation::Tanh => values[self.input_index(node, 0)?].tanh()?,
                     Operation::Sigmoid => values[self.input_index(node, 0)?].sigmoid()?,
                     Operation::Clamp { minimum, maximum } => {
@@ -978,6 +1000,28 @@ mod tests {
         assert_eq!(result[0].shape(), &[2, 2]);
         assert_eq!(result[0].data(), &[1.0, 3.0, 4.0, 6.0]);
         assert_eq!(result[1].data(), &[1.0, 9.0, 8.0, 4.0, 7.0, 6.0]);
+    }
+
+    #[test]
+    fn evaluates_trigonometric_graph_nodes() {
+        let mut graph = Graph::new();
+        let input = graph.input([3]).unwrap();
+        let sine = graph.sine(input).unwrap();
+        let cosine = graph.cosine(input).unwrap();
+        let result = graph
+            .evaluate(
+                &[Tensor::from_data(
+                    [3],
+                    [0.0, std::f32::consts::FRAC_PI_2, std::f32::consts::PI],
+                )
+                .unwrap()],
+                &[sine, cosine],
+            )
+            .unwrap();
+        assert!((result[0].data()[1] - 1.0).abs() < 1.0e-6);
+        assert!(result[0].data()[2].abs() < 1.0e-6);
+        assert!(result[1].data()[1].abs() < 1.0e-6);
+        assert!((result[1].data()[2] + 1.0).abs() < 1.0e-6);
     }
 
     #[test]
