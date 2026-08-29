@@ -366,7 +366,7 @@ impl LlamaConfig {
             keys.attention_window,
         )?;
         let attention_window_pattern =
-            model.metadata_bool_array(keys.attention_window_pattern, MAX_CONFIG_ARRAY_ELEMENTS)?;
+            parse_attention_window_pattern(model, keys.attention_window_pattern, block_count)?;
         Self::new_with_rope_scaling_and_attention_window_and_pattern(
             context_length,
             embedding_length,
@@ -2408,6 +2408,28 @@ fn parse_rope_scaling(
     }
 }
 
+fn parse_attention_window_pattern(
+    model: &GgufModel,
+    key: &'static str,
+    block_count: usize,
+) -> Result<Option<Vec<bool>>, LlamaError> {
+    match model.metadata_scalar(key) {
+        Ok(Some(value)) => {
+            let period =
+                as_usize(value).map_err(|value| LlamaError::InvalidMetadata { key, value })?;
+            let pattern = (0..block_count)
+                .map(|layer| period == 0 || layer % period < period.saturating_sub(1))
+                .collect();
+            Ok(Some(pattern))
+        }
+        Ok(None) => Ok(None),
+        Err(ModelError::MetadataArray(_)) => model
+            .metadata_bool_array(key, MAX_CONFIG_ARRAY_ELEMENTS)
+            .map_err(LlamaError::from),
+        Err(error) => Err(LlamaError::from(error)),
+    }
+}
+
 fn take_matrix(
     matrices: &mut HashMap<String, CpuMatrix>,
     name: &str,
@@ -2966,6 +2988,47 @@ mod tests {
                 4,
                 LlamaRopeScaling::None,
                 Some(0),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn applies_per_layer_sliding_attention_pattern() {
+        let config = LlamaConfig::new_with_rope_scaling_and_attention_window_and_pattern(
+            16,
+            8,
+            2,
+            2,
+            1,
+            16,
+            32,
+            1.0e-5,
+            10_000.0,
+            4,
+            LlamaRopeScaling::None,
+            Some(4),
+            Some(vec![true, false]),
+        )
+        .unwrap();
+        assert_eq!(config.attention_window_pattern(), Some(&[true, false][..]));
+        assert_eq!(config.attention_start_for_layer(0, 7), 3);
+        assert_eq!(config.attention_start_for_layer(1, 7), 0);
+        assert!(
+            LlamaConfig::new_with_rope_scaling_and_attention_window_and_pattern(
+                16,
+                8,
+                2,
+                2,
+                1,
+                16,
+                32,
+                1.0e-5,
+                10_000.0,
+                4,
+                LlamaRopeScaling::None,
+                Some(4),
+                Some(vec![true]),
             )
             .is_err()
         );
