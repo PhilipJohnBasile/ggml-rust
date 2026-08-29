@@ -7,6 +7,50 @@ use std::path::Path;
 use ggml_model::{GgufModel, MetadataScalar, ModelError, QuantizedMatrix};
 use ggml_tensor::{Tensor, TensorError};
 
+/// Position scaling applied before rotary phase calculation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LlamaRopeScaling {
+    /// Use the unscaled token position.
+    None,
+    /// Divide token positions by the configured linear factor.
+    Linear { factor: f32 },
+}
+
+impl Default for LlamaRopeScaling {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl LlamaRopeScaling {
+    /// Returns the position divisor used by rotary embeddings.
+    #[must_use]
+    pub const fn factor(self) -> f32 {
+        match self {
+            Self::None => 1.0,
+            Self::Linear { factor } => factor,
+        }
+    }
+
+    /// Returns the GGUF scaling kind.
+    #[must_use]
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Linear { .. } => "linear",
+        }
+    }
+
+    fn validate(self) -> Result<(), LlamaError> {
+        if !self.factor().is_finite() || self.factor() <= 0.0 {
+            return Err(LlamaError::InvalidConfig(
+                "rope scaling factor must be finite and positive".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Validated architecture parameters for a Llama decoder.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LlamaConfig {
@@ -20,6 +64,7 @@ pub struct LlamaConfig {
     rms_norm_epsilon: f32,
     rope_freq_base: f32,
     rope_dimension_count: usize,
+    rope_scaling: LlamaRopeScaling,
 }
 
 impl LlamaConfig {
@@ -76,6 +121,36 @@ impl LlamaConfig {
         rope_freq_base: f32,
         rope_dimension_count: usize,
     ) -> Result<Self, LlamaError> {
+        Self::new_with_rope_scaling(
+            context_length,
+            embedding_length,
+            block_count,
+            head_count,
+            head_count_kv,
+            feed_forward_length,
+            vocab_size,
+            rms_norm_epsilon,
+            rope_freq_base,
+            rope_dimension_count,
+            LlamaRopeScaling::None,
+        )
+    }
+
+    /// Creates a validated Llama configuration with rotary width and scaling.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_rope_scaling(
+        context_length: usize,
+        embedding_length: usize,
+        block_count: usize,
+        head_count: usize,
+        head_count_kv: usize,
+        feed_forward_length: usize,
+        vocab_size: usize,
+        rms_norm_epsilon: f32,
+        rope_freq_base: f32,
+        rope_dimension_count: usize,
+        rope_scaling: LlamaRopeScaling,
+    ) -> Result<Self, LlamaError> {
         let config = Self {
             context_length,
             embedding_length,
@@ -87,6 +162,7 @@ impl LlamaConfig {
             rms_norm_epsilon,
             rope_freq_base,
             rope_dimension_count,
+            rope_scaling,
         };
         config.validate()?;
         Ok(config)
@@ -148,7 +224,13 @@ impl LlamaConfig {
             })
             .transpose()?
             .unwrap_or_else(|| embedding_length.checked_div(head_count).unwrap_or(0));
-        Self::new_with_rope_dimension(
+        let rope_scaling_type = model.metadata_scalar("llama.rope.scaling.type")?;
+        let rope_scaling_factor = optional_f32_value(
+            model.metadata_scalar("llama.rope.scaling.factor")?,
+            "llama.rope.scaling.factor",
+        )?;
+        let rope_scaling = parse_rope_scaling(rope_scaling_type, rope_scaling_factor)?;
+        Self::new_with_rope_scaling(
             context_length,
             embedding_length,
             block_count,
@@ -159,6 +241,7 @@ impl LlamaConfig {
             rms_norm_epsilon,
             rope_freq_base,
             rope_dimension_count,
+            rope_scaling,
         )
     }
 
@@ -222,6 +305,25 @@ impl LlamaConfig {
         self.rope_dimension_count
     }
 
+    /// Returns the configured rotary position scaling.
+    #[must_use]
+    pub const fn rope_scaling(&self) -> LlamaRopeScaling {
+        self.rope_scaling
+    }
+
+    /// Returns the rotary position divisor, or `1.0` when scaling is disabled.
+    #[must_use]
+    pub const fn rope_scaling_factor(&self) -> f32 {
+        self.rope_scaling.factor()
+    }
+
+    /// Converts a token index to the rotary position used by this model.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn scaled_rope_position(&self, position: usize) -> f32 {
+        position as f32 / self.rope_scaling_factor()
+    }
+
     fn validate(&self) -> Result<(), LlamaError> {
         for (name, value) in [
             ("context_length", self.context_length),
@@ -275,6 +377,7 @@ impl LlamaConfig {
                 "rope_freq_base must be finite and positive".to_owned(),
             ));
         }
+        self.rope_scaling.validate()?;
         Ok(())
     }
 }
@@ -1332,7 +1435,7 @@ impl<'a> LlamaSession<'a> {
                 self.model.config.head_count,
                 head_dim,
                 self.model.config.rope_dimension_count,
-                self.position,
+                self.model.config.scaled_rope_position(self.position),
                 self.model.config.rope_freq_base,
             )?;
             apply_rope(
@@ -1340,7 +1443,7 @@ impl<'a> LlamaSession<'a> {
                 self.model.config.head_count_kv,
                 head_dim,
                 self.model.config.rope_dimension_count,
-                self.position,
+                self.model.config.scaled_rope_position(self.position),
                 self.model.config.rope_freq_base,
             )?;
             if key_values.len() != self.cache.kv_width {
@@ -1516,11 +1619,9 @@ fn apply_rope(
     head_count: usize,
     head_dim: usize,
     rope_dimension_count: usize,
-    position: usize,
+    position: f32,
     frequency_base: f32,
 ) -> Result<(), LlamaError> {
-    #[allow(clippy::cast_precision_loss)]
-    let position = position as f32;
     let head_width = head_dim;
     #[allow(clippy::cast_precision_loss)]
     let head_dim = head_width as f32;
@@ -1710,6 +1811,53 @@ fn optional_f32_value(
     value
         .map(|value| as_f32(value).map_err(|value| LlamaError::InvalidMetadata { key, value }))
         .transpose()
+}
+
+fn parse_rope_scaling(
+    kind: Option<MetadataScalar>,
+    factor: Option<f32>,
+) -> Result<LlamaRopeScaling, LlamaError> {
+    match (kind, factor) {
+        (None, None) => Ok(LlamaRopeScaling::None),
+        (None, Some(_)) => Err(LlamaError::InvalidMetadata {
+            key: "llama.rope.scaling.type",
+            value: "scaling factor is present without a scaling type".to_owned(),
+        }),
+        (Some(MetadataScalar::String(kind)), factor) => match kind.as_str() {
+            "none" => {
+                if let Some(factor) = factor
+                    && (factor - 1.0).abs() > f32::EPSILON
+                {
+                    return Err(LlamaError::InvalidMetadata {
+                        key: "llama.rope.scaling.factor",
+                        value: format!("none scaling requires factor 1.0, got {factor}"),
+                    });
+                }
+                Ok(LlamaRopeScaling::None)
+            }
+            "linear" => {
+                let factor =
+                    factor.ok_or(LlamaError::MissingMetadata("llama.rope.scaling.factor"))?;
+                let scaling = LlamaRopeScaling::Linear { factor };
+                scaling.validate().map_err(|error| match error {
+                    LlamaError::InvalidConfig(value) => LlamaError::InvalidMetadata {
+                        key: "llama.rope.scaling.factor",
+                        value,
+                    },
+                    other => other,
+                })?;
+                Ok(scaling)
+            }
+            _ => Err(LlamaError::InvalidMetadata {
+                key: "llama.rope.scaling.type",
+                value: format!("unsupported scaling type {kind:?}"),
+            }),
+        },
+        (Some(value), _) => Err(LlamaError::InvalidMetadata {
+            key: "llama.rope.scaling.type",
+            value: format!("expected a string, got {value:?}"),
+        }),
+    }
 }
 
 fn next_tensor(
@@ -2096,9 +2244,62 @@ mod tests {
     }
 
     #[test]
+    fn validates_linear_rope_scaling_and_positions() {
+        let config = LlamaConfig::new_with_rope_scaling(
+            16,
+            8,
+            1,
+            2,
+            1,
+            16,
+            32,
+            1.0e-5,
+            10_000.0,
+            4,
+            LlamaRopeScaling::Linear { factor: 2.0 },
+        )
+        .unwrap();
+        assert_eq!(config.rope_scaling().kind(), "linear");
+        assert_eq!(config.rope_scaling_factor(), 2.0);
+        assert_eq!(config.scaled_rope_position(7), 3.5);
+        assert!(
+            LlamaConfig::new_with_rope_scaling(
+                16,
+                8,
+                1,
+                2,
+                1,
+                16,
+                32,
+                1.0e-5,
+                10_000.0,
+                4,
+                LlamaRopeScaling::Linear { factor: 0.0 },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_supported_rope_scaling_metadata() {
+        assert_eq!(
+            parse_rope_scaling(Some(MetadataScalar::String("linear".to_owned())), Some(4.0))
+                .unwrap(),
+            LlamaRopeScaling::Linear { factor: 4.0 }
+        );
+        assert_eq!(
+            parse_rope_scaling(Some(MetadataScalar::String("none".to_owned())), None).unwrap(),
+            LlamaRopeScaling::None
+        );
+        assert!(
+            parse_rope_scaling(Some(MetadataScalar::String("yarn".to_owned())), Some(2.0)).is_err()
+        );
+    }
+
+    #[test]
     fn partial_rotary_dimension_leaves_the_tail_unchanged() {
         let mut values = vec![1.0, 2.0, 3.0, 4.0];
-        apply_rope(&mut values, 1, 4, 2, 1, 10_000.0).unwrap();
+        apply_rope(&mut values, 1, 4, 2, 1.0, 10_000.0).unwrap();
         assert_eq!(&values[2..], &[3.0, 4.0]);
     }
 
