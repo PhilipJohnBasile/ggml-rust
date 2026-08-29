@@ -78,6 +78,18 @@ enum Operation {
     Reshape(Vec<usize>),
     Transpose2d,
     Permute(Vec<usize>),
+    Slice {
+        starts: Vec<usize>,
+        ends: Vec<usize>,
+        axes: Vec<usize>,
+        strides: Vec<usize>,
+    },
+    SliceUpdate {
+        starts: Vec<usize>,
+        ends: Vec<usize>,
+        axes: Vec<usize>,
+        strides: Vec<usize>,
+    },
     GatherRows(Vec<usize>),
     Concatenate {
         axis: usize,
@@ -250,6 +262,65 @@ impl Graph {
     ) -> Result<ValueId, GraphError> {
         self.require(input)?;
         Ok(self.push(Operation::Permute(axes.into()), vec![input]))
+    }
+
+    /// Adds a positive-stride slice node.
+    ///
+    /// Axes not listed are copied in full with stride one. Bounds and output
+    /// dimensions are checked when the graph is evaluated against a concrete
+    /// tensor shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid.
+    pub fn slice(
+        &mut self,
+        input: ValueId,
+        starts: impl Into<Vec<usize>>,
+        ends: impl Into<Vec<usize>>,
+        axes: impl Into<Vec<usize>>,
+        strides: impl Into<Vec<usize>>,
+    ) -> Result<ValueId, GraphError> {
+        self.require(input)?;
+        Ok(self.push(
+            Operation::Slice {
+                starts: starts.into(),
+                ends: ends.into(),
+                axes: axes.into(),
+                strides: strides.into(),
+            },
+            vec![input],
+        ))
+    }
+
+    /// Adds a slice-update node that returns a new tensor.
+    ///
+    /// The update tensor must match the selected region. Bounds, strides, and
+    /// shape compatibility are checked when the graph is evaluated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either input handle is invalid.
+    pub fn slice_update(
+        &mut self,
+        input: ValueId,
+        update: ValueId,
+        starts: impl Into<Vec<usize>>,
+        ends: impl Into<Vec<usize>>,
+        axes: impl Into<Vec<usize>>,
+        strides: impl Into<Vec<usize>>,
+    ) -> Result<ValueId, GraphError> {
+        self.require(input)?;
+        self.require(update)?;
+        Ok(self.push(
+            Operation::SliceUpdate {
+                starts: starts.into(),
+                ends: ends.into(),
+                axes: axes.into(),
+                strides: strides.into(),
+            },
+            vec![input, update],
+        ))
     }
 
     /// Adds a row-gather node for embedding and lookup tables.
@@ -596,6 +667,24 @@ impl Graph {
                         .reshape(shape.clone())?,
                     Operation::Transpose2d => values[self.input_index(node, 0)?].transpose_2d()?,
                     Operation::Permute(axes) => values[self.input_index(node, 0)?].permute(axes)?,
+                    Operation::Slice {
+                        starts,
+                        ends,
+                        axes,
+                        strides,
+                    } => values[self.input_index(node, 0)?].slice(starts, ends, axes, strides)?,
+                    Operation::SliceUpdate {
+                        starts,
+                        ends,
+                        axes,
+                        strides,
+                    } => values[self.input_index(node, 0)?].slice_update(
+                        &values[self.input_index(node, 1)?],
+                        starts,
+                        ends,
+                        axes,
+                        strides,
+                    )?,
                     Operation::GatherRows(indices) => {
                         values[self.input_index(node, 0)?].gather_rows(indices)?
                     }
@@ -869,6 +958,26 @@ mod tests {
             .unwrap();
         assert_eq!(result[0].shape(), &[2, 2, 3]);
         assert_eq!(result[0].data()[..6], [0.0, 2.0, 4.0, 6.0, 8.0, 10.0]);
+    }
+
+    #[test]
+    fn evaluates_strided_slice_and_update_graph() {
+        let mut graph = Graph::new();
+        let input = graph.input([2, 3]).unwrap();
+        let sliced = graph.slice(input, [0], [3], [1], [2]).unwrap();
+        let update = graph.constant(Tensor::from_data([2, 2], [9.0, 8.0, 7.0, 6.0]).unwrap());
+        let updated = graph
+            .slice_update(input, update, [1], [3], [1], [1])
+            .unwrap();
+        let result = graph
+            .evaluate(
+                &[Tensor::from_data([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()],
+                &[sliced, updated],
+            )
+            .unwrap();
+        assert_eq!(result[0].shape(), &[2, 2]);
+        assert_eq!(result[0].data(), &[1.0, 3.0, 4.0, 6.0]);
+        assert_eq!(result[1].data(), &[1.0, 9.0, 8.0, 4.0, 7.0, 6.0]);
     }
 
     #[test]

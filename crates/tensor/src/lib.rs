@@ -52,6 +52,7 @@ pub enum TensorError {
     InvalidEpsilon,
     InvalidScale,
     InvalidClamp,
+    InvalidSlice(&'static str),
     IndexOutOfBounds {
         index: usize,
         upper_bound: usize,
@@ -110,6 +111,7 @@ impl fmt::Display for TensorError {
             }
             Self::InvalidScale => formatter.write_str("attention scale must be finite"),
             Self::InvalidClamp => formatter.write_str("clamp bounds must be finite and ordered"),
+            Self::InvalidSlice(reason) => write!(formatter, "invalid slice: {reason}"),
             Self::IndexOutOfBounds { index, upper_bound } => write!(
                 formatter,
                 "row index {index} is outside the table range 0..{upper_bound}"
@@ -429,6 +431,109 @@ impl Tensor {
             increment_index(&mut coordinates, &output_shape);
         }
         checked_output(output_shape, result, "permute")
+    }
+
+    /// Slices a tensor with positive strides along selected axes.
+    ///
+    /// Axes not listed are copied in full with stride one. The four index
+    /// slices must have equal lengths, and the result remains row-major.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when bounds, axes, strides, or the resulting shape are
+    /// invalid.
+    pub fn slice(
+        &self,
+        starts: &[usize],
+        ends: &[usize],
+        axes: &[usize],
+        strides: &[usize],
+    ) -> Result<Self, TensorError> {
+        let (output_shape, normalized_starts, normalized_strides) =
+            normalize_slice(&self.shape, starts, ends, axes, strides)?;
+        let output_len = element_count(&output_shape)?;
+        let rank = self.rank();
+        let mut result = Vec::with_capacity(output_len);
+        let mut coordinates = vec![0_usize; rank];
+        for _ in 0..output_len {
+            let mut source_index = 0_usize;
+            for axis in 0..rank {
+                let coordinate = normalized_starts[axis]
+                    .checked_add(
+                        coordinates[axis]
+                            .checked_mul(normalized_strides[axis])
+                            .ok_or(TensorError::ElementCountOverflow)?,
+                    )
+                    .ok_or(TensorError::ElementCountOverflow)?;
+                source_index = source_index
+                    .checked_mul(self.shape[axis])
+                    .and_then(|value| value.checked_add(coordinate))
+                    .ok_or(TensorError::ElementCountOverflow)?;
+            }
+            result.push(self.data[source_index]);
+            increment_index(&mut coordinates, &output_shape);
+        }
+        checked_output(output_shape, result, "slice")
+    }
+
+    /// Returns a copy with a positive-stride slice replaced by `update`.
+    ///
+    /// The update shape must equal the shape selected by the slice. The source
+    /// tensor is not modified in place.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when bounds, axes, strides, or update shape are
+    /// invalid.
+    pub fn slice_update(
+        &self,
+        update: &Self,
+        starts: &[usize],
+        ends: &[usize],
+        axes: &[usize],
+        strides: &[usize],
+    ) -> Result<Self, TensorError> {
+        let (expected_shape, normalized_starts, normalized_strides) =
+            normalize_slice(&self.shape, starts, ends, axes, strides)?;
+        if update.shape != expected_shape {
+            return Err(TensorError::ShapeMismatch {
+                left: update.shape.clone(),
+                right: expected_shape,
+            });
+        }
+        let mut result = self.data.clone();
+        let rank = self.rank();
+        let mut coordinates = vec![0_usize; rank];
+        for slot in &mut result {
+            let mut update_index = 0_usize;
+            let mut selected = true;
+            for axis in 0..rank {
+                let coordinate = coordinates[axis];
+                if coordinate < normalized_starts[axis] {
+                    selected = false;
+                    break;
+                }
+                let relative = coordinate - normalized_starts[axis];
+                if !relative.is_multiple_of(normalized_strides[axis]) {
+                    selected = false;
+                    break;
+                }
+                let update_coordinate = relative / normalized_strides[axis];
+                if update_coordinate >= expected_shape[axis] {
+                    selected = false;
+                    break;
+                }
+                update_index = update_index
+                    .checked_mul(expected_shape[axis])
+                    .and_then(|value| value.checked_add(update_coordinate))
+                    .ok_or(TensorError::ElementCountOverflow)?;
+            }
+            if selected {
+                *slot = update.data[update_index];
+            }
+            increment_index(&mut coordinates, &self.shape);
+        }
+        checked_output(self.shape.clone(), result, "slice_update")
     }
 
     /// Gathers rows from a rank-2 table by integer index.
@@ -1293,6 +1398,49 @@ fn validate_shape(shape: &[usize]) -> Result<(), TensorError> {
     Ok(())
 }
 
+type SliceNormalization = (Vec<usize>, Vec<usize>, Vec<usize>);
+
+fn normalize_slice(
+    shape: &[usize],
+    starts: &[usize],
+    ends: &[usize],
+    axes: &[usize],
+    strides: &[usize],
+) -> Result<SliceNormalization, TensorError> {
+    validate_shape(shape)?;
+    if starts.len() != ends.len() || starts.len() != axes.len() || starts.len() != strides.len() {
+        return Err(TensorError::InvalidSlice(
+            "index arrays must have equal lengths",
+        ));
+    }
+    let mut output_shape = shape.to_vec();
+    let mut normalized_starts = vec![0_usize; shape.len()];
+    let mut normalized_strides = vec![1_usize; shape.len()];
+    let mut seen = vec![false; shape.len()];
+    for (((&start, &end), &axis), &stride) in starts.iter().zip(ends).zip(axes).zip(strides) {
+        if axis >= shape.len() || seen[axis] || stride == 0 || start > end || end > shape[axis] {
+            return Err(TensorError::InvalidSlice(
+                "bounds, axes, or strides are invalid",
+            ));
+        }
+        let span = end - start;
+        let count = span
+            .checked_add(stride - 1)
+            .ok_or(TensorError::ElementCountOverflow)?
+            / stride;
+        if count == 0 {
+            return Err(TensorError::InvalidSlice(
+                "slice output dimensions must be nonzero",
+            ));
+        }
+        seen[axis] = true;
+        normalized_starts[axis] = start;
+        normalized_strides[axis] = stride;
+        output_shape[axis] = count;
+    }
+    Ok((output_shape, normalized_starts, normalized_strides))
+}
+
 fn element_count(shape: &[usize]) -> Result<usize, TensorError> {
     shape
         .iter()
@@ -1367,6 +1515,25 @@ mod tests {
                 axes: vec![0, 0, 1],
                 rank: 3,
             }
+        );
+    }
+
+    #[test]
+    fn slices_and_updates_strided_regions() {
+        let tensor = Tensor::from_data([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let sliced = tensor.slice(&[1], &[3], &[1], &[1]).unwrap();
+        assert_eq!(sliced.shape(), &[2, 2]);
+        assert_eq!(sliced.data(), &[2.0, 3.0, 5.0, 6.0]);
+        let strided = tensor.slice(&[0], &[3], &[1], &[2]).unwrap();
+        assert_eq!(strided.data(), &[1.0, 3.0, 4.0, 6.0]);
+        let update = Tensor::from_data([2, 2], [9.0, 8.0, 7.0, 6.0]).unwrap();
+        let updated = tensor
+            .slice_update(&update, &[1], &[3], &[1], &[1])
+            .unwrap();
+        assert_eq!(updated.data(), &[1.0, 9.0, 8.0, 4.0, 7.0, 6.0]);
+        assert_eq!(
+            tensor.slice(&[0], &[0], &[1], &[1]).unwrap_err(),
+            TensorError::InvalidSlice("slice output dimensions must be nonzero")
         );
     }
 
