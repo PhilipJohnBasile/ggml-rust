@@ -128,6 +128,9 @@ enum Operation {
         axis: usize,
         reverse: bool,
     },
+    Softmax {
+        axis: usize,
+    },
     Clamp {
         minimum: f32,
         maximum: f32,
@@ -548,6 +551,17 @@ impl Graph {
         self.unary(Operation::SoftmaxLastDim, input)
     }
 
+    /// Adds a numerically stable softmax node along one axis.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid. Axis validation is
+    /// completed during evaluation against the concrete tensor rank.
+    pub fn softmax(&mut self, input: ValueId, axis: usize) -> Result<ValueId, GraphError> {
+        self.require(input)?;
+        Ok(self.push(Operation::Softmax { axis }, vec![input]))
+    }
+
     /// Adds a final-dimension sum reduction.
     ///
     /// # Errors
@@ -728,106 +742,108 @@ impl Graph {
         }
         let mut values: Vec<Tensor> = Vec::with_capacity(self.nodes.len());
         for node in &self.nodes {
-            let value =
-                match &node.operation {
-                    Operation::Input { index, .. } => inputs[*index].clone(),
-                    Operation::Constant(tensor) => tensor.clone(),
-                    Operation::Add => values[self.input_index(node, 0)?]
-                        .add(&values[self.input_index(node, 1)?])?,
-                    Operation::Subtract => values[self.input_index(node, 0)?]
-                        .sub(&values[self.input_index(node, 1)?])?,
-                    Operation::Multiply => values[self.input_index(node, 0)?]
-                        .mul(&values[self.input_index(node, 1)?])?,
-                    Operation::Divide => values[self.input_index(node, 0)?]
-                        .div(&values[self.input_index(node, 1)?])?,
-                    Operation::Matmul => values[self.input_index(node, 0)?]
-                        .matmul(&values[self.input_index(node, 1)?])?,
-                    Operation::Reshape(shape) => values[self.input_index(node, 0)?]
-                        .clone()
-                        .reshape(shape.clone())?,
-                    Operation::Transpose2d => values[self.input_index(node, 0)?].transpose_2d()?,
-                    Operation::Permute(axes) => values[self.input_index(node, 0)?].permute(axes)?,
-                    Operation::Slice {
-                        starts,
-                        ends,
-                        axes,
-                        strides,
-                    } => values[self.input_index(node, 0)?].slice(starts, ends, axes, strides)?,
-                    Operation::SliceUpdate {
-                        starts,
-                        ends,
-                        axes,
-                        strides,
-                    } => values[self.input_index(node, 0)?].slice_update(
+            let value = match &node.operation {
+                Operation::Input { index, .. } => inputs[*index].clone(),
+                Operation::Constant(tensor) => tensor.clone(),
+                Operation::Add => {
+                    values[self.input_index(node, 0)?].add(&values[self.input_index(node, 1)?])?
+                }
+                Operation::Subtract => {
+                    values[self.input_index(node, 0)?].sub(&values[self.input_index(node, 1)?])?
+                }
+                Operation::Multiply => {
+                    values[self.input_index(node, 0)?].mul(&values[self.input_index(node, 1)?])?
+                }
+                Operation::Divide => {
+                    values[self.input_index(node, 0)?].div(&values[self.input_index(node, 1)?])?
+                }
+                Operation::Matmul => values[self.input_index(node, 0)?]
+                    .matmul(&values[self.input_index(node, 1)?])?,
+                Operation::Reshape(shape) => values[self.input_index(node, 0)?]
+                    .clone()
+                    .reshape(shape.clone())?,
+                Operation::Transpose2d => values[self.input_index(node, 0)?].transpose_2d()?,
+                Operation::Permute(axes) => values[self.input_index(node, 0)?].permute(axes)?,
+                Operation::Slice {
+                    starts,
+                    ends,
+                    axes,
+                    strides,
+                } => values[self.input_index(node, 0)?].slice(starts, ends, axes, strides)?,
+                Operation::SliceUpdate {
+                    starts,
+                    ends,
+                    axes,
+                    strides,
+                } => values[self.input_index(node, 0)?].slice_update(
+                    &values[self.input_index(node, 1)?],
+                    starts,
+                    ends,
+                    axes,
+                    strides,
+                )?,
+                Operation::GatherRows(indices) => {
+                    values[self.input_index(node, 0)?].gather_rows(indices)?
+                }
+                Operation::Concatenate { axis } => values[self.input_index(node, 0)?]
+                    .concatenate(&values[self.input_index(node, 1)?], *axis)?,
+                Operation::Broadcast(shape) => {
+                    values[self.input_index(node, 0)?].broadcast_to(shape.clone())?
+                }
+                Operation::RmsNorm { epsilon } => {
+                    values[self.input_index(node, 0)?].rms_norm(*epsilon)?
+                }
+                Operation::RmsNormWeighted { epsilon } => values[self.input_index(node, 0)?]
+                    .rms_norm_with_weight(&values[self.input_index(node, 1)?], *epsilon)?,
+                Operation::Scale { factor } => values[self.input_index(node, 0)?].scale(*factor)?,
+                Operation::Negate => values[self.input_index(node, 0)?].neg()?,
+                Operation::Absolute => values[self.input_index(node, 0)?].abs()?,
+                Operation::Square => values[self.input_index(node, 0)?].sqr()?,
+                Operation::SquareRoot => values[self.input_index(node, 0)?].sqrt()?,
+                Operation::Exponential => values[self.input_index(node, 0)?].exp()?,
+                Operation::Logarithm => values[self.input_index(node, 0)?].log()?,
+                Operation::Sine => values[self.input_index(node, 0)?].sin()?,
+                Operation::Cosine => values[self.input_index(node, 0)?].cos()?,
+                Operation::Tanh => values[self.input_index(node, 0)?].tanh()?,
+                Operation::Sigmoid => values[self.input_index(node, 0)?].sigmoid()?,
+                Operation::Clamp { minimum, maximum } => {
+                    values[self.input_index(node, 0)?].clamp(*minimum, *maximum)?
+                }
+                Operation::Silu => values[self.input_index(node, 0)?].silu()?,
+                Operation::SoftmaxLastDim => {
+                    values[self.input_index(node, 0)?].softmax_last_dim()?
+                }
+                Operation::SumLastDim => values[self.input_index(node, 0)?].sum_last_dim()?,
+                Operation::MeanLastDim => values[self.input_index(node, 0)?].mean_last_dim()?,
+                Operation::Sum { axis, keepdims } => {
+                    values[self.input_index(node, 0)?].sum(*axis, *keepdims)?
+                }
+                Operation::Mean { axis, keepdims } => {
+                    values[self.input_index(node, 0)?].mean(*axis, *keepdims)?
+                }
+                Operation::Cumsum { axis, reverse } => {
+                    values[self.input_index(node, 0)?].cumsum(*axis, *reverse)?
+                }
+                Operation::Softmax { axis } => values[self.input_index(node, 0)?].softmax(*axis)?,
+                Operation::Rotary {
+                    rotary_dimension,
+                    position,
+                    frequency_base,
+                    scaling,
+                } => values[self.input_index(node, 0)?].rotary_embedding_with_scaling(
+                    *rotary_dimension,
+                    *position,
+                    *frequency_base,
+                    *scaling,
+                )?,
+                Operation::Attention { scale, causal } => values[self.input_index(node, 0)?]
+                    .scaled_dot_product_attention(
                         &values[self.input_index(node, 1)?],
-                        starts,
-                        ends,
-                        axes,
-                        strides,
+                        &values[self.input_index(node, 2)?],
+                        *scale,
+                        *causal,
                     )?,
-                    Operation::GatherRows(indices) => {
-                        values[self.input_index(node, 0)?].gather_rows(indices)?
-                    }
-                    Operation::Concatenate { axis } => values[self.input_index(node, 0)?]
-                        .concatenate(&values[self.input_index(node, 1)?], *axis)?,
-                    Operation::Broadcast(shape) => {
-                        values[self.input_index(node, 0)?].broadcast_to(shape.clone())?
-                    }
-                    Operation::RmsNorm { epsilon } => {
-                        values[self.input_index(node, 0)?].rms_norm(*epsilon)?
-                    }
-                    Operation::RmsNormWeighted { epsilon } => values[self.input_index(node, 0)?]
-                        .rms_norm_with_weight(&values[self.input_index(node, 1)?], *epsilon)?,
-                    Operation::Scale { factor } => {
-                        values[self.input_index(node, 0)?].scale(*factor)?
-                    }
-                    Operation::Negate => values[self.input_index(node, 0)?].neg()?,
-                    Operation::Absolute => values[self.input_index(node, 0)?].abs()?,
-                    Operation::Square => values[self.input_index(node, 0)?].sqr()?,
-                    Operation::SquareRoot => values[self.input_index(node, 0)?].sqrt()?,
-                    Operation::Exponential => values[self.input_index(node, 0)?].exp()?,
-                    Operation::Logarithm => values[self.input_index(node, 0)?].log()?,
-                    Operation::Sine => values[self.input_index(node, 0)?].sin()?,
-                    Operation::Cosine => values[self.input_index(node, 0)?].cos()?,
-                    Operation::Tanh => values[self.input_index(node, 0)?].tanh()?,
-                    Operation::Sigmoid => values[self.input_index(node, 0)?].sigmoid()?,
-                    Operation::Clamp { minimum, maximum } => {
-                        values[self.input_index(node, 0)?].clamp(*minimum, *maximum)?
-                    }
-                    Operation::Silu => values[self.input_index(node, 0)?].silu()?,
-                    Operation::SoftmaxLastDim => {
-                        values[self.input_index(node, 0)?].softmax_last_dim()?
-                    }
-                    Operation::SumLastDim => values[self.input_index(node, 0)?].sum_last_dim()?,
-                    Operation::MeanLastDim => values[self.input_index(node, 0)?].mean_last_dim()?,
-                    Operation::Sum { axis, keepdims } => {
-                        values[self.input_index(node, 0)?].sum(*axis, *keepdims)?
-                    }
-                    Operation::Mean { axis, keepdims } => {
-                        values[self.input_index(node, 0)?].mean(*axis, *keepdims)?
-                    }
-                    Operation::Cumsum { axis, reverse } => {
-                        values[self.input_index(node, 0)?].cumsum(*axis, *reverse)?
-                    }
-                    Operation::Rotary {
-                        rotary_dimension,
-                        position,
-                        frequency_base,
-                        scaling,
-                    } => values[self.input_index(node, 0)?].rotary_embedding_with_scaling(
-                        *rotary_dimension,
-                        *position,
-                        *frequency_base,
-                        *scaling,
-                    )?,
-                    Operation::Attention { scale, causal } => values[self.input_index(node, 0)?]
-                        .scaled_dot_product_attention(
-                            &values[self.input_index(node, 1)?],
-                            &values[self.input_index(node, 2)?],
-                            *scale,
-                            *causal,
-                        )?,
-                };
+            };
             values.push(value);
         }
         outputs
@@ -1125,6 +1141,21 @@ mod tests {
             .unwrap();
         assert_eq!(result[0].data(), &[1.0, 3.0, 6.0, 4.0, 9.0, 15.0]);
         assert_eq!(result[1].data(), &[5.0, 7.0, 9.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn evaluates_axis_softmax_nodes() {
+        let mut graph = Graph::new();
+        let input = graph.input([2, 2]).unwrap();
+        let output = graph.softmax(input, 0).unwrap();
+        let result = graph
+            .evaluate(
+                &[Tensor::from_data([2, 2], [1.0, 2.0, 3.0, 4.0]).unwrap()],
+                &[output],
+            )
+            .unwrap();
+        assert!((result[0].data()[0] + result[0].data()[2] - 1.0).abs() < 1.0e-6);
+        assert!((result[0].data()[1] + result[0].data()[3] - 1.0).abs() < 1.0e-6);
     }
 
     #[test]

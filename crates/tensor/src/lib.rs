@@ -1147,25 +1147,59 @@ impl Tensor {
     ///
     /// Returns an error when an input or output value is non-finite.
     pub fn softmax_last_dim(&self) -> Result<Self, TensorError> {
-        let width = self
+        let axis = self
             .shape
-            .last()
-            .copied()
+            .len()
+            .checked_sub(1)
             .ok_or(TensorError::ZeroDimension)?;
-        let mut result = Vec::with_capacity(self.data.len());
-        for row in self.data.chunks_exact(width) {
-            for (index, value) in row.iter().enumerate() {
-                if !value.is_finite() {
-                    return Err(TensorError::NonFiniteInput { index });
+        self.softmax(axis)
+    }
+
+    /// Applies numerically stable softmax independently along one axis.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the axis is invalid, an input is non-finite, or
+    /// an output value is non-finite.
+    pub fn softmax(&self, axis: usize) -> Result<Self, TensorError> {
+        let rank = self.shape.len();
+        if axis >= rank {
+            return Err(TensorError::InvalidAxis { axis, rank });
+        }
+        let width = self.shape[axis];
+        let inner = self.shape[axis + 1..]
+            .iter()
+            .try_fold(1_usize, |value, &dimension| value.checked_mul(dimension))
+            .ok_or(TensorError::ElementCountOverflow)?;
+        let block = width
+            .checked_mul(inner)
+            .ok_or(TensorError::ElementCountOverflow)?;
+        let outer = self.len() / block;
+        let mut result = vec![0.0; self.data.len()];
+        for outer_index in 0..outer {
+            for inner_index in 0..inner {
+                let base = outer_index * block + inner_index;
+                let mut maximum = f32::NEG_INFINITY;
+                for position in 0..width {
+                    let index = base + position * inner;
+                    let value = self.data[index];
+                    if !value.is_finite() {
+                        return Err(TensorError::NonFiniteInput { index });
+                    }
+                    maximum = maximum.max(value);
+                }
+                let mut total = 0.0_f32;
+                for position in 0..width {
+                    let index = base + position * inner;
+                    let value = (self.data[index] - maximum).exp();
+                    result[index] = value;
+                    total += value;
+                }
+                for position in 0..width {
+                    let index = base + position * inner;
+                    result[index] /= total;
                 }
             }
-            let maximum = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let exponents = row
-                .iter()
-                .map(|value| (*value - maximum).exp())
-                .collect::<Vec<_>>();
-            let total = exponents.iter().sum::<f32>();
-            result.extend(exponents.into_iter().map(|value| value / total));
         }
         checked_output(self.shape.clone(), result, "softmax")
     }
@@ -1890,6 +1924,25 @@ mod tests {
         );
         assert!(matches!(
             tensor.cumsum(2, false),
+            Err(TensorError::InvalidAxis { axis: 2, rank: 2 })
+        ));
+    }
+
+    #[test]
+    fn softmax_supports_arbitrary_axes() {
+        let tensor = Tensor::from_data([2, 2], [1.0, 2.0, 3.0, 4.0]).unwrap();
+        let along_rows = tensor.softmax(0).unwrap();
+        let expected = [
+            1.0 / (1.0 + 2.0_f32.exp()),
+            1.0 / (1.0 + 2.0_f32.exp()),
+            2.0_f32.exp() / (1.0 + 2.0_f32.exp()),
+            2.0_f32.exp() / (1.0 + 2.0_f32.exp()),
+        ];
+        for (actual, expected) in along_rows.data().iter().zip(expected) {
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
+        assert!(matches!(
+            tensor.softmax(2),
             Err(TensorError::InvalidAxis { axis: 2, rank: 2 })
         ));
     }
