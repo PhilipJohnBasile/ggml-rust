@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use ggml_tensor::{Tensor, TensorError};
+use ggml_tensor::{RotaryScaling, Tensor, TensorError};
 
 /// A handle to one value in a graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -112,6 +112,7 @@ enum Operation {
         rotary_dimension: usize,
         position: f32,
         frequency_base: f32,
+        scaling: RotaryScaling,
     },
     Attention {
         scale: f32,
@@ -477,12 +478,39 @@ impl Graph {
         position: f32,
         frequency_base: f32,
     ) -> Result<ValueId, GraphError> {
+        self.rotary_embedding_with_scaling(
+            input,
+            rotary_dimension,
+            position,
+            frequency_base,
+            RotaryScaling::None,
+        )
+    }
+
+    /// Adds an interleaved rotary position embedding node with linear or `YaRN`
+    /// scaling.
+    ///
+    /// The input must evaluate to `[heads, head_dim]`; only the leading
+    /// `rotary_dimension` values are rotated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid.
+    pub fn rotary_embedding_with_scaling(
+        &mut self,
+        input: ValueId,
+        rotary_dimension: usize,
+        position: f32,
+        frequency_base: f32,
+        scaling: RotaryScaling,
+    ) -> Result<ValueId, GraphError> {
         self.require(input)?;
         Ok(self.push(
             Operation::Rotary {
                 rotary_dimension,
                 position,
                 frequency_base,
+                scaling,
             },
             vec![input],
         ))
@@ -605,10 +633,12 @@ impl Graph {
                         rotary_dimension,
                         position,
                         frequency_base,
-                    } => values[self.input_index(node, 0)?].rotary_embedding(
+                        scaling,
+                    } => values[self.input_index(node, 0)?].rotary_embedding_with_scaling(
                         *rotary_dimension,
                         *position,
                         *frequency_base,
+                        *scaling,
                     )?,
                     Operation::Attention { scale, causal } => values[self.input_index(node, 0)?]
                         .scaled_dot_product_attention(
@@ -745,6 +775,28 @@ mod tests {
         assert!((result[0].data()[1] - 0.841_470_96).abs() < 1.0e-5);
         assert!((result[0].data()[2] + 0.841_470_96).abs() < 1.0e-5);
         assert!((result[0].data()[3] - 0.540_302_3).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn evaluates_scaled_rotary_embedding_graph() {
+        let mut graph = Graph::new();
+        let input = graph.input([1, 2]).unwrap();
+        let rotated = graph
+            .rotary_embedding_with_scaling(
+                input,
+                2,
+                0.0,
+                10_000.0,
+                RotaryScaling::Linear { factor: 2.0 },
+            )
+            .unwrap();
+        let result = graph
+            .evaluate(
+                &[Tensor::from_data([1, 2], [1.0, 0.0]).unwrap()],
+                &[rotated],
+            )
+            .unwrap();
+        assert_eq!(result[0].data(), &[1.0, 0.0]);
     }
 
     #[test]

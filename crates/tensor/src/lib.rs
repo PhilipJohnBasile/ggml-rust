@@ -137,6 +137,101 @@ impl fmt::Display for TensorError {
 
 impl std::error::Error for TensorError {}
 
+/// Rotary position scaling shared by CPU tensors and graph execution.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RotaryScaling {
+    /// Use the unscaled token position.
+    None,
+    /// Divide rotary positions by a linear factor.
+    Linear { factor: f32 },
+    /// Apply `YaRN` frequency interpolation and magnitude scaling.
+    Yarn {
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        original_context_length: usize,
+        attention_factor: f32,
+        ext_factor: f32,
+    },
+}
+
+impl RotaryScaling {
+    #[allow(clippy::cast_precision_loss)]
+    fn phase(
+        self,
+        position: f32,
+        pair: usize,
+        head_dim: f32,
+        rotary_dimension: usize,
+        frequency_base: f32,
+    ) -> Result<(f32, f32), TensorError> {
+        let exponent = -2.0 * pair as f32 / head_dim;
+        let theta_extrap = position * frequency_base.powf(exponent);
+        let result = match self {
+            Self::None => (theta_extrap, 1.0),
+            Self::Linear { factor } => {
+                if !factor.is_finite() || factor <= 0.0 {
+                    return Err(TensorError::InvalidPosition);
+                }
+                (theta_extrap / factor, 1.0)
+            }
+            Self::Yarn {
+                factor,
+                beta_fast,
+                beta_slow,
+                original_context_length,
+                attention_factor,
+                ext_factor,
+            } => {
+                if !factor.is_finite()
+                    || factor <= 0.0
+                    || !beta_fast.is_finite()
+                    || beta_fast <= 0.0
+                    || !beta_slow.is_finite()
+                    || beta_slow <= 0.0
+                    || original_context_length == 0
+                    || !attention_factor.is_finite()
+                    || attention_factor <= 0.0
+                    || !ext_factor.is_finite()
+                    || ext_factor < 0.0
+                {
+                    return Err(TensorError::InvalidPosition);
+                }
+                let rotary_dimension_f32 = rotary_dimension as f32;
+                let low = (rotary_dimension_f32
+                    * ((original_context_length as f32)
+                        / (beta_fast * 2.0 * std::f32::consts::PI))
+                        .ln()
+                    / (2.0 * frequency_base.ln()))
+                .floor()
+                .max(0.0);
+                let high = (rotary_dimension_f32
+                    * ((original_context_length as f32)
+                        / (beta_slow * 2.0 * std::f32::consts::PI))
+                        .ln()
+                    / (2.0 * frequency_base.ln()))
+                .ceil()
+                .min((rotary_dimension.saturating_sub(1)) as f32);
+                let ramp = (1.0 - ((pair * 2) as f32 - low) / (0.001_f32.max(high - low)))
+                    .clamp(0.0, 1.0)
+                    * ext_factor;
+                let theta_interp = theta_extrap / factor;
+                let angle = theta_interp * (1.0 - ramp) + theta_extrap * ramp;
+                let magnitude = attention_factor * (1.0 + 0.1 * factor.ln());
+                (angle, magnitude)
+            }
+        };
+        if result.0.is_finite() && result.1.is_finite() {
+            Ok(result)
+        } else {
+            Err(TensorError::NonFiniteOutput {
+                operation: "rotary_embedding",
+                index: pair,
+            })
+        }
+    }
+}
+
 impl Tensor {
     /// Creates a tensor from a shape and row-major values.
     ///
@@ -777,6 +872,33 @@ impl Tensor {
         position: f32,
         frequency_base: f32,
     ) -> Result<Self, TensorError> {
+        self.rotary_embedding_with_scaling(
+            rotary_dimension,
+            position,
+            frequency_base,
+            RotaryScaling::None,
+        )
+    }
+
+    /// Applies interleaved rotary position embedding with linear or `YaRN`
+    /// scaling to `[heads, head_dim]`.
+    ///
+    /// Only the first `rotary_dimension` values of each head are rotated.
+    /// Scaling and magnitude are applied per rotary pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tensor rank, dimensions, scaling
+    /// parameters, position, or frequency base are invalid, or an output
+    /// value is non-finite.
+    #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+    pub fn rotary_embedding_with_scaling(
+        &self,
+        rotary_dimension: usize,
+        position: f32,
+        frequency_base: f32,
+        scaling: RotaryScaling,
+    ) -> Result<Self, TensorError> {
         if self.shape.len() != 2 {
             return Err(TensorError::RotaryShapeMismatch {
                 shape: self.shape.clone(),
@@ -802,19 +924,22 @@ impl Tensor {
         }
         self.validate_finite()?;
         let mut result = self.data.clone();
-        #[allow(clippy::cast_precision_loss)]
         let head_dim_f32 = head_dim as f32;
         for head in 0..heads {
             let start = head * head_dim;
             for pair in 0..rotary_dimension / 2 {
-                #[allow(clippy::cast_precision_loss)]
-                let exponent = -2.0 * pair as f32 / head_dim_f32;
-                let angle = position * frequency_base.powf(exponent);
+                let (angle, magnitude) = scaling.phase(
+                    position,
+                    pair,
+                    head_dim_f32,
+                    rotary_dimension,
+                    frequency_base,
+                )?;
                 let (sine, cosine) = angle.sin_cos();
                 let first = self.data[start + pair * 2];
                 let second = self.data[start + pair * 2 + 1];
-                result[start + pair * 2] = first * cosine - second * sine;
-                result[start + pair * 2 + 1] = first * sine + second * cosine;
+                result[start + pair * 2] = (first * cosine - second * sine) * magnitude;
+                result[start + pair * 2 + 1] = (first * sine + second * cosine) * magnitude;
             }
         }
         checked_output(self.shape.clone(), result, "rotary_embedding")
@@ -1298,6 +1423,29 @@ mod tests {
             Tensor::zeros([2, 0]).unwrap_err(),
             TensorError::ZeroDimension
         );
+    }
+
+    #[test]
+    fn rotary_embedding_applies_yarn_scaling() {
+        let tensor = Tensor::from_data([1, 2], [1.0, 2.0]).unwrap();
+        let output = tensor
+            .rotary_embedding_with_scaling(
+                2,
+                0.0,
+                10_000.0,
+                RotaryScaling::Yarn {
+                    factor: 4.0,
+                    beta_fast: 32.0,
+                    beta_slow: 1.0,
+                    original_context_length: 32,
+                    attention_factor: 1.0,
+                    ext_factor: 1.0,
+                },
+            )
+            .unwrap();
+        let magnitude = 1.0 + 0.1 * 4.0_f32.ln();
+        assert!((output.data()[0] - magnitude).abs() < 1.0e-6);
+        assert!((output.data()[1] - 2.0 * magnitude).abs() < 1.0e-6);
     }
 
     #[test]
