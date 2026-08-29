@@ -1981,7 +1981,32 @@ impl LlamaCpuModel {
             if descriptor.shape().len() == 2
                 && matches!(
                     descriptor.value_type().raw(),
-                    2 | 3 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15
+                    2 | 3
+                        | 6
+                        | 7
+                        | 8
+                        | 9
+                        | 10
+                        | 11
+                        | 12
+                        | 13
+                        | 14
+                        | 15
+                        | 16
+                        | 17
+                        | 18
+                        | 19
+                        | 20
+                        | 21
+                        | 22
+                        | 23
+                        | 29
+                        | 34
+                        | 35
+                        | 39
+                        | 40
+                        | 41
+                        | 42
                 )
             {
                 quantized_names.push(name.as_str());
