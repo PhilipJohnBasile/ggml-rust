@@ -456,7 +456,7 @@ impl LlamaModel {
 
 const MAX_TOKENIZER_ELEMENTS: u64 = 16 * 1024 * 1024;
 
-/// A bounded GGUF tokenizer vocabulary with greedy SentencePiece-style pieces.
+/// A bounded GGUF tokenizer vocabulary with SentencePiece-style pieces.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LlamaTokenizer {
     tokens: Vec<String>,
@@ -464,6 +464,15 @@ pub struct LlamaTokenizer {
     bos_token_id: Option<usize>,
     eos_token_id: Option<usize>,
     unk_token_id: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct EncodingPath {
+    score: f32,
+    token_count: usize,
+    previous: usize,
+    token_id: usize,
+    kind: u8,
 }
 
 impl LlamaTokenizer {
@@ -487,6 +496,12 @@ impl LlamaTokenizer {
             return Err(LlamaError::InvalidMetadata {
                 key: "tokenizer.ggml.scores",
                 value: format!("{} scores, expected {}", scores.len(), tokens.len()),
+            });
+        }
+        if let Some(index) = scores.iter().position(|score| !score.is_finite()) {
+            return Err(LlamaError::InvalidMetadata {
+                key: "tokenizer.ggml.scores",
+                value: format!("score at token {index} is not finite"),
             });
         }
         let token_id_keys = [
@@ -543,7 +558,8 @@ impl LlamaTokenizer {
         self.eos_token_id
     }
 
-    /// Encodes text using normalized whitespace markers and greedy longest pieces.
+    /// Encodes text using normalized whitespace markers and SentencePiece
+    /// unigram Viterbi segmentation.
     ///
     /// This covers the standard Llama `SentencePiece` vocabulary representation.
     /// Byte-fallback pieces are honored when present; otherwise an explicit
@@ -554,58 +570,131 @@ impl LlamaTokenizer {
     /// Returns an error when the text cannot be represented by this vocabulary.
     pub fn encode(&self, text: &str) -> Result<Vec<usize>, LlamaError> {
         let normalized = normalize_sentencepiece(text);
+        if normalized.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let input = normalized.as_bytes();
+        let mut character_ends = vec![None; input.len()];
+        for (offset, character) in normalized.char_indices() {
+            character_ends[offset] = Some(offset + character.len_utf8());
+        }
+        let paths = self.encoding_paths(input, &character_ends, false)?;
+        let paths = if paths[input.len()].is_some() {
+            paths
+        } else {
+            self.encoding_paths(input, &character_ends, true)?
+        };
+        let Some(_) = paths[input.len()] else {
+            return Err(LlamaError::InvalidMetadata {
+                key: "tokenizer.ggml.tokens",
+                value: "no token matches normalized input".to_owned(),
+            });
+        };
         let mut token_ids = Vec::new();
-        let mut offset = 0;
-        while offset < normalized.len() {
-            let suffix = &normalized[offset..];
-            let mut best: Option<(usize, usize, f32)> = None;
-            for (index, token) in self.tokens.iter().enumerate() {
-                if token.is_empty() || !suffix.starts_with(token) {
-                    continue;
-                }
-                let candidate = (token.len(), index, self.scores[index]);
-                if best.is_none_or(|current| {
-                    candidate.0 > current.0 || (candidate.0 == current.0 && candidate.2 > current.2)
-                }) {
-                    best = Some(candidate);
-                }
-            }
-            if let Some((length, index, _)) = best {
-                token_ids.push(index);
-                offset += length;
-                continue;
-            }
-            let character = suffix
-                .chars()
-                .next()
+        let mut offset = input.len();
+        while offset != 0 {
+            let path = paths[offset]
+                .as_ref()
                 .ok_or_else(|| LlamaError::InvalidMetadata {
                     key: "tokenizer.ggml.tokens",
-                    value: "invalid UTF-8 token boundary".to_owned(),
+                    value: "tokenization path is incomplete".to_owned(),
                 })?;
-            let mut consumed_byte = false;
-            for byte in character.to_string().as_bytes() {
-                let fallback = format!("<0x{byte:02X}>");
-                if let Some(index) = self.tokens.iter().position(|token| token == &fallback) {
-                    token_ids.push(index);
-                    consumed_byte = true;
-                } else {
-                    consumed_byte = false;
-                    break;
+            token_ids.push(path.token_id);
+            offset = path.previous;
+        }
+        token_ids.reverse();
+        Ok(token_ids)
+    }
+
+    fn encoding_paths(
+        &self,
+        input: &[u8],
+        character_ends: &[Option<usize>],
+        allow_unknown: bool,
+    ) -> Result<Vec<Option<EncodingPath>>, LlamaError> {
+        let mut paths = vec![None; input.len() + 1];
+        paths[0] = Some(EncodingPath {
+            score: 0.0,
+            token_count: 0,
+            previous: 0,
+            token_id: 0,
+            kind: 0,
+        });
+        let token_bytes = self.tokens.iter().map(String::as_bytes).collect::<Vec<_>>();
+        for offset in 0..input.len() {
+            let Some(path) = paths[offset].clone() else {
+                continue;
+            };
+            for (token_id, bytes) in token_bytes.iter().enumerate() {
+                if !bytes.is_empty()
+                    && offset.saturating_add(bytes.len()) <= input.len()
+                    && input[offset..].starts_with(bytes)
+                {
+                    self.relax_encoding_path(
+                        &mut paths,
+                        offset,
+                        offset + bytes.len(),
+                        token_id,
+                        0,
+                        &path,
+                    )?;
+                }
+                if parse_byte_fallback(&self.tokens[token_id]) == Some(input[offset]) {
+                    self.relax_encoding_path(&mut paths, offset, offset + 1, token_id, 1, &path)?;
                 }
             }
-            if consumed_byte {
-                offset += character.len_utf8();
-            } else if let Some(unk_token_id) = self.unk_token_id {
-                token_ids.push(unk_token_id);
-                offset += character.len_utf8();
-            } else {
-                return Err(LlamaError::InvalidMetadata {
-                    key: "tokenizer.ggml.tokens",
-                    value: format!("no token matches input at byte offset {offset}"),
-                });
+            if allow_unknown {
+                if let (Some(unk_token_id), Some(end)) = (self.unk_token_id, character_ends[offset])
+                {
+                    self.relax_encoding_path(&mut paths, offset, end, unk_token_id, 2, &path)?;
+                }
             }
         }
-        Ok(token_ids)
+        Ok(paths)
+    }
+
+    fn relax_encoding_path(
+        &self,
+        paths: &mut [Option<EncodingPath>],
+        previous: usize,
+        end: usize,
+        token_id: usize,
+        kind: u8,
+        path: &EncodingPath,
+    ) -> Result<(), LlamaError> {
+        let score = path.score + self.scores[token_id];
+        if !score.is_finite() {
+            return Err(LlamaError::InvalidMetadata {
+                key: "tokenizer.ggml.scores",
+                value: format!("tokenization score overflowed at token {token_id}"),
+            });
+        }
+        let candidate = EncodingPath {
+            score,
+            token_count: path.token_count.checked_add(1).ok_or_else(|| {
+                LlamaError::InvalidMetadata {
+                    key: "tokenizer.ggml.tokens",
+                    value: "tokenization path is too long".to_owned(),
+                }
+            })?,
+            previous,
+            token_id,
+            kind,
+        };
+        let replace = paths[end].as_ref().is_none_or(|current| {
+            candidate.score > current.score
+                || (candidate.score == current.score
+                    && (candidate.token_count < current.token_count
+                        || (candidate.token_count == current.token_count
+                            && (candidate.kind < current.kind
+                                || (candidate.kind == current.kind
+                                    && candidate.token_id < current.token_id)))))
+        });
+        if replace {
+            paths[end] = Some(candidate);
+        }
+        Ok(())
     }
 
     /// Decodes token ids into text, including byte-fallback pieces.
@@ -1709,6 +1798,36 @@ mod tests {
         let result = cpu.forward_token(8);
         assert!(matches!(result, Err(LlamaError::InvalidConfig(_))));
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn tokenizer_uses_unigram_scores_over_longest_piece() {
+        let tokenizer = LlamaTokenizer {
+            tokens: vec![
+                "<unk>".to_owned(),
+                "▁ab".to_owned(),
+                "▁a".to_owned(),
+                "b".to_owned(),
+            ],
+            scores: vec![0.0, -10.0, -1.0, -1.0],
+            bos_token_id: None,
+            eos_token_id: None,
+            unk_token_id: Some(0),
+        };
+        assert_eq!(tokenizer.encode("ab").unwrap(), [2, 3]);
+    }
+
+    #[test]
+    fn tokenizer_consumes_utf8_with_byte_fallback_pieces() {
+        let tokenizer = LlamaTokenizer {
+            tokens: vec!["▁".to_owned(), "<0xC3>".to_owned(), "<0xA9>".to_owned()],
+            scores: vec![0.0, 0.0, 0.0],
+            bos_token_id: None,
+            eos_token_id: None,
+            unk_token_id: None,
+        };
+        assert_eq!(tokenizer.encode("é").unwrap(), [0, 1, 2]);
+        assert_eq!(tokenizer.decode(&[0, 1, 2]).unwrap(), " é");
     }
 
     #[test]
