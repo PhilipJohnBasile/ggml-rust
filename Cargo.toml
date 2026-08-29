@@ -5,6 +5,7 @@ members = [
     "crates/model",
     "crates/tensor",
     "crates/graph",
+    "crates/agent-memory",
     "crates/llama-runtime",
     "tools/gguf-inspect",
 ]
