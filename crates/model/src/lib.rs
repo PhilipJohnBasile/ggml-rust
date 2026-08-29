@@ -749,7 +749,7 @@ impl GgufModel {
 
     /// Materializes one tensor as F32 values in the checked CPU tensor engine.
     ///
-    /// F32, F16, BF16, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q8_1`,
+    /// F32, F16, BF16, I8, I16, I32, I64, F64, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`,
     /// `Q2_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_K`, `IQ1_S`,
     /// `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`,
     /// `IQ4_XS`, `MXFP4`, `NVFP4`, `TQ1_0`, and `TQ2_0` storage are supported.
@@ -1134,6 +1134,11 @@ impl GgufModel {
         if !matches!(
             descriptor.value_type.raw(),
             0 | 1
+                | 24
+                | 25
+                | 26
+                | 27
+                | 28
                 | 2
                 | 3
                 | 6
@@ -5170,6 +5175,11 @@ fn decode_values(value_type: TensorType, bytes: &[u8]) -> Result<Vec<f32>, Model
     match value_type.raw() {
         0 => decode_f32(bytes),
         1 => decode_f16(bytes),
+        24 => Ok(decode_i8(bytes)),
+        25 => decode_i16(bytes),
+        26 => decode_i32(bytes),
+        27 => decode_i64(bytes),
+        28 => decode_f64(bytes),
         30 => decode_bf16(bytes),
         2 => decode_q4_0(bytes),
         3 => decode_q4_1(bytes),
@@ -5203,6 +5213,68 @@ fn decode_values(value_type: TensorType, bytes: &[u8]) -> Result<Vec<f32>, Model
             value_type,
         }),
     }
+}
+
+fn decode_i8(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .iter()
+        .map(|value| f32::from(value.cast_signed()))
+        .collect()
+}
+
+fn decode_i16(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
+    let (chunks, remainder) = bytes.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(ModelError::Shape(
+            "I16 tensor byte length is not aligned".to_owned(),
+        ));
+    }
+    Ok(chunks
+        .iter()
+        .map(|chunk| f32::from(i16::from_le_bytes(*chunk)))
+        .collect())
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn decode_i32(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
+    let (chunks, remainder) = bytes.as_chunks::<4>();
+    if !remainder.is_empty() {
+        return Err(ModelError::Shape(
+            "I32 tensor byte length is not aligned".to_owned(),
+        ));
+    }
+    Ok(chunks
+        .iter()
+        .map(|chunk| i32::from_le_bytes(*chunk) as f32)
+        .collect())
+}
+
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn decode_i64(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
+    let (chunks, remainder) = bytes.as_chunks::<8>();
+    if !remainder.is_empty() {
+        return Err(ModelError::Shape(
+            "I64 tensor byte length is not aligned".to_owned(),
+        ));
+    }
+    Ok(chunks
+        .iter()
+        .map(|chunk| i64::from_le_bytes(*chunk) as f32)
+        .collect())
+}
+
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn decode_f64(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
+    let (chunks, remainder) = bytes.as_chunks::<8>();
+    if !remainder.is_empty() {
+        return Err(ModelError::Shape(
+            "F64 tensor byte length is not aligned".to_owned(),
+        ));
+    }
+    Ok(chunks
+        .iter()
+        .map(|chunk| f64::from_le_bytes(*chunk) as f32)
+        .collect())
 }
 
 fn decode_f32(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
@@ -8279,14 +8351,34 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_tensor_materialization() {
-        let path = write_fixture(&fixture(24, &[256], &[0; 256]));
-        let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
-        assert!(matches!(
-            model.load_f32("probe.tensor"),
-            Err(ModelError::UnsupportedTensorType { .. })
-        ));
-        fs::remove_file(path).unwrap();
+    fn materializes_integer_and_f64_tensors() {
+        let cases: &[(u32, &[u8], &[f32])] = &[
+            (24, &[0, 255, 127, 128], &[0.0, -1.0, 127.0, -128.0]),
+            (25, &[0, 0x80, 0xff, 0xff], &[f32::from(i16::MIN), -1.0]),
+            (
+                26,
+                &[0, 0, 0, 0x80, 0xff, 0xff, 0xff, 0xff],
+                &[-2_147_483_648.0, -1.0],
+            ),
+            (
+                27,
+                &[
+                    42, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255,
+                ],
+                &[42.0, -1.0],
+            ),
+            (
+                28,
+                &[0, 0, 0, 0, 0, 0, 0xf0, 0x3f, 0, 0, 0, 0, 0, 0, 0xf0, 0xbf],
+                &[1.0, -1.0],
+            ),
+        ];
+        for &(value_type, encoded, expected) in cases {
+            let path = write_fixture(&fixture(value_type, &[expected.len() as u64], encoded));
+            let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
+            assert_eq!(model.load_f32("probe.tensor").unwrap().data(), expected);
+            fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
