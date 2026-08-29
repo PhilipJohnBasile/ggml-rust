@@ -795,6 +795,10 @@ enum CpuMatrix {
 }
 
 impl CpuMatrix {
+    fn from_tensor(tensor: Tensor) -> Result<Self, LlamaError> {
+        Ok(Self::F32(transpose_ggml_matrix(tensor)?))
+    }
+
     fn from_model(model: &GgufModel, name: &str, use_quantized: bool) -> Result<Self, LlamaError> {
         let descriptor = model
             .tensor(name)
@@ -889,6 +893,9 @@ impl LlamaCpuModel {
             Err(LlamaError::MissingMetadata("tokenizer.ggml.tokens")) => None,
             Err(error) => return Err(error),
         };
+        if !use_quantized {
+            return Self::load_f32_weights(model, config, tokenizer);
+        }
         let token_embedding =
             CpuMatrix::from_model(&model.model, "token_embd.weight", use_quantized)?;
         let output = CpuMatrix::from_model(&model.model, "output.weight", use_quantized)?;
@@ -946,6 +953,90 @@ impl LlamaCpuModel {
             layers,
             tokenizer,
             use_quantized,
+        })
+    }
+
+    fn load_f32_weights(
+        model: &LlamaModel,
+        config: LlamaConfig,
+        tokenizer: Option<LlamaTokenizer>,
+    ) -> Result<Self, LlamaError> {
+        let mut names = vec![
+            "token_embd.weight".to_owned(),
+            "output.weight".to_owned(),
+            "output_norm.weight".to_owned(),
+        ];
+        for layer in 0..config.block_count {
+            let prefix = format!("blk.{layer}");
+            for suffix in [
+                "attn_norm.weight",
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_output.weight",
+                "ffn_norm.weight",
+                "ffn_gate.weight",
+                "ffn_down.weight",
+                "ffn_up.weight",
+            ] {
+                names.push(format!("{prefix}.{suffix}"));
+            }
+        }
+        let name_refs = names.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut loaded = Vec::with_capacity(names.len());
+        model.model.for_each_f32(&name_refs, |_name, tensor| {
+            loaded.push(tensor);
+            Ok::<(), LlamaError>(())
+        })?;
+        let mut loaded = loaded.into_iter();
+        let token_embedding =
+            CpuMatrix::from_tensor(next_tensor(&mut loaded, "token_embd.weight")?)?;
+        let output = CpuMatrix::from_tensor(next_tensor(&mut loaded, "output.weight")?)?;
+        let output_norm = next_tensor(&mut loaded, "output_norm.weight")?;
+        let mut layers = Vec::with_capacity(config.block_count);
+        for layer in 0..config.block_count {
+            let prefix = format!("blk.{layer}");
+            layers.push(LayerWeights {
+                attn_norm: next_tensor(&mut loaded, &format!("{prefix}.attn_norm.weight"))?,
+                attn_q: CpuMatrix::from_tensor(next_tensor(
+                    &mut loaded,
+                    &format!("{prefix}.attn_q.weight"),
+                )?)?,
+                attn_k: CpuMatrix::from_tensor(next_tensor(
+                    &mut loaded,
+                    &format!("{prefix}.attn_k.weight"),
+                )?)?,
+                attn_v: CpuMatrix::from_tensor(next_tensor(
+                    &mut loaded,
+                    &format!("{prefix}.attn_v.weight"),
+                )?)?,
+                attn_output: CpuMatrix::from_tensor(next_tensor(
+                    &mut loaded,
+                    &format!("{prefix}.attn_output.weight"),
+                )?)?,
+                ffn_norm: next_tensor(&mut loaded, &format!("{prefix}.ffn_norm.weight"))?,
+                ffn_gate: CpuMatrix::from_tensor(next_tensor(
+                    &mut loaded,
+                    &format!("{prefix}.ffn_gate.weight"),
+                )?)?,
+                ffn_down: CpuMatrix::from_tensor(next_tensor(
+                    &mut loaded,
+                    &format!("{prefix}.ffn_down.weight"),
+                )?)?,
+                ffn_up: CpuMatrix::from_tensor(next_tensor(
+                    &mut loaded,
+                    &format!("{prefix}.ffn_up.weight"),
+                )?)?,
+            });
+        }
+        Ok(Self {
+            config,
+            token_embedding,
+            output,
+            output_norm,
+            layers,
+            tokenizer,
+            use_quantized: false,
         })
     }
 
@@ -1539,6 +1630,15 @@ fn optional_f32_value(
     value
         .map(|value| as_f32(value).map_err(|value| LlamaError::InvalidMetadata { key, value }))
         .transpose()
+}
+
+fn next_tensor(
+    tensors: &mut impl Iterator<Item = Tensor>,
+    name: &str,
+) -> Result<Tensor, LlamaError> {
+    tensors
+        .next()
+        .ok_or_else(|| LlamaError::Tensor(format!("GGUF loader did not return {name}")))
 }
 
 fn transpose_ggml_matrix(tensor: Tensor) -> Result<Tensor, LlamaError> {
