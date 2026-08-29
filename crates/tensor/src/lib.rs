@@ -514,6 +514,47 @@ impl Tensor {
         checked_output(self.shape.clone(), result, "rms_norm")
     }
 
+    /// Applies weighted `RMSNorm` independently to every row along the last
+    /// dimension.
+    ///
+    /// The weight must be a rank-1 tensor whose length equals the input's
+    /// final dimension.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the weight shape or epsilon is invalid, an input
+    /// is non-finite, or an output value is non-finite.
+    #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+    pub fn rms_norm_with_weight(&self, weight: &Self, epsilon: f32) -> Result<Self, TensorError> {
+        if !epsilon.is_finite() || epsilon < 0.0 {
+            return Err(TensorError::InvalidEpsilon);
+        }
+        let width = self
+            .shape
+            .last()
+            .copied()
+            .ok_or(TensorError::ZeroDimension)?;
+        if weight.shape != [width] {
+            return Err(TensorError::ShapeMismatch {
+                left: weight.shape.clone(),
+                right: vec![width],
+            });
+        }
+        self.validate_finite()?;
+        weight.validate_finite()?;
+        let mut result = Vec::with_capacity(self.data.len());
+        for row in self.data.chunks_exact(width) {
+            let mean_square = row.iter().map(|value| value * value).sum::<f32>() / width as f32;
+            let inverse = (mean_square + epsilon).sqrt().recip();
+            result.extend(
+                row.iter()
+                    .zip(weight.data.iter())
+                    .map(|(value, scale)| value * inverse * scale),
+            );
+        }
+        checked_output(self.shape.clone(), result, "rms_norm_with_weight")
+    }
+
     /// Applies numerically stable softmax independently along the last dimension.
     ///
     /// # Errors
@@ -809,6 +850,22 @@ mod tests {
         assert!((normalized.data()[1] - 4.0 * expected_scale).abs() < 1e-6);
         assert_eq!(normalized.data()[2].to_bits(), 0.0_f32.to_bits());
         assert!((normalized.data()[3] - 5.0 * expected_scale).abs() < 1e-6);
+    }
+
+    #[test]
+    fn weighted_rms_norm_applies_a_final_dimension_vector() {
+        let tensor = Tensor::from_data([2, 2], [1.0, 2.0, 3.0, 4.0]).unwrap();
+        let weight = Tensor::from_data([2], [2.0, 3.0]).unwrap();
+        let normalized = tensor.rms_norm_with_weight(&weight, 0.0).unwrap();
+        let expected = [
+            2.0 / 2.5_f32.sqrt(),
+            6.0 / 2.5_f32.sqrt(),
+            6.0 / 12.5_f32.sqrt(),
+            12.0 / 12.5_f32.sqrt(),
+        ];
+        for (actual, expected) in normalized.data().iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
     }
 
     #[test]
