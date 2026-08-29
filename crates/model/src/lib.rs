@@ -54,6 +54,38 @@ pub struct QuantizedMatrix {
     bytes: Vec<u8>,
 }
 
+/// An owned tensor retaining its original GGUF bytes and storage type.
+///
+/// Raw tensors are used by device backends that can consume compact F16,
+/// BF16, or quantized encodings directly without first widening them to the
+/// checked CPU F32 representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawTensor {
+    shape: Vec<usize>,
+    value_type: TensorType,
+    bytes: Vec<u8>,
+}
+
+impl RawTensor {
+    /// Returns the logical tensor shape in GGUF order.
+    #[must_use]
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    /// Returns the original GGUF storage type.
+    #[must_use]
+    pub const fn value_type(&self) -> TensorType {
+        self.value_type
+    }
+
+    /// Returns the owned encoded tensor bytes.
+    #[must_use]
+    pub fn encoded_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 /// Tensor data selected by [`GgufModel::for_each_tensor`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoadedTensor {
@@ -773,6 +805,39 @@ impl GgufModel {
         matrices
             .pop()
             .ok_or_else(|| ModelError::TensorNotFound(name.to_owned()))
+    }
+
+    /// Loads one tensor's original encoded bytes without widening its values.
+    ///
+    /// The byte range is copied into an owned buffer after the model digest is
+    /// checked. This is the backend boundary for device-native F16, BF16, and
+    /// quantized kernels that consume GGUF storage directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tensor is missing, the model bytes changed,
+    /// or the indexed tensor range is invalid.
+    pub fn load_raw(&self, name: &str) -> Result<RawTensor, ModelError> {
+        let descriptor = self
+            .tensor(name)
+            .ok_or_else(|| ModelError::TensorNotFound(name.to_owned()))?;
+        self.with_validated_bytes(|bytes| {
+            let start = usize::try_from(descriptor.byte_offset)
+                .map_err(|_| ModelError::Shape("tensor offset exceeds usize".to_owned()))?;
+            let length = usize::try_from(descriptor.byte_len)
+                .map_err(|_| ModelError::Shape("tensor byte length exceeds usize".to_owned()))?;
+            let end = start
+                .checked_add(length)
+                .ok_or_else(|| ModelError::Shape("tensor range overflows usize".to_owned()))?;
+            let encoded = bytes
+                .get(start..end)
+                .ok_or_else(|| ModelError::Parse("tensor range is outside the file".to_owned()))?;
+            Ok(RawTensor {
+                shape: descriptor.shape.clone(),
+                value_type: descriptor.value_type,
+                bytes: encoded.to_vec(),
+            })
+        })
     }
 
     /// Loads several rank-2 quantized GGUF matrices through one validated
@@ -7503,6 +7568,18 @@ mod tests {
         assert_eq!(batched.len(), 2);
         assert_eq!(batched[0].data(), &values);
         assert_eq!(batched[1].data(), &values);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn loads_raw_f16_tensor_without_widening_or_reordering() {
+        let encoded = [0x00_u8, 0x3c, 0x00, 0xc0, 0x00, 0x40, 0x00, 0x44];
+        let path = write_fixture(&f32_fixture(1, &encoded));
+        let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
+        let raw = model.load_raw("probe.tensor").unwrap();
+        assert_eq!(raw.shape(), &[2, 2]);
+        assert_eq!(raw.value_type().raw(), 1);
+        assert_eq!(raw.encoded_bytes(), encoded);
         fs::remove_file(path).unwrap();
     }
 
