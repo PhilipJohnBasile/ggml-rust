@@ -1078,6 +1078,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_precision_loss)]
     fn permutes_arbitrary_rank_data() {
         let tensor = Tensor::from_data(
             [2, 3, 2],
@@ -1181,7 +1182,7 @@ mod tests {
         assert!((positive.exp().unwrap().data()[0] - 0.5_f32.exp()).abs() < 1.0e-6);
         assert!((positive.log().unwrap().data()[1] - 0.0).abs() < 1.0e-6);
         assert!((tensor.tanh().unwrap().data()[1] - 0.5_f32.tanh()).abs() < 1.0e-6);
-        assert!((positive.sigmoid().unwrap().data()[0] - 0.62245935).abs() < 1.0e-6);
+        assert!((positive.sigmoid().unwrap().data()[0] - 0.622_459_35).abs() < 1.0e-6);
     }
 
     #[test]

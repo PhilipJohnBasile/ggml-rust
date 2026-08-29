@@ -759,6 +759,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_precision_loss)]
     fn evaluates_arbitrary_permutation_graph() {
         let mut graph = Graph::new();
         let input = graph.input([2, 3, 2]).unwrap();
