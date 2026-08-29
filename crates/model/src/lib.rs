@@ -1159,6 +1159,7 @@ fn validate_affine_quantization(group_size: usize, bits: usize) -> Result<(), Mo
 
 fn affine_quantized_candidate(descriptor: &TensorDescriptor, group_size: usize) -> bool {
     descriptor.shape.len() == 2
+        && matches!(descriptor.value_type.raw(), 2 | 3 | 6 | 7 | 8)
         && quantized_block_layout(descriptor.value_type).is_some()
         && descriptor.shape[0].is_multiple_of(group_size)
 }
