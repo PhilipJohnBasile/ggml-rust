@@ -1475,7 +1475,11 @@ impl<'a> LlamaSession<'a> {
         sampling: LlamaSamplingConfig,
     ) -> Result<Vec<usize>, LlamaError> {
         let mut sampler = LlamaSampler::new(sampling);
-        let mut logits = if let Some(logits) = self.decode(prompt_ids)?.pop() {
+        let mut logits = None;
+        for &token_id in prompt_ids {
+            logits = Some(self.forward_token(token_id)?);
+        }
+        let mut logits = if let Some(logits) = logits {
             logits
         } else if let Some(bos) = self
             .model
