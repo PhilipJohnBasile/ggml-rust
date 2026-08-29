@@ -53,6 +53,10 @@ pub enum TensorError {
     InvalidScale,
     InvalidClamp,
     InvalidSlice(&'static str),
+    InvalidAxis {
+        axis: usize,
+        rank: usize,
+    },
     IndexOutOfBounds {
         index: usize,
         upper_bound: usize,
@@ -112,6 +116,9 @@ impl fmt::Display for TensorError {
             Self::InvalidScale => formatter.write_str("attention scale must be finite"),
             Self::InvalidClamp => formatter.write_str("clamp bounds must be finite and ordered"),
             Self::InvalidSlice(reason) => write!(formatter, "invalid slice: {reason}"),
+            Self::InvalidAxis { axis, rank } => {
+                write!(formatter, "axis {axis} is outside tensor rank {rank}")
+            }
             Self::IndexOutOfBounds { index, upper_bound } => write!(
                 formatter,
                 "row index {index} is outside the table range 0..{upper_bound}"
@@ -1173,19 +1180,12 @@ impl Tensor {
     /// Returns an error when the tensor is scalar or an output value is
     /// non-finite.
     pub fn sum_last_dim(&self) -> Result<Self, TensorError> {
-        let width = *self.shape.last().ok_or(TensorError::ZeroDimension)?;
-        let rows = self.data.len() / width;
-        let result = self
-            .data
-            .chunks_exact(width)
-            .map(|row| row.iter().sum::<f32>())
-            .collect::<Vec<_>>();
-        let mut shape = self.shape[..self.shape.len() - 1].to_vec();
-        if shape.is_empty() {
-            shape.push(1);
-        }
-        debug_assert_eq!(rows, result.len());
-        checked_output(shape, result, "sum")
+        let axis = self
+            .shape
+            .len()
+            .checked_sub(1)
+            .ok_or(TensorError::ZeroDimension)?;
+        self.reduce_axis(axis, false, false)
     }
 
     /// Computes the arithmetic mean independently along the final dimension.
@@ -1196,20 +1196,99 @@ impl Tensor {
     /// non-finite.
     #[allow(clippy::cast_precision_loss)]
     pub fn mean_last_dim(&self) -> Result<Self, TensorError> {
-        let width = *self.shape.last().ok_or(TensorError::ZeroDimension)?;
-        let rows = self.data.len() / width;
-        let divisor = width as f32;
-        let result = self
-            .data
-            .chunks_exact(width)
-            .map(|row| row.iter().sum::<f32>() / divisor)
-            .collect::<Vec<_>>();
-        let mut shape = self.shape[..self.shape.len() - 1].to_vec();
-        if shape.is_empty() {
-            shape.push(1);
+        let axis = self
+            .shape
+            .len()
+            .checked_sub(1)
+            .ok_or(TensorError::ZeroDimension)?;
+        self.reduce_axis(axis, false, true)
+    }
+
+    /// Sums values along one axis.
+    ///
+    /// When `keepdims` is true the reduced axis remains as a singleton
+    /// dimension. A rank-1 reduction without `keepdims` uses `[1]` because
+    /// this checked tensor representation does not permit scalar shapes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tensor is scalar, the axis is invalid, or an
+    /// output value is non-finite.
+    pub fn sum(&self, axis: usize, keepdims: bool) -> Result<Self, TensorError> {
+        self.reduce_axis(axis, keepdims, false)
+    }
+
+    /// Computes the arithmetic mean along one axis.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tensor is scalar, the axis is invalid, or an
+    /// output value is non-finite.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn mean(&self, axis: usize, keepdims: bool) -> Result<Self, TensorError> {
+        self.reduce_axis(axis, keepdims, true)
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn reduce_axis(&self, axis: usize, keepdims: bool, mean: bool) -> Result<Self, TensorError> {
+        let rank = self.shape.len();
+        if rank == 0 {
+            return Err(TensorError::ZeroDimension);
         }
-        debug_assert_eq!(rows, result.len());
-        checked_output(shape, result, "mean")
+        if axis >= rank {
+            return Err(TensorError::InvalidAxis { axis, rank });
+        }
+        let width = self.shape[axis];
+        let mut output_shape = self.shape.clone();
+        if keepdims {
+            output_shape[axis] = 1;
+        } else {
+            output_shape.remove(axis);
+            if output_shape.is_empty() {
+                output_shape.push(1);
+            }
+        }
+        let output_len = element_count(&output_shape)?;
+        let mut result = Vec::with_capacity(output_len);
+        let mut output_coordinates = vec![0_usize; output_shape.len()];
+        for _ in 0..output_len {
+            let mut total = 0.0_f32;
+            for reduced_coordinate in 0..width {
+                let mut source_coordinates = vec![0_usize; rank];
+                if keepdims {
+                    for (source_axis, coordinate) in source_coordinates.iter_mut().enumerate() {
+                        *coordinate = if source_axis == axis {
+                            reduced_coordinate
+                        } else {
+                            output_coordinates[source_axis]
+                        };
+                    }
+                } else {
+                    let mut output_axis = 0;
+                    for (source_axis, coordinate) in source_coordinates.iter_mut().enumerate() {
+                        *coordinate = if source_axis == axis {
+                            reduced_coordinate
+                        } else {
+                            let coordinate = if output_shape.len() == 1 && rank == 1 {
+                                0
+                            } else {
+                                output_coordinates[output_axis]
+                            };
+                            output_axis += 1;
+                            coordinate
+                        };
+                    }
+                }
+                let mut source_index = 0_usize;
+                for (source_axis, &dimension) in self.shape.iter().enumerate() {
+                    source_index = source_index * dimension + source_coordinates[source_axis];
+                }
+                total += self.data[source_index];
+            }
+            result.push(if mean { total / width as f32 } else { total });
+            increment_index(&mut output_coordinates, &output_shape);
+        }
+        checked_output(output_shape, result, if mean { "mean" } else { "sum" })
     }
 
     /// Computes scaled dot-product attention for rank-4 tensors.

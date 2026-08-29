@@ -116,6 +116,14 @@ enum Operation {
     Sigmoid,
     SumLastDim,
     MeanLastDim,
+    Sum {
+        axis: usize,
+        keepdims: bool,
+    },
+    Mean {
+        axis: usize,
+        keepdims: bool,
+    },
     Clamp {
         minimum: f32,
         maximum: f32,
@@ -554,6 +562,38 @@ impl Graph {
         self.unary(Operation::MeanLastDim, input)
     }
 
+    /// Adds an axis-specific sum reduction node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid. Axis validation is
+    /// completed during evaluation against the concrete tensor rank.
+    pub fn sum(
+        &mut self,
+        input: ValueId,
+        axis: usize,
+        keepdims: bool,
+    ) -> Result<ValueId, GraphError> {
+        self.require(input)?;
+        Ok(self.push(Operation::Sum { axis, keepdims }, vec![input]))
+    }
+
+    /// Adds an axis-specific mean reduction node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid. Axis validation is
+    /// completed during evaluation against the concrete tensor rank.
+    pub fn mean(
+        &mut self,
+        input: ValueId,
+        axis: usize,
+        keepdims: bool,
+    ) -> Result<ValueId, GraphError> {
+        self.require(input)?;
+        Ok(self.push(Operation::Mean { axis, keepdims }, vec![input]))
+    }
+
     /// Adds an interleaved rotary position embedding node.
     ///
     /// The input must evaluate to `[heads, head_dim]`; only the leading
@@ -740,6 +780,12 @@ impl Graph {
                     }
                     Operation::SumLastDim => values[self.input_index(node, 0)?].sum_last_dim()?,
                     Operation::MeanLastDim => values[self.input_index(node, 0)?].mean_last_dim()?,
+                    Operation::Sum { axis, keepdims } => {
+                        values[self.input_index(node, 0)?].sum(*axis, *keepdims)?
+                    }
+                    Operation::Mean { axis, keepdims } => {
+                        values[self.input_index(node, 0)?].mean(*axis, *keepdims)?
+                    }
                     Operation::Rotary {
                         rotary_dimension,
                         position,
@@ -1022,6 +1068,24 @@ mod tests {
         assert!(result[0].data()[2].abs() < 1.0e-6);
         assert!(result[1].data()[1].abs() < 1.0e-6);
         assert!((result[1].data()[2] + 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn evaluates_axis_reductions_with_and_without_keepdims() {
+        let mut graph = Graph::new();
+        let input = graph.input([2, 3]).unwrap();
+        let sums = graph.sum(input, 0, false).unwrap();
+        let means = graph.mean(input, 1, true).unwrap();
+        let result = graph
+            .evaluate(
+                &[Tensor::from_data([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()],
+                &[sums, means],
+            )
+            .unwrap();
+        assert_eq!(result[0].shape(), &[3]);
+        assert_eq!(result[0].data(), &[5.0, 7.0, 9.0]);
+        assert_eq!(result[1].shape(), &[2, 1]);
+        assert_eq!(result[1].data(), &[2.0, 5.0]);
     }
 
     #[test]
