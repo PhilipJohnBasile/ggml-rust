@@ -65,7 +65,10 @@ impl From<TensorError> for GraphError {
 
 #[derive(Debug, Clone)]
 enum Operation {
-    Input { index: usize, shape: Vec<usize> },
+    Input {
+        index: usize,
+        shape: Vec<usize>,
+    },
     Constant(Tensor),
     Add,
     Multiply,
@@ -73,10 +76,20 @@ enum Operation {
     Reshape(Vec<usize>),
     Transpose2d,
     Broadcast(Vec<usize>),
-    RmsNorm { epsilon: f32 },
+    RmsNorm {
+        epsilon: f32,
+    },
     Silu,
     SoftmaxLastDim,
-    Attention { scale: f32, causal: bool },
+    Rotary {
+        rotary_dimension: usize,
+        position: f32,
+        frequency_base: f32,
+    },
+    Attention {
+        scale: f32,
+        causal: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +230,32 @@ impl Graph {
         self.unary(Operation::SoftmaxLastDim, input)
     }
 
+    /// Adds an interleaved rotary position embedding node.
+    ///
+    /// The input must evaluate to `[heads, head_dim]`; only the leading
+    /// `rotary_dimension` values are rotated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid.
+    pub fn rotary_embedding(
+        &mut self,
+        input: ValueId,
+        rotary_dimension: usize,
+        position: f32,
+        frequency_base: f32,
+    ) -> Result<ValueId, GraphError> {
+        self.require(input)?;
+        Ok(self.push(
+            Operation::Rotary {
+                rotary_dimension,
+                position,
+                frequency_base,
+            },
+            vec![input],
+        ))
+    }
+
     /// Adds a rank-4 grouped-query scaled dot-product attention node.
     ///
     /// # Errors
@@ -301,6 +340,15 @@ impl Graph {
                     Operation::SoftmaxLastDim => {
                         values[self.input_index(node, 0)?].softmax_last_dim()?
                     }
+                    Operation::Rotary {
+                        rotary_dimension,
+                        position,
+                        frequency_base,
+                    } => values[self.input_index(node, 0)?].rotary_embedding(
+                        *rotary_dimension,
+                        *position,
+                        *frequency_base,
+                    )?,
                     Operation::Attention { scale, causal } => values[self.input_index(node, 0)?]
                         .scaled_dot_product_attention(
                             &values[self.input_index(node, 1)?],
@@ -419,6 +467,23 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result[0].data(), &[2.0, 3.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn evaluates_rotary_embedding_graph() {
+        let mut graph = Graph::new();
+        let input = graph.input([2, 2]).unwrap();
+        let rotated = graph.rotary_embedding(input, 2, 1.0, 10_000.0).unwrap();
+        let result = graph
+            .evaluate(
+                &[Tensor::from_data([2, 2], [1.0, 0.0, 0.0, 1.0]).unwrap()],
+                &[rotated],
+            )
+            .unwrap();
+        assert!((result[0].data()[0] - 0.540_302_3).abs() < 1.0e-5);
+        assert!((result[0].data()[1] - 0.841_470_96).abs() < 1.0e-5);
+        assert!((result[0].data()[2] + 0.841_470_96).abs() < 1.0e-5);
+        assert!((result[0].data()[3] - 0.540_302_3).abs() < 1.0e-5);
     }
 
     #[test]

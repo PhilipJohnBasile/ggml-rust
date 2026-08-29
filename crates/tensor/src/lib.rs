@@ -47,6 +47,11 @@ pub enum TensorError {
     ZeroDimension,
     InvalidEpsilon,
     InvalidScale,
+    RotaryShapeMismatch {
+        shape: Vec<usize>,
+    },
+    InvalidFrequencyBase,
+    InvalidPosition,
     NonFiniteInput {
         index: usize,
     },
@@ -89,6 +94,14 @@ impl fmt::Display for TensorError {
                 formatter.write_str("RMSNorm epsilon must be finite and nonnegative")
             }
             Self::InvalidScale => formatter.write_str("attention scale must be finite"),
+            Self::RotaryShapeMismatch { shape } => write!(
+                formatter,
+                "rotary embedding requires a rank-2 head tensor, got {shape:?}"
+            ),
+            Self::InvalidFrequencyBase => {
+                formatter.write_str("rotary frequency base must be finite and positive")
+            }
+            Self::InvalidPosition => formatter.write_str("rotary position must be finite"),
             Self::NonFiniteInput { index } => {
                 write!(formatter, "tensor input at index {index} is not finite")
             }
@@ -415,6 +428,65 @@ impl Tensor {
             .map(|value| *value / (1.0 + (-value).exp()))
             .collect::<Vec<_>>();
         checked_output(self.shape.clone(), result, "silu")
+    }
+
+    /// Applies interleaved rotary position embedding to `[heads, head_dim]`.
+    ///
+    /// Only the first `rotary_dimension` values of each head are rotated.
+    /// Values after that prefix are copied unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tensor rank, dimensions, position, or
+    /// frequency base are invalid, or an output value is non-finite.
+    #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+    pub fn rotary_embedding(
+        &self,
+        rotary_dimension: usize,
+        position: f32,
+        frequency_base: f32,
+    ) -> Result<Self, TensorError> {
+        if self.shape.len() != 2 {
+            return Err(TensorError::RotaryShapeMismatch {
+                shape: self.shape.clone(),
+            });
+        }
+        let heads = self.shape[0];
+        let head_dim = self.shape[1];
+        if head_dim == 0
+            || !head_dim.is_multiple_of(2)
+            || rotary_dimension == 0
+            || rotary_dimension > head_dim
+            || !rotary_dimension.is_multiple_of(2)
+        {
+            return Err(TensorError::RotaryShapeMismatch {
+                shape: self.shape.clone(),
+            });
+        }
+        if !position.is_finite() {
+            return Err(TensorError::InvalidPosition);
+        }
+        if !frequency_base.is_finite() || frequency_base <= 0.0 {
+            return Err(TensorError::InvalidFrequencyBase);
+        }
+        self.validate_finite()?;
+        let mut result = self.data.clone();
+        #[allow(clippy::cast_precision_loss)]
+        let head_dim_f32 = head_dim as f32;
+        for head in 0..heads {
+            let start = head * head_dim;
+            for pair in 0..rotary_dimension / 2 {
+                #[allow(clippy::cast_precision_loss)]
+                let exponent = -2.0 * pair as f32 / head_dim_f32;
+                let angle = position * frequency_base.powf(exponent);
+                let (sine, cosine) = angle.sin_cos();
+                let first = self.data[start + pair * 2];
+                let second = self.data[start + pair * 2 + 1];
+                result[start + pair * 2] = first * cosine - second * sine;
+                result[start + pair * 2 + 1] = first * sine + second * cosine;
+            }
+        }
+        checked_output(self.shape.clone(), result, "rotary_embedding")
     }
 
     /// Applies `RMSNorm` independently to every row along the last dimension.
