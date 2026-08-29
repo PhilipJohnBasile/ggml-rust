@@ -495,40 +495,43 @@ impl Tensor {
         Ok(())
     }
 
-    /// Adds two tensors with identical shapes.
+    /// Adds two tensors with right-aligned singleton broadcasting.
     ///
     /// # Errors
     ///
     /// Returns an error when shapes differ or an output value is non-finite.
     pub fn add(&self, rhs: &Self) -> Result<Self, TensorError> {
-        self.binary_op(rhs, "add", |left, right| left + right)
+        self.binary_broadcast(rhs, "add", |left, right| left + right)
     }
 
-    /// Multiplies two tensors element by element.
+    /// Multiplies two tensors element by element with right-aligned
+    /// singleton broadcasting.
     ///
     /// # Errors
     ///
     /// Returns an error when shapes differ or an output value is non-finite.
     pub fn mul(&self, rhs: &Self) -> Result<Self, TensorError> {
-        self.binary_op(rhs, "mul", |left, right| left * right)
+        self.binary_broadcast(rhs, "mul", |left, right| left * right)
     }
 
-    /// Subtracts two tensors element by element.
+    /// Subtracts two tensors element by element with right-aligned singleton
+    /// broadcasting.
     ///
     /// # Errors
     ///
     /// Returns an error when shapes differ or an output value is non-finite.
     pub fn sub(&self, rhs: &Self) -> Result<Self, TensorError> {
-        self.binary_op(rhs, "sub", |left, right| left - right)
+        self.binary_broadcast(rhs, "sub", |left, right| left - right)
     }
 
-    /// Divides two tensors element by element.
+    /// Divides two tensors element by element with right-aligned singleton
+    /// broadcasting.
     ///
     /// # Errors
     ///
     /// Returns an error when shapes differ or an output value is non-finite.
     pub fn div(&self, rhs: &Self) -> Result<Self, TensorError> {
-        self.binary_op(rhs, "div", |left, right| left / right)
+        self.binary_broadcast(rhs, "div", |left, right| left / right)
     }
 
     /// Multiplies every value by one scalar.
@@ -1038,7 +1041,7 @@ impl Tensor {
         checked_output(output_shape, result, "scaled_dot_product_attention")
     }
 
-    fn binary_op<F>(
+    fn binary_broadcast<F>(
         &self,
         rhs: &Self,
         operation: &'static str,
@@ -1047,19 +1050,55 @@ impl Tensor {
     where
         F: Fn(f32, f32) -> f32,
     {
-        if self.shape != rhs.shape {
-            return Err(TensorError::ShapeMismatch {
-                left: self.shape.clone(),
-                right: rhs.shape.clone(),
-            });
+        let rank = self.rank().max(rhs.rank());
+        let left_offset = rank - self.rank();
+        let right_offset = rank - rhs.rank();
+        let mut output_shape = Vec::with_capacity(rank);
+        for axis in 0..rank {
+            let left_dimension = if axis < left_offset {
+                1
+            } else {
+                self.shape[axis - left_offset]
+            };
+            let right_dimension = if axis < right_offset {
+                1
+            } else {
+                rhs.shape[axis - right_offset]
+            };
+            if left_dimension != right_dimension && left_dimension != 1 && right_dimension != 1 {
+                return Err(TensorError::ShapeMismatch {
+                    left: self.shape.clone(),
+                    right: rhs.shape.clone(),
+                });
+            }
+            output_shape.push(left_dimension.max(right_dimension));
         }
-        let result = self
-            .data
-            .iter()
-            .zip(&rhs.data)
-            .map(|(left, right)| function(*left, *right))
-            .collect::<Vec<_>>();
-        checked_output(self.shape.clone(), result, operation)
+        let output_len = element_count(&output_shape)?;
+        let mut result = Vec::with_capacity(output_len);
+        let mut coordinates = vec![0_usize; rank];
+        for _ in 0..output_len {
+            let mut left_index = 0_usize;
+            for (axis, &dimension) in self.shape.iter().enumerate() {
+                let coordinate = if dimension == 1 {
+                    0
+                } else {
+                    coordinates[left_offset + axis]
+                };
+                left_index = left_index * dimension + coordinate;
+            }
+            let mut right_index = 0_usize;
+            for (axis, &dimension) in rhs.shape.iter().enumerate() {
+                let coordinate = if dimension == 1 {
+                    0
+                } else {
+                    coordinates[right_offset + axis]
+                };
+                right_index = right_index * dimension + coordinate;
+            }
+            result.push(function(self.data[left_index], rhs.data[right_index]));
+            increment_index(&mut coordinates, &output_shape);
+        }
+        checked_output(output_shape, result, operation)
     }
 
     fn unary_op<F>(&self, operation: &'static str, function: F) -> Result<Self, TensorError>
@@ -1220,24 +1259,24 @@ mod tests {
     }
 
     #[test]
-    fn elementwise_ops_require_identical_shapes() {
-        let left = Tensor::from_data([2], [1.0, 2.0]).unwrap();
-        let right = Tensor::from_data([1, 2], [3.0, 4.0]).unwrap();
+    fn elementwise_ops_broadcast_compatible_shapes() {
+        let left = Tensor::from_data([2, 1], [1.0, 2.0]).unwrap();
+        let right = Tensor::from_data([3, 2], [3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
         assert!(matches!(
             left.add(&right),
             Err(TensorError::ShapeMismatch { .. })
         ));
+        let broadcast = left.add(&Tensor::from_data([1, 2], [3.0, 4.0]).unwrap());
+        assert_eq!(broadcast.unwrap().data(), &[4.0, 5.0, 5.0, 6.0]);
+        assert_eq!(left.add(&Tensor::scalar(2.0)).unwrap().data(), &[3.0, 4.0]);
     }
 
     #[test]
     fn extended_elementwise_ops_match_scalar_math() {
         let tensor = Tensor::from_data([4], [-2.0, 0.5, 1.0, 4.0]).unwrap();
         assert_eq!(
-            tensor.sub(&Tensor::scalar(1.0)),
-            Err(TensorError::ShapeMismatch {
-                left: vec![4],
-                right: vec![],
-            })
+            tensor.sub(&Tensor::scalar(1.0)).unwrap().data(),
+            &[-3.0, -0.5, 0.0, 3.0]
         );
         let rhs = Tensor::from_data([4], [1.0, 0.5, 2.0, 2.0]).unwrap();
         assert_eq!(tensor.sub(&rhs).unwrap().data(), &[-3.0, 0.0, -1.0, 2.0]);
