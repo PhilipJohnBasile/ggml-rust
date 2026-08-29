@@ -162,8 +162,42 @@ impl QuantizedMatrix {
                 "quantized matmul input contains a non-finite value".to_owned(),
             ));
         }
-        let mut output = Vec::with_capacity(self.columns);
-        for column in 0..self.columns {
+        let worker_count = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .min(16)
+            .min(self.columns);
+        if worker_count <= 1 || self.columns < 2 {
+            return self.matmul_columns(input, 0, self.columns);
+        }
+        let chunk_width = self.columns.div_ceil(worker_count);
+        let mut output = vec![0.0_f32; self.columns];
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(worker_count);
+            for start in (0..self.columns).step_by(chunk_width) {
+                let end = (start + chunk_width).min(self.columns);
+                handles.push(scope.spawn(move || {
+                    self.matmul_columns(input, start, end)
+                        .map(|values| (start, values))
+                }));
+            }
+            for handle in handles {
+                let (start, values) = handle.join().map_err(|_| {
+                    ModelError::Shape("quantized matmul worker panicked".to_owned())
+                })??;
+                output[start..start + values.len()].copy_from_slice(&values);
+            }
+            Ok(output)
+        })
+    }
+
+    fn matmul_columns(
+        &self,
+        input: &[f32],
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<f32>, ModelError> {
+        let mut output = Vec::with_capacity(end.saturating_sub(start));
+        for column in start..end {
             let weights = self.decode_column(column)?;
             let mut sum = 0.0_f32;
             for (&value, &weight) in input.iter().zip(&weights) {
