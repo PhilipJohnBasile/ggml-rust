@@ -81,65 +81,39 @@ struct LlamaMetadataKeys {
 }
 
 fn metadata_keys(architecture: &str) -> Option<LlamaMetadataKeys> {
-    let prefix = match architecture {
-        "llama" => "llama",
-        "mistral" => "mistral",
-        _ => return None,
-    };
-    Some(LlamaMetadataKeys {
-        context_length: match prefix {
-            "llama" => "llama.context_length",
-            _ => "mistral.context_length",
-        },
-        embedding_length: match prefix {
-            "llama" => "llama.embedding_length",
-            _ => "mistral.embedding_length",
-        },
-        block_count: match prefix {
-            "llama" => "llama.block_count",
-            _ => "mistral.block_count",
-        },
-        head_count: match prefix {
-            "llama" => "llama.attention.head_count",
-            _ => "mistral.attention.head_count",
-        },
-        head_count_kv: match prefix {
-            "llama" => "llama.attention.head_count_kv",
-            _ => "mistral.attention.head_count_kv",
-        },
-        feed_forward_length: match prefix {
-            "llama" => "llama.feed_forward_length",
-            _ => "mistral.feed_forward_length",
-        },
-        vocab_size: match prefix {
-            "llama" => "llama.vocab_size",
-            _ => "mistral.vocab_size",
-        },
-        rms_norm_epsilon: match prefix {
-            "llama" => "llama.attention.layer_norm_rms_epsilon",
-            _ => "mistral.attention.layer_norm_rms_epsilon",
-        },
-        rope_freq_base: match prefix {
-            "llama" => "llama.rope.freq_base",
-            _ => "mistral.rope.freq_base",
-        },
-        rope_dimension_count: match prefix {
-            "llama" => "llama.rope.dimension_count",
-            _ => "mistral.rope.dimension_count",
-        },
-        rope_scaling_type: match prefix {
-            "llama" => "llama.rope.scaling.type",
-            _ => "mistral.rope.scaling.type",
-        },
-        rope_scaling_factor: match prefix {
-            "llama" => "llama.rope.scaling.factor",
-            _ => "mistral.rope.scaling.factor",
-        },
-        attention_window: match prefix {
-            "llama" => "llama.attention.sliding_window",
-            _ => "mistral.attention.sliding_window",
-        },
-    })
+    match architecture {
+        "llama" => Some(LlamaMetadataKeys {
+            context_length: "llama.context_length",
+            embedding_length: "llama.embedding_length",
+            block_count: "llama.block_count",
+            head_count: "llama.attention.head_count",
+            head_count_kv: "llama.attention.head_count_kv",
+            feed_forward_length: "llama.feed_forward_length",
+            vocab_size: "llama.vocab_size",
+            rms_norm_epsilon: "llama.attention.layer_norm_rms_epsilon",
+            rope_freq_base: "llama.rope.freq_base",
+            rope_dimension_count: "llama.rope.dimension_count",
+            rope_scaling_type: "llama.rope.scaling.type",
+            rope_scaling_factor: "llama.rope.scaling.factor",
+            attention_window: "llama.attention.sliding_window",
+        }),
+        "qwen2" => Some(LlamaMetadataKeys {
+            context_length: "qwen2.context_length",
+            embedding_length: "qwen2.embedding_length",
+            block_count: "qwen2.block_count",
+            head_count: "qwen2.attention.head_count",
+            head_count_kv: "qwen2.attention.head_count_kv",
+            feed_forward_length: "qwen2.feed_forward_length",
+            vocab_size: "qwen2.vocab_size",
+            rms_norm_epsilon: "qwen2.attention.layer_norm_rms_epsilon",
+            rope_freq_base: "qwen2.rope.freq_base",
+            rope_dimension_count: "qwen2.rope.dimension_count",
+            rope_scaling_type: "qwen2.rope.scaling.type",
+            rope_scaling_factor: "qwen2.rope.scaling.factor",
+            attention_window: "qwen2.attention.sliding_window",
+        }),
+        _ => None,
+    }
 }
 
 impl LlamaConfig {
@@ -780,7 +754,13 @@ impl LlamaModel {
 
 const MAX_TOKENIZER_ELEMENTS: u64 = 16 * 1024 * 1024;
 
-/// A bounded GGUF tokenizer vocabulary with SentencePiece-style pieces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenizerKind {
+    SentencePiece,
+    Gpt2Bpe,
+}
+
+/// A bounded GGUF tokenizer vocabulary with `SentencePiece` and GPT-2 BPE modes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LlamaTokenizer {
     tokens: Vec<String>,
@@ -788,6 +768,9 @@ pub struct LlamaTokenizer {
     bos_token_id: Option<usize>,
     eos_token_id: Option<usize>,
     unk_token_id: Option<usize>,
+    kind: TokenizerKind,
+    token_ids: HashMap<String, usize>,
+    merge_ranks: HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -800,6 +783,7 @@ struct EncodingPath {
 }
 
 impl LlamaTokenizer {
+    #[allow(clippy::too_many_lines)]
     fn from_model(model: &GgufModel, vocab_size: usize) -> Result<Self, LlamaError> {
         let tokens = model
             .metadata_string_array("tokenizer.ggml.tokens", MAX_TOKENIZER_ELEMENTS)?
@@ -855,12 +839,58 @@ impl LlamaTokenizer {
                 });
             }
         }
+        let kind = match model.metadata_scalar("tokenizer.ggml.model")? {
+            None => TokenizerKind::SentencePiece,
+            Some(MetadataScalar::String(value)) if value == "gpt2" => TokenizerKind::Gpt2Bpe,
+            Some(MetadataScalar::String(value)) if value == "llama" || value == "sentencepiece" => {
+                TokenizerKind::SentencePiece
+            }
+            Some(value) => {
+                return Err(LlamaError::InvalidMetadata {
+                    key: "tokenizer.ggml.model",
+                    value: format!("unsupported tokenizer model {value:?}"),
+                });
+            }
+        };
+        let token_ids = if kind == TokenizerKind::Gpt2Bpe {
+            tokens
+                .iter()
+                .enumerate()
+                .map(|(id, token)| (token.clone(), id))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        let merge_ranks = if kind == TokenizerKind::Gpt2Bpe {
+            let merges = model
+                .metadata_string_array("tokenizer.ggml.merges", MAX_TOKENIZER_ELEMENTS)?
+                .ok_or(LlamaError::MissingMetadata("tokenizer.ggml.merges"))?;
+            let mut ranks = HashMap::with_capacity(merges.len());
+            for (rank, merge) in merges.into_iter().enumerate() {
+                let mut pieces = merge.splitn(2, ' ');
+                let left = pieces.next().unwrap_or_default();
+                let right = pieces.next().unwrap_or_default();
+                if left.is_empty() || right.is_empty() {
+                    return Err(LlamaError::InvalidMetadata {
+                        key: "tokenizer.ggml.merges",
+                        value: format!("merge {rank} is not a pair"),
+                    });
+                }
+                ranks.insert(bpe_pair_key(left, right), rank);
+            }
+            ranks
+        } else {
+            HashMap::new()
+        };
         Ok(Self {
             tokens,
             scores,
             bos_token_id,
             eos_token_id,
             unk_token_id,
+            kind,
+            token_ids,
+            merge_ranks,
         })
     }
 
@@ -893,6 +923,9 @@ impl LlamaTokenizer {
     ///
     /// Returns an error when the text cannot be represented by this vocabulary.
     pub fn encode(&self, text: &str) -> Result<Vec<usize>, LlamaError> {
+        if self.kind == TokenizerKind::Gpt2Bpe {
+            return self.encode_gpt2_bpe(text);
+        }
         let normalized = normalize_sentencepiece(text);
         if normalized.is_empty() {
             return Ok(Vec::new());
@@ -929,6 +962,58 @@ impl LlamaTokenizer {
         }
         token_ids.reverse();
         Ok(token_ids)
+    }
+
+    fn encode_gpt2_bpe(&self, text: &str) -> Result<Vec<usize>, LlamaError> {
+        let encoder = byte_encoder_table();
+        let mut token_ids = Vec::new();
+        for chunk in gpt2_pretokenize(text) {
+            let symbols = chunk
+                .as_bytes()
+                .iter()
+                .map(|byte| encoder[usize::from(*byte)].to_string())
+                .collect::<Vec<_>>();
+            let symbols = self.merge_bpe_symbols(symbols);
+            for symbol in symbols {
+                if let Some(&token_id) = self.token_ids.get(&symbol) {
+                    token_ids.push(token_id);
+                    continue;
+                }
+                for character in symbol.chars() {
+                    let piece = character.to_string();
+                    let token_id = self.token_ids.get(&piece).copied().or(self.unk_token_id);
+                    let Some(token_id) = token_id else {
+                        return Err(LlamaError::InvalidMetadata {
+                            key: "tokenizer.ggml.tokens",
+                            value: format!("no BPE token matches {piece:?}"),
+                        });
+                    };
+                    token_ids.push(token_id);
+                }
+            }
+        }
+        Ok(token_ids)
+    }
+
+    fn merge_bpe_symbols(&self, mut symbols: Vec<String>) -> Vec<String> {
+        while symbols.len() > 1 {
+            let mut best: Option<(usize, usize)> = None;
+            for index in 0..symbols.len() - 1 {
+                let key = bpe_pair_key(&symbols[index], &symbols[index + 1]);
+                let Some(&rank) = self.merge_ranks.get(&key) else {
+                    continue;
+                };
+                if best.is_none_or(|(_, best_rank)| rank < best_rank) {
+                    best = Some((index, rank));
+                }
+            }
+            let Some((index, _)) = best else {
+                break;
+            };
+            let right = symbols.remove(index + 1);
+            symbols[index].push_str(&right);
+        }
+        symbols
     }
 
     fn encoding_paths(
@@ -1031,6 +1116,9 @@ impl LlamaTokenizer {
     ///
     /// Returns an error when a token id is outside the vocabulary.
     pub fn decode(&self, token_ids: &[usize]) -> Result<String, LlamaError> {
+        if self.kind == TokenizerKind::Gpt2Bpe {
+            return self.decode_gpt2_bpe(token_ids);
+        }
         let mut output = String::new();
         let mut bytes = Vec::new();
         for &token_id in token_ids {
@@ -1059,6 +1147,135 @@ impl LlamaTokenizer {
         }
         Ok(output)
     }
+
+    fn decode_gpt2_bpe(&self, token_ids: &[usize]) -> Result<String, LlamaError> {
+        let mut bytes = Vec::new();
+        let mut output = String::new();
+        for &token_id in token_ids {
+            let token = self
+                .tokens
+                .get(token_id)
+                .ok_or_else(|| LlamaError::InvalidMetadata {
+                    key: "tokenizer.ggml.tokens",
+                    value: format!("token id {token_id} is outside vocabulary"),
+                })?;
+            if Some(token_id) == self.bos_token_id || Some(token_id) == self.eos_token_id {
+                continue;
+            }
+            let mut decoded = true;
+            for character in token.chars() {
+                if let Some(byte) = unicode_to_byte(character) {
+                    bytes.push(byte);
+                } else {
+                    decoded = false;
+                    break;
+                }
+            }
+            if !decoded {
+                output.push_str(&String::from_utf8_lossy(&bytes));
+                bytes.clear();
+                output.push_str(token);
+            }
+        }
+        output.push_str(&String::from_utf8_lossy(&bytes));
+        Ok(output)
+    }
+}
+
+fn bpe_pair_key(left: &str, right: &str) -> String {
+    let mut key = String::with_capacity(left.len() + right.len() + 1);
+    key.push_str(left);
+    key.push('\0');
+    key.push_str(right);
+    key
+}
+
+fn byte_encoder_table() -> [char; 256] {
+    let mut table = ['\0'; 256];
+    let mut byte = 0_u16;
+    let mut mapped = 0_u32;
+    while byte < 256 {
+        let value = u8::try_from(byte).unwrap_or_default();
+        if (33..=126).contains(&value)
+            || (161..=172).contains(&value)
+            || (174..=255).contains(&value)
+        {
+            table[usize::from(value)] = char::from(value);
+        } else {
+            table[usize::from(value)] = char::from_u32(256 + mapped).unwrap_or('\u{fffd}');
+            mapped += 1;
+        }
+        byte += 1;
+    }
+    table
+}
+
+fn unicode_to_byte(character: char) -> Option<u8> {
+    let table = byte_encoder_table();
+    table
+        .iter()
+        .position(|candidate| *candidate == character)
+        .and_then(|index| u8::try_from(index).ok())
+}
+
+fn gpt2_pretokenize(text: &str) -> Vec<String> {
+    let characters = text.chars().collect::<Vec<_>>();
+    let mut chunks = Vec::new();
+    let mut index = 0;
+    while index < characters.len() {
+        let mut prefix = String::new();
+        if characters[index] == ' '
+            && index + 1 < characters.len()
+            && !characters[index + 1].is_whitespace()
+        {
+            prefix.push(' ');
+            index += 1;
+        }
+        let start = index;
+        if index + 1 < characters.len() && characters[index] == '\'' {
+            let suffixes = ["re", "ve", "ll", "s", "t", "m", "d"];
+            if let Some(suffix) = suffixes.iter().find(|suffix| {
+                characters[index + 1..]
+                    .iter()
+                    .take(suffix.len())
+                    .collect::<String>()
+                    .eq_ignore_ascii_case(suffix)
+            }) {
+                index += 1 + suffix.len();
+                let mut chunk = prefix;
+                chunk.extend(characters[start..index].iter());
+                chunks.push(chunk);
+                continue;
+            }
+        }
+        let category = characters[index];
+        if category.is_alphabetic() {
+            index += 1;
+            while index < characters.len() && characters[index].is_alphabetic() {
+                index += 1;
+            }
+        } else if category.is_numeric() {
+            index += 1;
+        } else if category.is_whitespace() {
+            index += 1;
+            while index < characters.len() && characters[index].is_whitespace() {
+                index += 1;
+            }
+        } else {
+            index += 1;
+            while index < characters.len()
+                && !characters[index].is_whitespace()
+                && !characters[index].is_alphabetic()
+                && !characters[index].is_numeric()
+            {
+                index += 1;
+            }
+        }
+        let mut chunk = prefix;
+        chunk.extend(characters[start..index].iter());
+        chunks.push(chunk);
+    }
+    chunks
 }
 
 fn normalize_sentencepiece(text: &str) -> String {
@@ -1168,6 +1385,7 @@ pub struct LlamaCpuModel {
     config: LlamaConfig,
     token_embedding: CpuMatrix,
     output: CpuMatrix,
+    output_bias: Option<Vec<f32>>,
     output_norm: Tensor,
     layers: Vec<LayerWeights>,
     tokenizer: Option<LlamaTokenizer>,
@@ -1188,13 +1406,22 @@ impl LlamaCpuModel {
         Self::load_quantized_weights(model, config, tokenizer)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn load_quantized_weights(
         model: &LlamaModel,
         config: LlamaConfig,
         tokenizer: Option<LlamaTokenizer>,
     ) -> Result<Self, LlamaError> {
-        let mut matrix_names = vec!["token_embd.weight".to_owned(), "output.weight".to_owned()];
+        let has_output_weight = model.model.tensor("output.weight").is_some();
+        let mut matrix_names = vec!["token_embd.weight".to_owned()];
+        if has_output_weight {
+            matrix_names.push("output.weight".to_owned());
+        }
         let mut vector_names = vec!["output_norm.weight".to_owned()];
+        let has_output_bias = model.model.tensor("output.bias").is_some();
+        if has_output_bias {
+            vector_names.push("output.bias".to_owned());
+        }
         for layer in 0..config.block_count {
             let prefix = format!("blk.{layer}");
             vector_names.extend([
@@ -1245,7 +1472,26 @@ impl LlamaCpuModel {
             .zip(vector_values)
             .collect::<HashMap<_, _>>();
         let token_embedding = take_matrix(&mut matrices, "token_embd.weight")?;
-        let output = take_matrix(&mut matrices, "output.weight")?;
+        let output = if has_output_weight {
+            take_matrix(&mut matrices, "output.weight")?
+        } else {
+            token_embedding.clone()
+        };
+        let output_bias = vectors
+            .remove("output.bias")
+            .map(Tensor::into_data)
+            .map(|bias| {
+                if bias.len() == config.vocab_size {
+                    Ok(bias)
+                } else {
+                    Err(LlamaError::TensorShape {
+                        name: "output.bias".to_owned(),
+                        expected: vec![config.vocab_size],
+                        actual: vec![bias.len()],
+                    })
+                }
+            })
+            .transpose()?;
         let output_norm = take_vector(&mut vectors, "output_norm.weight")?;
         let mut layers = Vec::with_capacity(config.block_count);
         for layer in 0..config.block_count {
@@ -1266,6 +1512,7 @@ impl LlamaCpuModel {
             config,
             token_embedding,
             output,
+            output_bias,
             output_norm,
             layers,
             tokenizer,
@@ -1273,16 +1520,18 @@ impl LlamaCpuModel {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn load_f32_weights(
         model: &LlamaModel,
         config: LlamaConfig,
         tokenizer: Option<LlamaTokenizer>,
     ) -> Result<Self, LlamaError> {
-        let mut names = vec![
-            "token_embd.weight".to_owned(),
-            "output.weight".to_owned(),
-            "output_norm.weight".to_owned(),
-        ];
+        let has_output_weight = model.model.tensor("output.weight").is_some();
+        let mut names = vec!["token_embd.weight".to_owned()];
+        if has_output_weight {
+            names.push("output.weight".to_owned());
+        }
+        names.push("output_norm.weight".to_owned());
         for layer in 0..config.block_count {
             let prefix = format!("blk.{layer}");
             for suffix in [
@@ -1299,57 +1548,128 @@ impl LlamaCpuModel {
                 names.push(format!("{prefix}.{suffix}"));
             }
         }
+        let has_output_bias = model.model.tensor("output.bias").is_some();
+        if has_output_bias {
+            names.push("output.bias".to_owned());
+        }
         let name_refs = names.iter().map(String::as_str).collect::<Vec<_>>();
-        let mut loaded = Vec::with_capacity(names.len());
-        model.model.for_each_f32(&name_refs, |_name, tensor| {
-            loaded.push(tensor);
+        let mut loaded = HashMap::with_capacity(names.len());
+        model.model.for_each_f32(&name_refs, |name, tensor| {
+            loaded.insert(name.to_owned(), tensor);
             Ok::<(), LlamaError>(())
         })?;
-        let mut loaded = loaded.into_iter();
         let token_embedding =
-            CpuMatrix::from_tensor(next_tensor(&mut loaded, "token_embd.weight")?)?;
-        let output = CpuMatrix::from_tensor(next_tensor(&mut loaded, "output.weight")?)?;
-        let output_norm = next_tensor(&mut loaded, "output_norm.weight")?;
+            CpuMatrix::from_tensor(loaded.remove("token_embd.weight").ok_or_else(|| {
+                LlamaError::Tensor("GGUF loader did not return token_embd.weight".to_owned())
+            })?)?;
+        let output = if has_output_weight {
+            CpuMatrix::from_tensor(loaded.remove("output.weight").ok_or_else(|| {
+                LlamaError::Tensor("GGUF loader did not return output.weight".to_owned())
+            })?)?
+        } else {
+            token_embedding.clone()
+        };
+        let output_bias = loaded.remove("output.bias").map(Tensor::into_data);
+        if let Some(bias) = &output_bias
+            && bias.len() != config.vocab_size
+        {
+            return Err(LlamaError::TensorShape {
+                name: "output.bias".to_owned(),
+                expected: vec![config.vocab_size],
+                actual: vec![bias.len()],
+            });
+        }
+        let output_norm = loaded.remove("output_norm.weight").ok_or_else(|| {
+            LlamaError::Tensor("GGUF loader did not return output_norm.weight".to_owned())
+        })?;
         let mut layers = Vec::with_capacity(config.block_count);
         for layer in 0..config.block_count {
             let prefix = format!("blk.{layer}");
             layers.push(LayerWeights {
-                attn_norm: next_tensor(&mut loaded, &format!("{prefix}.attn_norm.weight"))?,
-                attn_q: CpuMatrix::from_tensor(next_tensor(
-                    &mut loaded,
-                    &format!("{prefix}.attn_q.weight"),
-                )?)?,
-                attn_k: CpuMatrix::from_tensor(next_tensor(
-                    &mut loaded,
-                    &format!("{prefix}.attn_k.weight"),
-                )?)?,
-                attn_v: CpuMatrix::from_tensor(next_tensor(
-                    &mut loaded,
-                    &format!("{prefix}.attn_v.weight"),
-                )?)?,
-                attn_output: CpuMatrix::from_tensor(next_tensor(
-                    &mut loaded,
-                    &format!("{prefix}.attn_output.weight"),
-                )?)?,
-                ffn_norm: next_tensor(&mut loaded, &format!("{prefix}.ffn_norm.weight"))?,
-                ffn_gate: CpuMatrix::from_tensor(next_tensor(
-                    &mut loaded,
-                    &format!("{prefix}.ffn_gate.weight"),
-                )?)?,
-                ffn_down: CpuMatrix::from_tensor(next_tensor(
-                    &mut loaded,
-                    &format!("{prefix}.ffn_down.weight"),
-                )?)?,
-                ffn_up: CpuMatrix::from_tensor(next_tensor(
-                    &mut loaded,
-                    &format!("{prefix}.ffn_up.weight"),
-                )?)?,
+                attn_norm: loaded
+                    .remove(&format!("{prefix}.attn_norm.weight"))
+                    .ok_or_else(|| {
+                        LlamaError::Tensor(format!(
+                            "GGUF loader did not return {prefix}.attn_norm.weight"
+                        ))
+                    })?,
+                attn_q: CpuMatrix::from_tensor(
+                    loaded
+                        .remove(&format!("{prefix}.attn_q.weight"))
+                        .ok_or_else(|| {
+                            LlamaError::Tensor(format!(
+                                "GGUF loader did not return {prefix}.attn_q.weight"
+                            ))
+                        })?,
+                )?,
+                attn_k: CpuMatrix::from_tensor(
+                    loaded
+                        .remove(&format!("{prefix}.attn_k.weight"))
+                        .ok_or_else(|| {
+                            LlamaError::Tensor(format!(
+                                "GGUF loader did not return {prefix}.attn_k.weight"
+                            ))
+                        })?,
+                )?,
+                attn_v: CpuMatrix::from_tensor(
+                    loaded
+                        .remove(&format!("{prefix}.attn_v.weight"))
+                        .ok_or_else(|| {
+                            LlamaError::Tensor(format!(
+                                "GGUF loader did not return {prefix}.attn_v.weight"
+                            ))
+                        })?,
+                )?,
+                attn_output: CpuMatrix::from_tensor(
+                    loaded
+                        .remove(&format!("{prefix}.attn_output.weight"))
+                        .ok_or_else(|| {
+                            LlamaError::Tensor(format!(
+                                "GGUF loader did not return {prefix}.attn_output.weight"
+                            ))
+                        })?,
+                )?,
+                ffn_norm: loaded
+                    .remove(&format!("{prefix}.ffn_norm.weight"))
+                    .ok_or_else(|| {
+                        LlamaError::Tensor(format!(
+                            "GGUF loader did not return {prefix}.ffn_norm.weight"
+                        ))
+                    })?,
+                ffn_gate: CpuMatrix::from_tensor(
+                    loaded
+                        .remove(&format!("{prefix}.ffn_gate.weight"))
+                        .ok_or_else(|| {
+                            LlamaError::Tensor(format!(
+                                "GGUF loader did not return {prefix}.ffn_gate.weight"
+                            ))
+                        })?,
+                )?,
+                ffn_down: CpuMatrix::from_tensor(
+                    loaded
+                        .remove(&format!("{prefix}.ffn_down.weight"))
+                        .ok_or_else(|| {
+                            LlamaError::Tensor(format!(
+                                "GGUF loader did not return {prefix}.ffn_down.weight"
+                            ))
+                        })?,
+                )?,
+                ffn_up: CpuMatrix::from_tensor(
+                    loaded
+                        .remove(&format!("{prefix}.ffn_up.weight"))
+                        .ok_or_else(|| {
+                            LlamaError::Tensor(format!(
+                                "GGUF loader did not return {prefix}.ffn_up.weight"
+                            ))
+                        })?,
+                )?,
             });
         }
         Ok(Self {
             config,
             token_embedding,
             output,
+            output_bias,
             output_norm,
             layers,
             tokenizer,
@@ -1668,7 +1988,12 @@ impl<'a> LlamaSession<'a> {
                 embedding_width,
                 self.model.output_norm.data().to_vec(),
             )?)?;
-        let logits = self.model.output.matmul_tensor(&normalized)?.into_data();
+        let mut logits = self.model.output.matmul_tensor(&normalized)?.into_data();
+        if let Some(output_bias) = &self.model.output_bias {
+            for (logit, bias) in logits.iter_mut().zip(output_bias) {
+                *logit += *bias;
+            }
+        }
         self.position += 1;
         Ok(logits)
     }
@@ -2003,15 +2328,6 @@ fn parse_rope_scaling(
     }
 }
 
-fn next_tensor(
-    tensors: &mut impl Iterator<Item = Tensor>,
-    name: &str,
-) -> Result<Tensor, LlamaError> {
-    tensors
-        .next()
-        .ok_or_else(|| LlamaError::Tensor(format!("GGUF loader did not return {name}")))
-}
-
 fn take_matrix(
     matrices: &mut HashMap<String, CpuMatrix>,
     name: &str,
@@ -2083,11 +2399,32 @@ fn validate_layout(model: &GgufModel, config: &LlamaConfig) -> Result<(), LlamaE
         "token_embd.weight",
         &[config.embedding_length, config.vocab_size],
     )?;
-    require_shape(
-        model,
-        "output.weight",
-        &[config.embedding_length, config.vocab_size],
-    )?;
+    let architecture = model.architecture().unwrap_or_default();
+    if model.tensor("output.weight").is_some() {
+        require_shape(
+            model,
+            "output.weight",
+            &[config.embedding_length, config.vocab_size],
+        )?;
+    } else if architecture != "qwen2" {
+        return Err(LlamaError::MissingTensor("output.weight".to_owned()));
+    }
+    if let Some(output_bias) = model.tensor("output.bias")
+        && output_bias.shape() != [config.vocab_size]
+    {
+        return Err(LlamaError::TensorShape {
+            name: "output.bias".to_owned(),
+            expected: vec![config.vocab_size],
+            actual: output_bias.shape().to_vec(),
+        });
+    }
+    if architecture == "qwen2"
+        && config.rope_dimension_count() != config.embedding_length() / config.head_count()
+    {
+        return Err(LlamaError::InvalidConfig(
+            "qwen2 requires rotary embeddings across the full attention head".to_owned(),
+        ));
+    }
     require_shape(model, "output_norm.weight", &[config.embedding_length])?;
     let kv_width = config
         .embedding_length
@@ -2183,6 +2520,12 @@ mod tests {
         }
     }
 
+    fn push_string_metadata(bytes: &mut Vec<u8>, key: &str, value: &str) {
+        push_string(bytes, key);
+        bytes.extend_from_slice(&8_u32.to_le_bytes());
+        push_string(bytes, value);
+    }
+
     fn push_f32_array_metadata(bytes: &mut Vec<u8>, key: &str, values: &[f32]) {
         push_string(bytes, key);
         bytes.extend_from_slice(&9_u32.to_le_bytes());
@@ -2262,6 +2605,68 @@ mod tests {
             "tokenizer.ggml.scores",
             &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         );
+        let mut offset = 0_u64;
+        for (name, shape) in &config {
+            push_string(&mut bytes, name);
+            bytes.extend_from_slice(&u32::try_from(shape.len()).unwrap().to_le_bytes());
+            for dimension in shape {
+                bytes.extend_from_slice(&dimension.to_le_bytes());
+            }
+            bytes.extend_from_slice(&0_u32.to_le_bytes());
+            bytes.extend_from_slice(&offset.to_le_bytes());
+            let elements = shape.iter().product::<u64>();
+            let byte_len = elements * 4;
+            offset += byte_len.div_ceil(32) * 32;
+        }
+        while bytes.len() % 32 != 0 {
+            bytes.push(0);
+        }
+        bytes.resize(bytes.len() + usize::try_from(offset).unwrap(), 0);
+        bytes
+    }
+
+    fn qwen2_tied_fixture() -> Vec<u8> {
+        let config = [
+            ("token_embd.weight", vec![4_u64, 8]),
+            ("output.bias", vec![8]),
+            ("output_norm.weight", vec![4]),
+            ("blk.0.attn_norm.weight", vec![4]),
+            ("blk.0.attn_q.weight", vec![4, 4]),
+            ("blk.0.attn_k.weight", vec![4, 2]),
+            ("blk.0.attn_v.weight", vec![4, 2]),
+            ("blk.0.attn_output.weight", vec![4, 4]),
+            ("blk.0.ffn_norm.weight", vec![4]),
+            ("blk.0.ffn_gate.weight", vec![4, 8]),
+            ("blk.0.ffn_down.weight", vec![8, 4]),
+            ("blk.0.ffn_up.weight", vec![4, 8]),
+        ];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&(config.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&14_u64.to_le_bytes());
+        push_string_metadata(&mut bytes, "general.architecture", "qwen2");
+        push_u32_metadata(&mut bytes, "qwen2.context_length", 16);
+        push_u32_metadata(&mut bytes, "qwen2.embedding_length", 4);
+        push_u32_metadata(&mut bytes, "qwen2.block_count", 1);
+        push_u32_metadata(&mut bytes, "qwen2.attention.head_count", 2);
+        push_u32_metadata(&mut bytes, "qwen2.attention.head_count_kv", 1);
+        push_u32_metadata(&mut bytes, "qwen2.feed_forward_length", 8);
+        push_u32_metadata(&mut bytes, "qwen2.vocab_size", 8);
+        push_f32_metadata(&mut bytes, "qwen2.attention.layer_norm_rms_epsilon", 1.0e-5);
+        push_f32_metadata(&mut bytes, "qwen2.rope.freq_base", 10_000.0);
+        push_string_array_metadata(
+            &mut bytes,
+            "tokenizer.ggml.tokens",
+            &["<unk>", "Ġ", "a", "Ġa", "b", "c", "d", "e"],
+        );
+        push_f32_array_metadata(
+            &mut bytes,
+            "tokenizer.ggml.scores",
+            &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        push_string_metadata(&mut bytes, "tokenizer.ggml.model", "gpt2");
+        push_string_array_metadata(&mut bytes, "tokenizer.ggml.merges", &["Ġ a"]);
         let mut offset = 0_u64;
         for (name, shape) in &config {
             push_string(&mut bytes, name);
@@ -2558,12 +2963,15 @@ mod tests {
     }
 
     #[test]
-    fn opens_mistral_metadata_with_the_shared_decoder_layout() {
-        let path = write_fixture(&llama_fixture_for("mistral"));
+    fn loads_qwen2_with_tied_output_and_gpt2_tokenizer() {
+        let path = write_fixture(&qwen2_tied_fixture());
         let model = LlamaModel::open(&path, 1 << 20).unwrap();
-        assert_eq!(model.model().architecture(), Some("mistral"));
-        assert_eq!(model.config().embedding_length(), 4);
-        assert_eq!(model.config().attention_window(), None);
+        assert_eq!(model.config().vocab_size(), 8);
+        assert!(model.model().tensor("output.weight").is_none());
+        let tokenizer = model.tokenizer().unwrap();
+        assert_eq!(tokenizer.encode(" a").unwrap(), [3]);
+        let cpu = model.load_cpu().unwrap();
+        assert_eq!(cpu.forward_token(1).unwrap(), vec![0.0; 8]);
         fs::remove_file(path).unwrap();
     }
 
@@ -2607,6 +3015,9 @@ mod tests {
             bos_token_id: None,
             eos_token_id: None,
             unk_token_id: Some(0),
+            kind: TokenizerKind::SentencePiece,
+            token_ids: HashMap::new(),
+            merge_ranks: HashMap::new(),
         };
         assert_eq!(tokenizer.encode("ab").unwrap(), [2, 3]);
     }
@@ -2619,10 +3030,49 @@ mod tests {
             bos_token_id: None,
             eos_token_id: None,
             unk_token_id: None,
+            kind: TokenizerKind::SentencePiece,
+            token_ids: HashMap::new(),
+            merge_ranks: HashMap::new(),
         };
         assert_eq!(tokenizer.encode("é").unwrap(), [0, 1, 2]);
         assert_eq!(tokenizer.decode(&[0, 1, 2]).unwrap(), " é");
         assert_eq!(tokenizer.decode(&[1]).unwrap(), "�");
+    }
+
+    #[test]
+    fn tokenizer_applies_gpt2_bpe_merges_and_round_trips_bytes() {
+        let tokens = ["h", "e", "l", "o", "hello"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let token_ids = tokens
+            .iter()
+            .enumerate()
+            .map(|(id, token)| (token.clone(), id))
+            .collect::<HashMap<_, _>>();
+        let merge_ranks = ["h e", "he l", "hel l", "hell o"]
+            .into_iter()
+            .enumerate()
+            .map(|(rank, merge)| {
+                let mut pieces = merge.split(' ');
+                (
+                    bpe_pair_key(pieces.next().unwrap(), pieces.next().unwrap()),
+                    rank,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let tokenizer = LlamaTokenizer {
+            tokens,
+            scores: vec![0.0; 5],
+            bos_token_id: None,
+            eos_token_id: None,
+            unk_token_id: None,
+            kind: TokenizerKind::Gpt2Bpe,
+            token_ids,
+            merge_ranks,
+        };
+        assert_eq!(tokenizer.encode("hello").unwrap(), [4]);
+        assert_eq!(tokenizer.decode(&[4]).unwrap(), "hello");
     }
 
     #[test]
