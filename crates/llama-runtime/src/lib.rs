@@ -116,6 +116,38 @@ fn metadata_keys(architecture: &str) -> Option<LlamaMetadataKeys> {
             attention_window: "qwen2.attention.sliding_window",
             attention_window_pattern: "qwen2.attention.sliding_window_pattern",
         }),
+        "mistral" => Some(LlamaMetadataKeys {
+            context_length: "mistral.context_length",
+            embedding_length: "mistral.embedding_length",
+            block_count: "mistral.block_count",
+            head_count: "mistral.attention.head_count",
+            head_count_kv: "mistral.attention.head_count_kv",
+            feed_forward_length: "mistral.feed_forward_length",
+            vocab_size: "mistral.vocab_size",
+            rms_norm_epsilon: "mistral.attention.layer_norm_rms_epsilon",
+            rope_freq_base: "mistral.rope.freq_base",
+            rope_dimension_count: "mistral.rope.dimension_count",
+            rope_scaling_type: "mistral.rope.scaling.type",
+            rope_scaling_factor: "mistral.rope.scaling.factor",
+            attention_window: "mistral.attention.sliding_window",
+            attention_window_pattern: "mistral.attention.sliding_window_pattern",
+        }),
+        "mistral3" => Some(LlamaMetadataKeys {
+            context_length: "mistral3.context_length",
+            embedding_length: "mistral3.embedding_length",
+            block_count: "mistral3.block_count",
+            head_count: "mistral3.attention.head_count",
+            head_count_kv: "mistral3.attention.head_count_kv",
+            feed_forward_length: "mistral3.feed_forward_length",
+            vocab_size: "mistral3.vocab_size",
+            rms_norm_epsilon: "mistral3.attention.layer_norm_rms_epsilon",
+            rope_freq_base: "mistral3.rope.freq_base",
+            rope_dimension_count: "mistral3.rope.dimension_count",
+            rope_scaling_type: "mistral3.rope.scaling.type",
+            rope_scaling_factor: "mistral3.rope.scaling.factor",
+            attention_window: "mistral3.attention.sliding_window",
+            attention_window_pattern: "mistral3.attention.sliding_window_pattern",
+        }),
         _ => None,
     }
 }
@@ -3255,6 +3287,17 @@ mod tests {
         assert_eq!(model.config().context_length(), 16);
         assert_eq!(model.config().head_count_kv(), 1);
         assert_eq!(model.model().tensors().len(), 12);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn opens_mistral3_text_layout_with_canonical_metadata_prefix() {
+        let path = write_fixture(&llama_fixture_for("mistral3"));
+        let model = LlamaModel::open(&path, 1 << 20).unwrap();
+        assert_eq!(model.config().embedding_length(), 4);
+        assert_eq!(model.config().kv_cache_capacity_for_layer(0), 16);
+        let cpu = model.load_cpu().unwrap();
+        assert_eq!(cpu.forward_token(1).unwrap().len(), 8);
         fs::remove_file(path).unwrap();
     }
 
