@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
+    path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -240,6 +241,8 @@ pub enum MemoryError {
         path: String,
         version: u64,
     },
+    InvalidSnapshot,
+    Io(String),
 }
 
 impl fmt::Display for MemoryError {
@@ -274,6 +277,8 @@ impl fmt::Display for MemoryError {
             Self::InvalidVersion { path, version } => {
                 write!(formatter, "memory path {path} has no version {version}")
             }
+            Self::InvalidSnapshot => formatter.write_str("memory snapshot is invalid"),
+            Self::Io(error) => write!(formatter, "memory snapshot I/O failed: {error}"),
         }
     }
 }
@@ -430,6 +435,143 @@ impl MemoryStore {
             }
         }
         format!("sha256:{:x}", hasher.finalize())
+    }
+
+    /// Encodes the complete store as a deterministic versioned snapshot.
+    ///
+    /// The binary format is deliberately self-contained and does not expose
+    /// Rust layout details. It can be copied as one file, hashed, or moved
+    /// between processes before being restored with [`Self::decode`].
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"MTPLXMEM\0");
+        put_u64(&mut bytes, 1);
+        put_u64(&mut bytes, self.next_sequence);
+        put_u64(&mut bytes, self.histories.len() as u64);
+        for (path, history) in &self.histories {
+            put_string(&mut bytes, path);
+            put_u64(&mut bytes, history.len() as u64);
+            for entry in history {
+                put_string(&mut bytes, &entry.path);
+                put_scope(&mut bytes, &entry.scope);
+                put_u64(&mut bytes, entry.version);
+                put_string(&mut bytes, &entry.content);
+                put_string(&mut bytes, &entry.content_hash);
+                put_string(&mut bytes, &entry.written_by);
+                put_string(&mut bytes, &entry.session_id);
+                put_u64(&mut bytes, entry.sequence);
+                put_u128(&mut bytes, entry.written_at_unix_ms);
+            }
+        }
+        bytes
+    }
+
+    /// Restores a store from a snapshot produced by [`Self::encode`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::InvalidSnapshot`] when the bytes are truncated,
+    /// malformed, inconsistent, or contain an unsupported format version.
+    pub fn decode(bytes: &[u8]) -> Result<Self, MemoryError> {
+        let mut reader = SnapshotReader::new(bytes);
+        if reader.take(9)? != b"MTPLXMEM\0" {
+            return Err(MemoryError::InvalidSnapshot);
+        }
+        if reader.u64()? != 1 {
+            return Err(MemoryError::InvalidSnapshot);
+        }
+        let next_sequence = reader.u64()?;
+        let history_count = reader.count()?;
+        let mut histories = BTreeMap::new();
+        let mut seen_sequences = BTreeSet::new();
+        let mut highest_sequence = 0_u64;
+        for _ in 0..history_count {
+            let path = validate_path(reader.string()?)?;
+            let entry_count = reader.count()?;
+            if entry_count == 0 || histories.contains_key(&path) {
+                return Err(MemoryError::InvalidSnapshot);
+            }
+            let mut history = Vec::with_capacity(entry_count);
+            let mut history_scope = None;
+            for expected_version in 1..=entry_count as u64 {
+                let entry_path = reader.string()?;
+                if entry_path != path {
+                    return Err(MemoryError::InvalidSnapshot);
+                }
+                let scope = reader.scope()?;
+                validate_scope(&scope)?;
+                if history_scope
+                    .as_ref()
+                    .is_some_and(|previous| previous != &scope)
+                {
+                    return Err(MemoryError::InvalidSnapshot);
+                }
+                history_scope = Some(scope.clone());
+                let version = reader.u64()?;
+                if version != expected_version {
+                    return Err(MemoryError::InvalidSnapshot);
+                }
+                let content = reader.string()?;
+                let stored_hash = reader.string()?;
+                if stored_hash != content_hash(&content) {
+                    return Err(MemoryError::InvalidSnapshot);
+                }
+                let written_by = reader.string()?;
+                if written_by.is_empty() || written_by.contains('\0') {
+                    return Err(MemoryError::InvalidSnapshot);
+                }
+                let session_id = reader.string()?;
+                if session_id.is_empty() || session_id.contains('\0') {
+                    return Err(MemoryError::InvalidSnapshot);
+                }
+                let sequence = reader.u64()?;
+                if sequence == 0 || !seen_sequences.insert(sequence) {
+                    return Err(MemoryError::InvalidSnapshot);
+                }
+                highest_sequence = highest_sequence.max(sequence);
+                let written_at_unix_ms = reader.u128()?;
+                history.push(MemoryEntry {
+                    path: entry_path,
+                    scope,
+                    version,
+                    content,
+                    content_hash: stored_hash,
+                    written_by,
+                    session_id,
+                    sequence,
+                    written_at_unix_ms,
+                });
+            }
+            histories.insert(path, history);
+        }
+        if !reader.is_empty() || next_sequence < highest_sequence {
+            return Err(MemoryError::InvalidSnapshot);
+        }
+        Ok(Self {
+            histories,
+            next_sequence,
+        })
+    }
+
+    /// Writes a complete snapshot to a file, replacing its contents.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the file cannot be written.
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), MemoryError> {
+        std::fs::write(path, self.encode()).map_err(|error| MemoryError::Io(error.to_string()))
+    }
+
+    /// Loads a complete snapshot from a file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the file cannot be read, or an invalid
+    /// snapshot error when its contents fail validation.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, MemoryError> {
+        let bytes = std::fs::read(path).map_err(|error| MemoryError::Io(error.to_string()))?;
+        Self::decode(&bytes)
     }
 
     /// Starts an out-of-band dreaming pass from a stable clone of this store.
@@ -658,6 +800,90 @@ fn content_hash(content: &str) -> String {
     format!("sha256:{digest:x}")
 }
 
+fn put_u64(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_u128(bytes: &mut Vec<u8>, value: u128) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_string(bytes: &mut Vec<u8>, value: &str) {
+    put_u64(bytes, value.len() as u64);
+    bytes.extend_from_slice(value.as_bytes());
+}
+
+fn put_scope(bytes: &mut Vec<u8>, scope: &MemoryScope) {
+    match scope {
+        MemoryScope::Shared => bytes.push(0),
+        MemoryScope::Agent(agent_id) => {
+            bytes.push(1);
+            put_string(bytes, agent_id);
+        }
+    }
+}
+
+struct SnapshotReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> SnapshotReader<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], MemoryError> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(MemoryError::InvalidSnapshot)?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(MemoryError::InvalidSnapshot)?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn u64(&mut self) -> Result<u64, MemoryError> {
+        let bytes: [u8; 8] = self
+            .take(8)?
+            .try_into()
+            .map_err(|_| MemoryError::InvalidSnapshot)?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn u128(&mut self) -> Result<u128, MemoryError> {
+        let bytes: [u8; 16] = self
+            .take(16)?
+            .try_into()
+            .map_err(|_| MemoryError::InvalidSnapshot)?;
+        Ok(u128::from_le_bytes(bytes))
+    }
+
+    fn count(&mut self) -> Result<usize, MemoryError> {
+        usize::try_from(self.u64()?).map_err(|_| MemoryError::InvalidSnapshot)
+    }
+
+    fn string(&mut self) -> Result<String, MemoryError> {
+        let length = self.count()?;
+        String::from_utf8(self.take(length)?.to_vec()).map_err(|_| MemoryError::InvalidSnapshot)
+    }
+
+    fn scope(&mut self) -> Result<MemoryScope, MemoryError> {
+        match self.take(1)?[0] {
+            0 => Ok(MemoryScope::Shared),
+            1 => Ok(MemoryScope::Agent(self.string()?)),
+            _ => Err(MemoryError::InvalidSnapshot),
+        }
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,6 +1064,48 @@ mod tests {
         assert!(matches!(
             stale_pass.commit(&orchestrator, &mut store),
             Err(MemoryError::Conflict { path, .. }) if path == "<store>"
+        ));
+    }
+
+    #[test]
+    fn snapshots_round_trip_interleaved_history_and_reject_tampering() {
+        let orchestrator = Principal::orchestrator("orchestrator").unwrap();
+        let mut store = MemoryStore::new();
+        let first = store
+            .write(
+                &orchestrator,
+                MemoryWrite::new(MemoryScope::Shared, "team/a.md", "one", "s1").unwrap(),
+            )
+            .unwrap();
+        store
+            .write(
+                &orchestrator,
+                MemoryWrite::new(MemoryScope::Shared, "team/b.md", "two", "s2").unwrap(),
+            )
+            .unwrap();
+        store
+            .write(
+                &orchestrator,
+                MemoryWrite::new(MemoryScope::Shared, "team/a.md", "three", "s3")
+                    .unwrap()
+                    .with_expected_hash(first.content_hash()),
+            )
+            .unwrap();
+
+        let encoded = store.encode();
+        assert_eq!(MemoryStore::decode(&encoded).unwrap(), store);
+
+        let mut truncated = encoded.clone();
+        truncated.pop();
+        assert!(matches!(
+            MemoryStore::decode(&truncated),
+            Err(MemoryError::InvalidSnapshot)
+        ));
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(matches!(
+            MemoryStore::decode(&trailing),
+            Err(MemoryError::InvalidSnapshot)
         ));
     }
 
