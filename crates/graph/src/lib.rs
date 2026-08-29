@@ -77,6 +77,7 @@ enum Operation {
     Matmul,
     Reshape(Vec<usize>),
     Transpose2d,
+    GatherRows(Vec<usize>),
     Broadcast(Vec<usize>),
     RmsNorm {
         epsilon: f32,
@@ -224,6 +225,25 @@ impl Graph {
     /// Returns an error when the input handle is invalid.
     pub fn transpose_2d(&mut self, input: ValueId) -> Result<ValueId, GraphError> {
         self.unary(Operation::Transpose2d, input)
+    }
+
+    /// Adds a row-gather node for embedding and lookup tables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid or no indices are
+    /// supplied.
+    pub fn gather_rows(
+        &mut self,
+        input: ValueId,
+        indices: impl Into<Vec<usize>>,
+    ) -> Result<ValueId, GraphError> {
+        self.require(input)?;
+        let indices = indices.into();
+        if indices.is_empty() {
+            return Err(GraphError::Tensor(TensorError::ZeroDimension));
+        }
+        Ok(self.push(Operation::GatherRows(indices), vec![input]))
     }
 
     /// Adds a right-aligned broadcast node.
@@ -487,6 +507,9 @@ impl Graph {
                         .clone()
                         .reshape(shape.clone())?,
                     Operation::Transpose2d => values[self.input_index(node, 0)?].transpose_2d()?,
+                    Operation::GatherRows(indices) => {
+                        values[self.input_index(node, 0)?].gather_rows(indices)?
+                    }
                     Operation::Broadcast(shape) => {
                         values[self.input_index(node, 0)?].broadcast_to(shape.clone())?
                     }
@@ -675,6 +698,21 @@ mod tests {
         assert!((result[0].data()[1] - 3.0).abs() < 1.0e-6);
         assert!((result[0].data()[2] - 2.0).abs() < 1.0e-6);
         assert!((result[0].data()[3] - 3.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn evaluates_embedding_row_gather_graph() {
+        let mut graph = Graph::new();
+        let table = graph.input([3, 2]).unwrap();
+        let gathered = graph.gather_rows(table, vec![2, 0]).unwrap();
+        let result = graph
+            .evaluate(
+                &[Tensor::from_data([3, 2], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()],
+                &[gathered],
+            )
+            .unwrap();
+        assert_eq!(result[0].shape(), &[2, 2]);
+        assert_eq!(result[0].data(), &[5.0, 6.0, 1.0, 2.0]);
     }
 
     #[test]

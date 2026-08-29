@@ -48,6 +48,10 @@ pub enum TensorError {
     InvalidEpsilon,
     InvalidScale,
     InvalidClamp,
+    IndexOutOfBounds {
+        index: usize,
+        upper_bound: usize,
+    },
     RotaryShapeMismatch {
         shape: Vec<usize>,
     },
@@ -96,6 +100,10 @@ impl fmt::Display for TensorError {
             }
             Self::InvalidScale => formatter.write_str("attention scale must be finite"),
             Self::InvalidClamp => formatter.write_str("clamp bounds must be finite and ordered"),
+            Self::IndexOutOfBounds { index, upper_bound } => write!(
+                formatter,
+                "row index {index} is outside the table range 0..{upper_bound}"
+            ),
             Self::RotaryShapeMismatch { shape } => write!(
                 formatter,
                 "rotary embedding requires a rank-2 head tensor, got {shape:?}"
@@ -264,6 +272,46 @@ impl Tensor {
             }
         }
         checked_output(vec![columns, rows], result, "transpose")
+    }
+
+    /// Gathers rows from a rank-2 table by integer index.
+    ///
+    /// The returned tensor has shape `[indices.len(), self.shape[1]]` and
+    /// preserves the table's row-major column order. This is the checked
+    /// equivalent of GGML `GET_ROWS` and an embedding lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the table is not rank 2, no indices are supplied,
+    /// an index is outside the table, or an output value is non-finite.
+    pub fn gather_rows(&self, indices: &[usize]) -> Result<Self, TensorError> {
+        if self.rank() != 2 {
+            return Err(TensorError::RankMismatch {
+                expected: 2,
+                actual: self.rank(),
+            });
+        }
+        if indices.is_empty() {
+            return Err(TensorError::ZeroDimension);
+        }
+        let rows = self.shape[0];
+        let columns = self.shape[1];
+        let output_len = indices
+            .len()
+            .checked_mul(columns)
+            .ok_or(TensorError::ElementCountOverflow)?;
+        let mut result = Vec::with_capacity(output_len);
+        for &index in indices {
+            if index >= rows {
+                return Err(TensorError::IndexOutOfBounds {
+                    index,
+                    upper_bound: rows,
+                });
+            }
+            let start = index * columns;
+            result.extend_from_slice(&self.data[start..start + columns]);
+        }
+        checked_output(vec![indices.len(), columns], result, "gather_rows")
     }
 
     /// Broadcasts this tensor to a larger, right-aligned shape by copying
@@ -916,6 +964,21 @@ mod tests {
             .unwrap();
         assert_eq!(tensor.shape(), &[3, 2]);
         assert_eq!(tensor.data(), &[1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+
+    #[test]
+    fn gathers_rows_in_requested_order() {
+        let table = Tensor::from_data([3, 2], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let gathered = table.gather_rows(&[2, 0, 2]).unwrap();
+        assert_eq!(gathered.shape(), &[3, 2]);
+        assert_eq!(gathered.data(), &[5.0, 6.0, 1.0, 2.0, 5.0, 6.0]);
+        assert_eq!(
+            table.gather_rows(&[3]).unwrap_err(),
+            TensorError::IndexOutOfBounds {
+                index: 3,
+                upper_bound: 3,
+            }
+        );
     }
 
     #[test]
