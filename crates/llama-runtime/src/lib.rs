@@ -2086,6 +2086,24 @@ mod tests {
     }
 
     #[test]
+    fn accepts_a_partial_rotary_dimension() {
+        let config =
+            LlamaConfig::new_with_rope_dimension(16, 8, 1, 2, 1, 16, 32, 1.0e-5, 10_000.0, 2)
+                .unwrap();
+        assert_eq!(config.rope_dimension_count(), 2);
+        let invalid =
+            LlamaConfig::new_with_rope_dimension(16, 8, 1, 2, 1, 16, 32, 1.0e-5, 10_000.0, 3);
+        assert!(matches!(invalid, Err(LlamaError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn partial_rotary_dimension_leaves_the_tail_unchanged() {
+        let mut values = vec![1.0, 2.0, 3.0, 4.0];
+        apply_rope(&mut values, 1, 4, 2, 1, 10_000.0).unwrap();
+        assert_eq!(&values[2..], &[3.0, 4.0]);
+    }
+
+    #[test]
     fn validates_sampling_parameters() {
         assert!(LlamaSamplingConfig::new(-1.0, 0, 1.0, 1).is_err());
         assert!(LlamaSamplingConfig::new(f32::NAN, 0, 1.0, 1).is_err());
