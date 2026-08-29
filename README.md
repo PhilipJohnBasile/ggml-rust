@@ -9,8 +9,8 @@ The workspace requires Rust 1.98 or newer and pins Rust 1.98.0, with Clippy and 
 Current workspace:
 
 - llama-runtime: checked Llama metadata/layout admission, tokenizer metadata,
-  KV-cache CPU decoding, and deterministic greedy or seeded constrained
-  sampling generation
+  KV-cache CPU decoding, linear RoPE scaling, and deterministic greedy or
+  seeded constrained sampling generation
 - `ggml-gguf`: bounded GGUF parser with byte-slice and safe seekable-reader validation paths
 - `ggml-mmap`: explicitly size-bounded, read-only model file mapping
 - `ggml-model`: digest-bound GGUF tensor index with F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, and Q8_K CPU materialization, plus direct row-vector matmul for all supported quantized formats without F32 materialization
