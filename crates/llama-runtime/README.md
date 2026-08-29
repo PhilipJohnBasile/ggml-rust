@@ -8,7 +8,9 @@ supported quantized matrices into the checked CPU tensor engine, maintain a
 bounded per-layer KV cache, apply rotary embeddings, and perform deterministic
 greedy or seeded temperature, top-k, and nucleus top-p generation.
 
-The CPU decoder is the correctness fallback. Quantized rank-2 weights use
-direct encoded matrix products and embedding column lookup without a complete
-F32 expansion. It does not yet provide MLX or Metal kernels, the full llama.cpp
-sampling surface, or every llama.cpp architecture variant.
+The CPU decoder is the correctness fallback. `LlamaModel::load_cpu` uses the
+fast F32 reference representation, while `LlamaModel::load_cpu_quantized`
+retains supported rank-2 weights in encoded form and uses direct products and
+embedding column lookup without a complete F32 expansion. It does not yet
+provide MLX or Metal kernels, the full llama.cpp sampling surface, or every
+llama.cpp architecture variant.
