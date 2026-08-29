@@ -21,6 +21,78 @@ pub struct TensorDescriptor {
     byte_len: u64,
 }
 
+/// An MLX affine-quantized matrix converted directly from an encoded GGUF
+/// matrix.
+///
+/// The matrix is stored in MLX's row-major `[output, input]` orientation. The
+/// packed weights use the same little-endian bit layout as `mlx_quantize`,
+/// while scales and biases contain one value per input group. Conversion
+/// decodes one group at a time and never materializes the complete matrix as
+/// F32 values.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AffineQuantizedMatrix {
+    rows: usize,
+    columns: usize,
+    group_size: usize,
+    bits: usize,
+    packed: Vec<u32>,
+    scales: Vec<f32>,
+    biases: Vec<f32>,
+}
+
+/// Tensor data selected by [`GgufModel::for_each_tensor`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum LoadedTensor {
+    /// A tensor decoded into the checked CPU F32 representation.
+    F32(Tensor),
+    /// A rank-2 quantized tensor converted directly to MLX affine layout.
+    AffineQuantized(AffineQuantizedMatrix),
+}
+
+impl AffineQuantizedMatrix {
+    /// Number of output rows in the MLX matrix.
+    #[must_use]
+    pub const fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Number of input columns in the MLX matrix.
+    #[must_use]
+    pub const fn columns(&self) -> usize {
+        self.columns
+    }
+
+    /// Number of input values covered by one affine scale and bias.
+    #[must_use]
+    pub const fn group_size(&self) -> usize {
+        self.group_size
+    }
+
+    /// Number of bits used for each packed value.
+    #[must_use]
+    pub const fn bits(&self) -> usize {
+        self.bits
+    }
+
+    /// Returns packed MLX quantized weights in row-major `[rows, columns * bits / 32]` layout.
+    #[must_use]
+    pub fn packed(&self) -> &[u32] {
+        &self.packed
+    }
+
+    /// Returns MLX affine scales in row-major `[rows, columns / group_size]` layout.
+    #[must_use]
+    pub fn scales(&self) -> &[f32] {
+        &self.scales
+    }
+
+    /// Returns MLX affine biases in row-major `[rows, columns / group_size]` layout.
+    #[must_use]
+    pub fn biases(&self) -> &[f32] {
+        &self.biases
+    }
+}
+
 /// An owned scalar GGUF metadata value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MetadataScalar {
@@ -455,6 +527,88 @@ impl GgufModel {
         Ok(tensors)
     }
 
+    /// Converts one rank-2 quantized GGUF matrix directly to MLX affine
+    /// quantization components.
+    ///
+    /// The GGUF matrix is decoded one input group at a time, so this path
+    /// never allocates a complete F32 copy before packing the MLX weights.
+    /// The returned matrix uses MLX's `[output, input]` orientation and the
+    /// same packed little-endian bit layout as `mlx_quantize`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tensor is missing, not a supported GGUF
+    /// quantized matrix, not rank 2, not aligned to `group_size`, the
+    /// quantization parameters are unsupported, the model changed, or the
+    /// encoded tensor is malformed.
+    pub fn load_affine_quantized(
+        &self,
+        name: &str,
+        group_size: usize,
+        bits: usize,
+    ) -> Result<AffineQuantizedMatrix, ModelError> {
+        let descriptor = self
+            .tensor(name)
+            .ok_or_else(|| ModelError::TensorNotFound(name.to_owned()))?;
+        self.with_validated_bytes(|bytes| {
+            materialize_affine_quantized(bytes, descriptor, group_size, bits)
+        })
+    }
+
+    /// Loads tensors through one validated mapping, selecting direct MLX
+    /// affine conversion for eligible rank-2 GGUF quantized matrices and F32
+    /// materialization for all other tensors.
+    ///
+    /// This is the preferred boundary for backends that can consume MLX
+    /// affine weights. Quantized vectors and non-matrix tensors remain F32,
+    /// while eligible matrices never pass through a full F32 materialization.
+    /// Tensors are delivered in the order of `names`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a tensor is missing or malformed, the model
+    /// changed, the requested affine parameters are unsupported, or the
+    /// callback fails.
+    pub fn for_each_tensor<F, E>(
+        &self,
+        names: &[&str],
+        group_size: usize,
+        bits: usize,
+        mut callback: F,
+    ) -> Result<(), E>
+    where
+        F: FnMut(&str, LoadedTensor) -> Result<(), E>,
+        E: From<ModelError>,
+    {
+        validate_affine_quantization(group_size, bits).map_err(E::from)?;
+        let descriptors = names
+            .iter()
+            .map(|name| {
+                self.tensor(name)
+                    .ok_or_else(|| ModelError::TensorNotFound((*name).to_owned()))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(E::from)?;
+        let mapped = map_model(&self.path, self.max_file_bytes).map_err(E::from)?;
+        let bytes = mapped.as_bytes();
+        if digest_bytes(bytes) != self.digest {
+            return Err(E::from(ModelError::ContentChanged));
+        }
+        for descriptor in descriptors {
+            let loaded = if affine_quantized_candidate(descriptor, group_size) {
+                materialize_affine_quantized(bytes, descriptor, group_size, bits)
+                    .map(LoadedTensor::AffineQuantized)
+                    .map_err(E::from)?
+            } else {
+                Self::materialize_f32(bytes, descriptor)
+                    .map(LoadedTensor::F32)
+                    .map_err(E::from)?
+            };
+            callback(&descriptor.name, loaded)?;
+        }
+        Ok(())
+    }
+
     /// Computes a row-vector matrix product directly from a quantized GGUF
     /// matrix without materializing the matrix as F32 values.
     ///
@@ -708,6 +862,170 @@ fn decode_bf16(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
         .map(|chunk| u32::from(u16::from_le_bytes(*chunk)) << 16)
         .map(f32::from_bits)
         .collect())
+}
+
+fn validate_affine_quantization(group_size: usize, bits: usize) -> Result<(), ModelError> {
+    if !matches!(group_size, 32 | 64 | 128) {
+        return Err(ModelError::Shape(
+            "MLX affine group size must be 32, 64, or 128".to_owned(),
+        ));
+    }
+    if !matches!(bits, 2 | 3 | 4 | 5 | 6 | 8) {
+        return Err(ModelError::Shape(
+            "MLX affine bit width must be 2, 3, 4, 5, 6, or 8".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn affine_quantized_candidate(descriptor: &TensorDescriptor, group_size: usize) -> bool {
+    descriptor.shape.len() == 2
+        && quantized_block_layout(descriptor.value_type).is_some()
+        && descriptor.shape[0].is_multiple_of(group_size)
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::similar_names,
+    clippy::too_many_lines
+)]
+fn materialize_affine_quantized(
+    bytes: &[u8],
+    descriptor: &TensorDescriptor,
+    group_size: usize,
+    bits: usize,
+) -> Result<AffineQuantizedMatrix, ModelError> {
+    validate_affine_quantization(group_size, bits)?;
+    let (input, output) = match descriptor.shape.as_slice() {
+        [input, output] => (*input, *output),
+        shape => {
+            return Err(ModelError::Shape(format!(
+                "MLX affine quantization requires a rank-2 matrix, got {shape:?}"
+            )));
+        }
+    };
+    if !input.is_multiple_of(group_size) {
+        return Err(ModelError::Shape(format!(
+            "MLX affine input dimension {input} is not divisible by group size {group_size}"
+        )));
+    }
+    let (block_values, block_bytes) =
+        quantized_block_layout(descriptor.value_type).ok_or_else(|| {
+            ModelError::UnsupportedTensorType {
+                name: descriptor.name.clone(),
+                value_type: descriptor.value_type,
+            }
+        })?;
+    if !input.is_multiple_of(block_values) {
+        return Err(ModelError::Shape(format!(
+            "quantized matrix rows must be a multiple of {block_values}"
+        )));
+    }
+    let expected_bytes = input
+        .checked_mul(output)
+        .and_then(|elements| elements.checked_div(block_values))
+        .and_then(|blocks| blocks.checked_mul(block_bytes))
+        .ok_or_else(|| ModelError::Shape("quantized matrix byte length overflows".to_owned()))?;
+    if usize::try_from(descriptor.byte_len).ok() != Some(expected_bytes) {
+        return Err(ModelError::Shape(format!(
+            "quantized matrix byte length {}, expected {expected_bytes}",
+            descriptor.byte_len
+        )));
+    }
+    let start = usize::try_from(descriptor.byte_offset)
+        .map_err(|_| ModelError::Shape("tensor offset exceeds usize".to_owned()))?;
+    let end = start
+        .checked_add(expected_bytes)
+        .ok_or_else(|| ModelError::Shape("tensor range overflows usize".to_owned()))?;
+    let tensor_bytes = bytes
+        .get(start..end)
+        .ok_or_else(|| ModelError::Parse("tensor range is outside the file".to_owned()))?;
+    let packed_columns = input
+        .checked_mul(bits)
+        .and_then(|values| values.checked_div(32))
+        .ok_or_else(|| ModelError::Shape("MLX packed matrix shape overflows".to_owned()))?;
+    let groups = input / group_size;
+    let packed_len = output
+        .checked_mul(packed_columns)
+        .ok_or_else(|| ModelError::Shape("MLX packed matrix length overflows".to_owned()))?;
+    let affine_len = output
+        .checked_mul(groups)
+        .ok_or_else(|| ModelError::Shape("MLX affine parameter length overflows".to_owned()))?;
+    let mut packed = vec![0_u32; packed_len];
+    let mut scales = Vec::with_capacity(affine_len);
+    let mut biases = Vec::with_capacity(affine_len);
+    let n_bins = f32::from((1_u16 << bits) - 1);
+    for output_index in 0..output {
+        for group_index in 0..groups {
+            let group_start = group_index * group_size;
+            let mut minimum = f32::INFINITY;
+            let mut maximum = f32::NEG_INFINITY;
+            for offset in 0..group_size {
+                let index = output_index
+                    .checked_mul(input)
+                    .and_then(|base| base.checked_add(group_start + offset))
+                    .ok_or_else(|| {
+                        ModelError::Shape("quantized matrix index overflows".to_owned())
+                    })?;
+                let value = quantized_value_at(descriptor.value_type, tensor_bytes, index)?;
+                if !value.is_finite() {
+                    return Err(ModelError::Shape(
+                        "quantized matrix contains a non-finite value".to_owned(),
+                    ));
+                }
+                minimum = minimum.min(value);
+                maximum = maximum.max(value);
+            }
+            let mut scale = ((maximum - minimum) / n_bins).max(1e-7);
+            let side = minimum.abs() > maximum.abs();
+            let edge = if side { minimum } else { maximum };
+            if !side {
+                scale = -scale;
+            }
+            let q0 = (edge / scale).round();
+            let bias = if q0 == 0.0 { 0.0 } else { edge };
+            if q0 != 0.0 {
+                scale = edge / q0;
+            }
+            if !scale.is_finite() || !bias.is_finite() {
+                return Err(ModelError::Shape(
+                    "MLX affine parameters are non-finite".to_owned(),
+                ));
+            }
+            scales.push(scale);
+            biases.push(bias);
+            let packed_start =
+                output_index * packed_columns + group_index * (group_size * bits / 32);
+            for offset in 0..group_size {
+                let index = output_index
+                    .checked_mul(input)
+                    .and_then(|base| base.checked_add(group_start + offset))
+                    .ok_or_else(|| {
+                        ModelError::Shape("quantized matrix index overflows".to_owned())
+                    })?;
+                let value = quantized_value_at(descriptor.value_type, tensor_bytes, index)?;
+                let quantized = ((value - bias) / scale).round().clamp(0.0, n_bins) as u32;
+                let bit_offset = offset * bits;
+                let word = packed_start + bit_offset / 32;
+                let shift = bit_offset % 32;
+                packed[word] |= quantized << shift;
+                if shift + bits > 32 {
+                    packed[word + 1] |= quantized >> (32 - shift);
+                }
+            }
+        }
+    }
+    Ok(AffineQuantizedMatrix {
+        rows: output,
+        columns: input,
+        group_size,
+        bits,
+        packed,
+        scales,
+        biases,
+    })
 }
 
 fn quantized_block_layout(value_type: TensorType) -> Option<(usize, usize)> {
@@ -1681,6 +1999,53 @@ mod tests {
                 .unwrap(),
             &[32.0, 64.0]
         );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn converts_q4_0_matrix_directly_to_mlx_affine_layout() {
+        let mut encoded = vec![0x00, 0x3c];
+        encoded.extend((0_u8..16).map(|value| value | (value << 4)));
+        let path = write_fixture(&fixture(2, &[32, 1], &encoded));
+        let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
+        let quantized = model.load_affine_quantized("probe.tensor", 32, 4).unwrap();
+        assert_eq!(quantized.rows(), 1);
+        assert_eq!(quantized.columns(), 32);
+        assert_eq!(quantized.group_size(), 32);
+        assert_eq!(quantized.bits(), 4);
+        assert_eq!(quantized.scales(), &[1.0]);
+        assert_eq!(quantized.biases(), &[-8.0]);
+        assert_eq!(
+            quantized.packed(),
+            &[0x7654_3210, 0xfedc_ba98, 0x7654_3210, 0xfedc_ba98]
+        );
+
+        let names = ["probe.tensor"];
+        let mut observed = None;
+        model
+            .for_each_tensor(&names, 32, 4, |_, tensor| {
+                observed = Some(tensor);
+                Ok::<(), ModelError>(())
+            })
+            .unwrap();
+        assert!(matches!(observed, Some(LoadedTensor::AffineQuantized(_))));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_unsupported_mlx_affine_parameters() {
+        let mut encoded = vec![0x00, 0x3c];
+        encoded.extend(std::iter::repeat_n(0, 16));
+        let path = write_fixture(&fixture(2, &[32, 1], &encoded));
+        let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
+        assert!(matches!(
+            model.load_affine_quantized("probe.tensor", 16, 4),
+            Err(ModelError::Shape(_))
+        ));
+        assert!(matches!(
+            model.load_affine_quantized("probe.tensor", 32, 7),
+            Err(ModelError::Shape(_))
+        ));
         fs::remove_file(path).unwrap();
     }
 
