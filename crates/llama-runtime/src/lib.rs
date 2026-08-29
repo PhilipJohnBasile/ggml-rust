@@ -1913,8 +1913,10 @@ impl CpuMatrix {
 struct LayerWeights {
     attn_norm: Tensor,
     attn_q: CpuMatrix,
+    attn_q_norm: Option<Vec<f32>>,
     attn_q_bias: Option<Vec<f32>>,
     attn_k: CpuMatrix,
+    attn_k_norm: Option<Vec<f32>>,
     attn_k_bias: Option<Vec<f32>>,
     attn_v: CpuMatrix,
     attn_v_bias: Option<Vec<f32>>,
@@ -1980,6 +1982,12 @@ impl LlamaCpuModel {
                 format!("{prefix}.attn_norm.weight"),
                 format!("{prefix}.ffn_norm.weight"),
             ]);
+            for suffix in ["attn_q_norm.weight", "attn_k_norm.weight"] {
+                let name = format!("{prefix}.{suffix}");
+                if model.model.tensor(&name).is_some() {
+                    vector_names.push(name);
+                }
+            }
             for suffix in [
                 "attn_q.bias",
                 "attn_k.bias",
@@ -2087,12 +2095,22 @@ impl LlamaCpuModel {
             layers.push(LayerWeights {
                 attn_norm: take_vector(&mut vectors, &format!("{prefix}.attn_norm.weight"))?,
                 attn_q: take_matrix(&mut matrices, &format!("{prefix}.attn_q.weight"))?,
+                attn_q_norm: take_optional_bias(
+                    &mut vectors,
+                    &format!("{prefix}.attn_q_norm.weight"),
+                    config.key_length,
+                )?,
                 attn_q_bias: take_optional_bias(
                     &mut vectors,
                     &format!("{prefix}.attn_q.bias"),
                     config.head_count * config.key_length,
                 )?,
                 attn_k: take_matrix(&mut matrices, &format!("{prefix}.attn_k.weight"))?,
+                attn_k_norm: take_optional_bias(
+                    &mut vectors,
+                    &format!("{prefix}.attn_k_norm.weight"),
+                    config.key_length,
+                )?,
                 attn_k_bias: take_optional_bias(
                     &mut vectors,
                     &format!("{prefix}.attn_k.bias"),
@@ -2154,6 +2172,12 @@ impl LlamaCpuModel {
                 "ffn_up.weight",
             ] {
                 names.push(format!("{prefix}.{suffix}"));
+            }
+            for suffix in ["attn_q_norm.weight", "attn_k_norm.weight"] {
+                let name = format!("{prefix}.{suffix}");
+                if model.model.tensor(&name).is_some() {
+                    names.push(name);
+                }
             }
             for suffix in [
                 "attn_q.bias",
@@ -2221,6 +2245,11 @@ impl LlamaCpuModel {
                             ))
                         })?,
                 )?,
+                attn_q_norm: take_optional_loaded_bias(
+                    &mut loaded,
+                    &format!("{prefix}.attn_q_norm.weight"),
+                    config.key_length,
+                )?,
                 attn_q_bias: take_optional_loaded_bias(
                     &mut loaded,
                     &format!("{prefix}.attn_q.bias"),
@@ -2234,6 +2263,11 @@ impl LlamaCpuModel {
                                 "GGUF loader did not return {prefix}.attn_k.weight"
                             ))
                         })?,
+                )?,
+                attn_k_norm: take_optional_loaded_bias(
+                    &mut loaded,
+                    &format!("{prefix}.attn_k_norm.weight"),
+                    config.key_length,
                 )?,
                 attn_k_bias: take_optional_loaded_bias(
                     &mut loaded,
@@ -2652,6 +2686,22 @@ impl<'a> LlamaSession<'a> {
                 &mut value_values,
                 layer.attn_v_bias.as_deref(),
                 "attention value",
+            )?;
+            apply_projection_rms_norm(
+                &mut query_values,
+                layer.attn_q_norm.as_deref(),
+                self.model.config.head_count,
+                head_dim,
+                self.model.config.rms_norm_epsilon,
+                "attention query",
+            )?;
+            apply_projection_rms_norm(
+                &mut key_values,
+                layer.attn_k_norm.as_deref(),
+                self.model.config.head_count_kv,
+                head_dim,
+                self.model.config.rms_norm_epsilon,
+                "attention key",
             )?;
             apply_rope_with_scaling(
                 &mut query_values,
@@ -3308,6 +3358,52 @@ fn add_projection_bias(
         return Err(LlamaError::Tensor(format!(
             "{operation} projection is not finite after bias"
         )));
+    }
+    Ok(())
+}
+
+fn apply_projection_rms_norm(
+    values: &mut [f32],
+    weight: Option<&[f32]>,
+    head_count: usize,
+    head_dim: usize,
+    epsilon: f32,
+    operation: &str,
+) -> Result<(), LlamaError> {
+    let Some(weight) = weight else {
+        return Ok(());
+    };
+    if head_dim == 0
+        || values.len() != head_count.saturating_mul(head_dim)
+        || weight.len() != head_dim
+    {
+        return Err(LlamaError::Tensor(format!(
+            "{operation} RMSNorm shape does not match projection"
+        )));
+    }
+    if !epsilon.is_finite() || epsilon < 0.0 {
+        return Err(LlamaError::InvalidConfig(
+            "RMSNorm epsilon must be finite and nonnegative".to_owned(),
+        ));
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let scale = 1.0 / head_dim as f32;
+    for row in values.chunks_exact_mut(head_dim) {
+        let mean_square = row.iter().map(|value| value * value).sum::<f32>() * scale;
+        let denominator = (mean_square + epsilon).sqrt();
+        if !denominator.is_finite() || denominator == 0.0 {
+            return Err(LlamaError::Tensor(format!(
+                "{operation} RMSNorm produced a non-finite scale"
+            )));
+        }
+        for (value, factor) in row.iter_mut().zip(weight) {
+            *value = *value / denominator * *factor;
+            if !value.is_finite() {
+                return Err(LlamaError::Tensor(format!(
+                    "{operation} RMSNorm produced a non-finite value"
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -4039,6 +4135,18 @@ mod tests {
             sample_logits(&[10.0, 0.0, 0.0], config, &mut rng).unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn projection_rms_norm_scales_each_attention_head() {
+        let mut values = vec![3.0, 4.0, 1.0, 2.0];
+        let weight = [2.0, 0.5];
+        apply_projection_rms_norm(&mut values, Some(&weight), 2, 2, 0.0, "attention query")
+            .unwrap();
+        assert!((values[0] - 1.697_056_3).abs() < 1.0e-6);
+        assert!((values[1] - 0.565_685_45).abs() < 1.0e-6);
+        assert!((values[2] - 1.264_911).abs() < 1.0e-6);
+        assert!((values[3] - 0.632_455_5).abs() < 1.0e-6);
     }
 
     #[test]
