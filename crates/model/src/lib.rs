@@ -108,6 +108,15 @@ impl AffineQuantizedMatrix {
 }
 
 impl QuantizedMatrix {
+    /// Returns the encoded GGUF bytes in their original block format.
+    ///
+    /// The slice is suitable for a device-native quantized kernel and avoids
+    /// materializing the complete matrix as F32 values.
+    #[must_use]
+    pub fn encoded_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     /// Number of input values expected by a row-vector product.
     #[must_use]
     pub const fn rows(&self) -> usize {
