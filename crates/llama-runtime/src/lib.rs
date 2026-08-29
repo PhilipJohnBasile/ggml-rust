@@ -440,7 +440,21 @@ impl LlamaModel {
     ///
     /// Returns an error when a required tensor cannot be materialized as F32.
     pub fn load_cpu(&self) -> Result<LlamaCpuModel, LlamaError> {
-        LlamaCpuModel::load(self)
+        LlamaCpuModel::load(self, false)
+    }
+
+    /// Loads the model while retaining supported rank-2 quantized matrices in
+    /// encoded form for direct CPU products and embedding column lookup.
+    ///
+    /// The default [`Self::load_cpu`] path expands weights to F32 for faster
+    /// CPU execution. This explicit mode avoids a complete F32 expansion and
+    /// is useful for memory-bounded callers and backend parity checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a required tensor cannot be loaded or validated.
+    pub fn load_cpu_quantized(&self) -> Result<LlamaCpuModel, LlamaError> {
+        LlamaCpuModel::load(self, true)
     }
 
     /// Loads the model tokenizer tables from bounded GGUF metadata.
@@ -781,11 +795,12 @@ enum CpuMatrix {
 }
 
 impl CpuMatrix {
-    fn from_model(model: &GgufModel, name: &str) -> Result<Self, LlamaError> {
+    fn from_model(model: &GgufModel, name: &str, use_quantized: bool) -> Result<Self, LlamaError> {
         let descriptor = model
             .tensor(name)
             .ok_or_else(|| LlamaError::MissingTensor(name.to_owned()))?;
-        if descriptor.shape().len() == 2
+        if use_quantized
+            && descriptor.shape().len() == 2
             && matches!(
                 descriptor.value_type().raw(),
                 2 | 3 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15
@@ -863,18 +878,20 @@ pub struct LlamaCpuModel {
     output_norm: Tensor,
     layers: Vec<LayerWeights>,
     tokenizer: Option<LlamaTokenizer>,
+    use_quantized: bool,
 }
 
 impl LlamaCpuModel {
-    fn load(model: &LlamaModel) -> Result<Self, LlamaError> {
+    fn load(model: &LlamaModel, use_quantized: bool) -> Result<Self, LlamaError> {
         let config = model.config.clone();
         let tokenizer = match model.tokenizer() {
             Ok(tokenizer) => Some(tokenizer),
             Err(LlamaError::MissingMetadata("tokenizer.ggml.tokens")) => None,
             Err(error) => return Err(error),
         };
-        let token_embedding = CpuMatrix::from_model(&model.model, "token_embd.weight")?;
-        let output = CpuMatrix::from_model(&model.model, "output.weight")?;
+        let token_embedding =
+            CpuMatrix::from_model(&model.model, "token_embd.weight", use_quantized)?;
+        let output = CpuMatrix::from_model(&model.model, "output.weight", use_quantized)?;
         let output_norm = model.model.load_f32("output_norm.weight")?;
         let mut layers = Vec::with_capacity(config.block_count);
         for layer in 0..config.block_count {
@@ -883,23 +900,42 @@ impl LlamaCpuModel {
                 attn_norm: model
                     .model
                     .load_f32(&format!("{prefix}.attn_norm.weight"))?,
-                attn_q: CpuMatrix::from_model(&model.model, &format!("{prefix}.attn_q.weight"))?,
-                attn_k: CpuMatrix::from_model(&model.model, &format!("{prefix}.attn_k.weight"))?,
-                attn_v: CpuMatrix::from_model(&model.model, &format!("{prefix}.attn_v.weight"))?,
+                attn_q: CpuMatrix::from_model(
+                    &model.model,
+                    &format!("{prefix}.attn_q.weight"),
+                    use_quantized,
+                )?,
+                attn_k: CpuMatrix::from_model(
+                    &model.model,
+                    &format!("{prefix}.attn_k.weight"),
+                    use_quantized,
+                )?,
+                attn_v: CpuMatrix::from_model(
+                    &model.model,
+                    &format!("{prefix}.attn_v.weight"),
+                    use_quantized,
+                )?,
                 attn_output: CpuMatrix::from_model(
                     &model.model,
                     &format!("{prefix}.attn_output.weight"),
+                    use_quantized,
                 )?,
                 ffn_norm: model.model.load_f32(&format!("{prefix}.ffn_norm.weight"))?,
                 ffn_gate: CpuMatrix::from_model(
                     &model.model,
                     &format!("{prefix}.ffn_gate.weight"),
+                    use_quantized,
                 )?,
                 ffn_down: CpuMatrix::from_model(
                     &model.model,
                     &format!("{prefix}.ffn_down.weight"),
+                    use_quantized,
                 )?,
-                ffn_up: CpuMatrix::from_model(&model.model, &format!("{prefix}.ffn_up.weight"))?,
+                ffn_up: CpuMatrix::from_model(
+                    &model.model,
+                    &format!("{prefix}.ffn_up.weight"),
+                    use_quantized,
+                )?,
             });
         }
         Ok(Self {
@@ -909,6 +945,7 @@ impl LlamaCpuModel {
             output_norm,
             layers,
             tokenizer,
+            use_quantized,
         })
     }
 
@@ -922,6 +959,13 @@ impl LlamaCpuModel {
     #[must_use]
     pub const fn tokenizer(&self) -> Option<&LlamaTokenizer> {
         self.tokenizer.as_ref()
+    }
+
+    /// Returns whether supported quantized matrices remain encoded in this
+    /// CPU model rather than being expanded to F32.
+    #[must_use]
+    pub const fn uses_quantized_weights(&self) -> bool {
+        self.use_quantized
     }
 
     /// Creates an empty KV-cache session for this model.
