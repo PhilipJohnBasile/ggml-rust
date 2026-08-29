@@ -717,8 +717,11 @@ impl GgufModel {
 
     /// Materializes one tensor as F32 values in the checked CPU tensor engine.
     ///
-    /// F32, F16, BF16, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q2_K`, `Q3_K`, `Q4_K`,
-    /// `Q5_K`, `Q6_K`, `Q8_0`, `Q8_K`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ4_NL`, `IQ4_XS`, `MXFP4`, `NVFP4`, `TQ1_0`, and `TQ2_0` storage are supported. Quantized
+    /// F32, F16, BF16, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q8_1`,
+    /// `Q2_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_K`, `IQ1_S`,
+    /// `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`,
+    /// `IQ4_XS`, `MXFP4`, `NVFP4`, `TQ1_0`, and `TQ2_0` storage are supported.
+    /// Quantized
     /// formats are
     /// decoded on the CPU into owned F32 values; the encoded bytes remain
     /// content-bound to the digest captured by [`Self::open`].
@@ -891,7 +894,10 @@ impl GgufModel {
     /// GGML stores matrix values in column-major tensor order, so each output
     /// column is decoded and dotted against the input row. `Q4_0`, `Q4_1`,
     /// `Q5_0`, `Q5_1`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0`, `Q8_K`,
-    /// `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ4_NL`, `IQ4_XS`, `MXFP4`, `NVFP4`, `TQ1_0`, and `TQ2_0` are supported. The operation walks the encoded blocks directly
+    /// `Q2_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_K`, `IQ1_S`,
+    /// `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`,
+    /// `IQ4_XS`, `MXFP4`, `NVFP4`, `TQ1_0`, and `TQ2_0` are supported. The
+    /// operation walks the encoded blocks directly
     /// and does not allocate a temporary F32 matrix.
     ///
     /// # Errors
