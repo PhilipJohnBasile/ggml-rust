@@ -3,7 +3,7 @@
 use std::fmt;
 use std::path::Path;
 
-use ggml_model::{GgufModel, MetadataScalar, ModelError};
+use ggml_model::{GgufModel, MetadataScalar, ModelError, QuantizedMatrix};
 use ggml_tensor::{Tensor, TensorError};
 
 /// Validated architecture parameters for a Llama decoder.
@@ -775,28 +775,91 @@ fn parse_byte_fallback(token: &str) -> Option<u8> {
 }
 
 #[derive(Debug, Clone)]
+enum CpuMatrix {
+    F32(Tensor),
+    Quantized(QuantizedMatrix),
+}
+
+impl CpuMatrix {
+    fn from_model(model: &GgufModel, name: &str) -> Result<Self, LlamaError> {
+        let descriptor = model
+            .tensor(name)
+            .ok_or_else(|| LlamaError::MissingTensor(name.to_owned()))?;
+        if descriptor.shape().len() == 2
+            && matches!(
+                descriptor.value_type().raw(),
+                2 | 3 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15
+            )
+        {
+            return Ok(Self::Quantized(model.load_quantized(name)?));
+        }
+        Ok(Self::F32(transpose_ggml_matrix(model.load_f32(name)?)?))
+    }
+
+    fn matmul(&self, input: &[f32]) -> Result<Vec<f32>, LlamaError> {
+        match self {
+            Self::F32(tensor) => row_tensor(input.len(), input.to_vec())?
+                .matmul(tensor)
+                .map(Tensor::into_data)
+                .map_err(LlamaError::from),
+            Self::Quantized(matrix) => matrix.matmul_f32(input).map_err(LlamaError::from),
+        }
+    }
+
+    fn matmul_tensor(&self, input: &Tensor) -> Result<Tensor, LlamaError> {
+        let data = self.matmul(input.data())?;
+        Tensor::from_data([1, self.shape()[1]], data).map_err(LlamaError::from)
+    }
+
+    fn column(&self, column: usize) -> Result<Vec<f32>, LlamaError> {
+        match self {
+            Self::F32(tensor) => {
+                let shape = tensor.shape();
+                if shape.len() != 2 || column >= shape[1] {
+                    return Err(LlamaError::Tensor(format!(
+                        "matrix column {column} is outside shape {shape:?}"
+                    )));
+                }
+                Ok((0..shape[0])
+                    .map(|row| tensor.data()[row * shape[1] + column])
+                    .collect())
+            }
+            Self::Quantized(matrix) => matrix.column(column).map_err(LlamaError::from),
+        }
+    }
+
+    fn shape(&self) -> [usize; 2] {
+        match self {
+            Self::F32(tensor) => [tensor.shape()[0], tensor.shape()[1]],
+            Self::Quantized(matrix) => [matrix.rows(), matrix.columns()],
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct LayerWeights {
     attn_norm: Tensor,
-    attn_q: Tensor,
-    attn_k: Tensor,
-    attn_v: Tensor,
-    attn_output: Tensor,
+    attn_q: CpuMatrix,
+    attn_k: CpuMatrix,
+    attn_v: CpuMatrix,
+    attn_output: CpuMatrix,
     ffn_norm: Tensor,
-    ffn_gate: Tensor,
-    ffn_down: Tensor,
-    ffn_up: Tensor,
+    ffn_gate: CpuMatrix,
+    ffn_down: CpuMatrix,
+    ffn_up: CpuMatrix,
 }
 
 /// A CPU-resident Llama model with checked incremental decoding.
 ///
-/// The CPU path covers bounded tokenizer loading, RoPE-aware causal attention,
-/// per-layer KV caching, and deterministic greedy generation. It remains a
-/// correctness reference until optimized sampling and Apple GPU kernels land.
+/// The CPU path covers bounded tokenizer loading, direct products for
+/// supported quantized matrices, RoPE-aware causal attention, per-layer KV
+/// caching, and deterministic seeded sampling. It remains the correctness
+/// fallback while Apple GPU kernels and broader architecture coverage evolve.
 #[derive(Debug, Clone)]
 pub struct LlamaCpuModel {
     config: LlamaConfig,
-    token_embedding: Tensor,
-    output: Tensor,
+    token_embedding: CpuMatrix,
+    output: CpuMatrix,
     output_norm: Tensor,
     layers: Vec<LayerWeights>,
     tokenizer: Option<LlamaTokenizer>,
@@ -810,57 +873,33 @@ impl LlamaCpuModel {
             Err(LlamaError::MissingMetadata("tokenizer.ggml.tokens")) => None,
             Err(error) => return Err(error),
         };
-        let mut names = vec![
-            "token_embd.weight".to_owned(),
-            "output.weight".to_owned(),
-            "output_norm.weight".to_owned(),
-        ];
-        for layer in 0..config.block_count {
-            let prefix = format!("blk.{layer}");
-            for suffix in [
-                "attn_norm.weight",
-                "attn_q.weight",
-                "attn_k.weight",
-                "attn_v.weight",
-                "attn_output.weight",
-                "ffn_norm.weight",
-                "ffn_gate.weight",
-                "ffn_down.weight",
-                "ffn_up.weight",
-            ] {
-                names.push(format!("{prefix}.{suffix}"));
-            }
-        }
-        let name_refs = names.iter().map(String::as_str).collect::<Vec<_>>();
-        let mut loaded = (0..names.len())
-            .map(|_| None)
-            .collect::<Vec<Option<Tensor>>>();
-        let mut next = 0;
-        model.model.for_each_f32(&name_refs, |_name, tensor| {
-            let slot = loaded.get_mut(next).ok_or_else(|| {
-                LlamaError::Tensor("GGUF loader returned an unexpected tensor".to_owned())
-            })?;
-            *slot = Some(tensor);
-            next += 1;
-            Ok::<(), LlamaError>(())
-        })?;
-        let mut loaded = loaded.into_iter();
-        let token_embedding = next_matrix(&mut loaded, "token_embd.weight")?;
-        let output = next_matrix(&mut loaded, "output.weight")?;
-        let output_norm = next_tensor(&mut loaded, "output_norm.weight")?;
+        let token_embedding = CpuMatrix::from_model(&model.model, "token_embd.weight")?;
+        let output = CpuMatrix::from_model(&model.model, "output.weight")?;
+        let output_norm = model.model.load_f32("output_norm.weight")?;
         let mut layers = Vec::with_capacity(config.block_count);
         for layer in 0..config.block_count {
             let prefix = format!("blk.{layer}");
             layers.push(LayerWeights {
-                attn_norm: next_tensor(&mut loaded, &format!("{prefix}.attn_norm.weight"))?,
-                attn_q: next_matrix(&mut loaded, &format!("{prefix}.attn_q.weight"))?,
-                attn_k: next_matrix(&mut loaded, &format!("{prefix}.attn_k.weight"))?,
-                attn_v: next_matrix(&mut loaded, &format!("{prefix}.attn_v.weight"))?,
-                attn_output: next_matrix(&mut loaded, &format!("{prefix}.attn_output.weight"))?,
-                ffn_norm: next_tensor(&mut loaded, &format!("{prefix}.ffn_norm.weight"))?,
-                ffn_gate: next_matrix(&mut loaded, &format!("{prefix}.ffn_gate.weight"))?,
-                ffn_down: next_matrix(&mut loaded, &format!("{prefix}.ffn_down.weight"))?,
-                ffn_up: next_matrix(&mut loaded, &format!("{prefix}.ffn_up.weight"))?,
+                attn_norm: model
+                    .model
+                    .load_f32(&format!("{prefix}.attn_norm.weight"))?,
+                attn_q: CpuMatrix::from_model(&model.model, &format!("{prefix}.attn_q.weight"))?,
+                attn_k: CpuMatrix::from_model(&model.model, &format!("{prefix}.attn_k.weight"))?,
+                attn_v: CpuMatrix::from_model(&model.model, &format!("{prefix}.attn_v.weight"))?,
+                attn_output: CpuMatrix::from_model(
+                    &model.model,
+                    &format!("{prefix}.attn_output.weight"),
+                )?,
+                ffn_norm: model.model.load_f32(&format!("{prefix}.ffn_norm.weight"))?,
+                ffn_gate: CpuMatrix::from_model(
+                    &model.model,
+                    &format!("{prefix}.ffn_gate.weight"),
+                )?,
+                ffn_down: CpuMatrix::from_model(
+                    &model.model,
+                    &format!("{prefix}.ffn_down.weight"),
+                )?,
+                ffn_up: CpuMatrix::from_model(&model.model, &format!("{prefix}.ffn_up.weight"))?,
             });
         }
         Ok(Self {
@@ -1061,10 +1100,7 @@ impl<'a> LlamaSession<'a> {
             )));
         }
         let embedding_width = self.model.config.embedding_length;
-        let embedding = self.model.token_embedding.data();
-        let hidden = (0..embedding_width)
-            .map(|row| embedding[row * self.model.config.vocab_size + token_id])
-            .collect::<Vec<_>>();
+        let hidden = self.model.token_embedding.column(token_id)?;
         let mut hidden = row_tensor(embedding_width, hidden)?;
         let head_dim = embedding_width / self.model.config.head_count;
         #[allow(clippy::cast_precision_loss)]
@@ -1077,9 +1113,9 @@ impl<'a> LlamaSession<'a> {
                         embedding_width,
                         layer.attn_norm.data().to_vec(),
                     )?)?;
-            let query = normalized.matmul(&layer.attn_q)?;
-            let key = normalized.matmul(&layer.attn_k)?;
-            let value = normalized.matmul(&layer.attn_v)?;
+            let query = layer.attn_q.matmul_tensor(&normalized)?;
+            let key = layer.attn_k.matmul_tensor(&normalized)?;
+            let value = layer.attn_v.matmul_tensor(&normalized)?;
             let mut query_values = query.into_data();
             let mut key_values = key.into_data();
             let value_values = value.into_data();
@@ -1154,7 +1190,9 @@ impl<'a> LlamaSession<'a> {
                     }
                 }
             }
-            let attended = row_tensor(embedding_width, attended)?.matmul(&layer.attn_output)?;
+            let attended = layer
+                .attn_output
+                .matmul_tensor(&row_tensor(embedding_width, attended)?)?;
             hidden = hidden.add(&attended)?;
             let normalized =
                 hidden
@@ -1163,9 +1201,9 @@ impl<'a> LlamaSession<'a> {
                         embedding_width,
                         layer.ffn_norm.data().to_vec(),
                     )?)?;
-            let gate = normalized.matmul(&layer.ffn_gate)?.silu()?;
-            let up = normalized.matmul(&layer.ffn_up)?;
-            let feed_forward = gate.mul(&up)?.matmul(&layer.ffn_down)?;
+            let gate = layer.ffn_gate.matmul_tensor(&normalized)?.silu()?;
+            let up = layer.ffn_up.matmul_tensor(&normalized)?;
+            let feed_forward = layer.ffn_down.matmul_tensor(&gate.mul(&up)?)?;
             hidden = hidden.add(&feed_forward)?;
         }
         let normalized = hidden
@@ -1174,7 +1212,7 @@ impl<'a> LlamaSession<'a> {
                 embedding_width,
                 self.model.output_norm.data().to_vec(),
             )?)?;
-        let logits = normalized.matmul(&self.model.output)?.into_data();
+        let logits = self.model.output.matmul_tensor(&normalized)?.into_data();
         self.position += 1;
         Ok(logits)
     }
@@ -1457,23 +1495,6 @@ fn optional_f32_value(
     value
         .map(|value| as_f32(value).map_err(|value| LlamaError::InvalidMetadata { key, value }))
         .transpose()
-}
-
-fn next_tensor(
-    tensors: &mut impl Iterator<Item = Option<Tensor>>,
-    name: &str,
-) -> Result<Tensor, LlamaError> {
-    tensors
-        .next()
-        .flatten()
-        .ok_or_else(|| LlamaError::Tensor(format!("GGUF loader did not return {name}")))
-}
-
-fn next_matrix(
-    tensors: &mut impl Iterator<Item = Option<Tensor>>,
-    name: &str,
-) -> Result<Tensor, LlamaError> {
-    transpose_ggml_matrix(next_tensor(tensors, name)?)
 }
 
 fn transpose_ggml_matrix(tensor: Tensor) -> Result<Tensor, LlamaError> {

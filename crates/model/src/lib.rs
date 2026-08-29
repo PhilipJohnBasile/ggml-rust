@@ -40,6 +40,20 @@ pub struct AffineQuantizedMatrix {
     biases: Vec<f32>,
 }
 
+/// An owned GGUF quantized matrix that can be used without F32 expansion.
+///
+/// GGML stores rank-2 matrices with the input dimension first and contiguous
+/// columns. The encoded block bytes are retained in their original format;
+/// callers can read one input column (for embeddings) or multiply a row vector
+/// directly against the matrix.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuantizedMatrix {
+    rows: usize,
+    columns: usize,
+    value_type: TensorType,
+    bytes: Vec<u8>,
+}
+
 /// Tensor data selected by [`GgufModel::for_each_tensor`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoadedTensor {
@@ -90,6 +104,110 @@ impl AffineQuantizedMatrix {
     #[must_use]
     pub fn biases(&self) -> &[f32] {
         &self.biases
+    }
+}
+
+impl QuantizedMatrix {
+    /// Number of input values expected by a row-vector product.
+    #[must_use]
+    pub const fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Number of output values produced by a row-vector product.
+    #[must_use]
+    pub const fn columns(&self) -> usize {
+        self.columns
+    }
+
+    /// Returns the GGUF quantization format used by this matrix.
+    #[must_use]
+    pub const fn value_type(&self) -> TensorType {
+        self.value_type
+    }
+
+    /// Returns one logical input column, preserving GGML matrix orientation.
+    ///
+    /// This is used for token embeddings, where the token id selects a column
+    /// and the returned values have length [`Self::rows`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `column` is outside the matrix or a decoded value
+    /// is malformed or non-finite.
+    pub fn column(&self, column: usize) -> Result<Vec<f32>, ModelError> {
+        if column >= self.columns {
+            return Err(ModelError::Shape(format!(
+                "quantized matrix column {column} is outside {} columns",
+                self.columns
+            )));
+        }
+        let mut output = Vec::with_capacity(self.rows);
+        for row in 0..self.rows {
+            let index = column
+                .checked_mul(self.rows)
+                .and_then(|base| base.checked_add(row))
+                .ok_or_else(|| ModelError::Shape("quantized matrix index overflows".to_owned()))?;
+            let value = quantized_value_at(self.value_type, &self.bytes, index)?;
+            if !value.is_finite() {
+                return Err(ModelError::Shape(
+                    "quantized matrix decoded a non-finite value".to_owned(),
+                ));
+            }
+            output.push(value);
+        }
+        Ok(output)
+    }
+
+    /// Computes a row-vector product directly from the encoded matrix.
+    ///
+    /// The input length must equal [`Self::rows`]. No complete F32 matrix is
+    /// allocated; each encoded weight is decoded once while accumulating its
+    /// output column.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when dimensions or encoded values are invalid, the
+    /// input is non-finite, or an accumulated result is non-finite.
+    pub fn matmul_f32(&self, input: &[f32]) -> Result<Vec<f32>, ModelError> {
+        if input.len() != self.rows {
+            return Err(ModelError::Shape(format!(
+                "quantized matmul input has {} values, expected {}",
+                input.len(),
+                self.rows
+            )));
+        }
+        if input.iter().any(|value| !value.is_finite()) {
+            return Err(ModelError::Shape(
+                "quantized matmul input contains a non-finite value".to_owned(),
+            ));
+        }
+        let mut output = Vec::with_capacity(self.columns);
+        for column in 0..self.columns {
+            let mut sum = 0.0_f32;
+            for (row, &value) in input.iter().enumerate() {
+                let index = column
+                    .checked_mul(self.rows)
+                    .and_then(|base| base.checked_add(row))
+                    .ok_or_else(|| {
+                        ModelError::Shape("quantized matrix index overflows".to_owned())
+                    })?;
+                let weight = quantized_value_at(self.value_type, &self.bytes, index)?;
+                if !weight.is_finite() {
+                    return Err(ModelError::Shape(
+                        "quantized matrix decoded a non-finite value".to_owned(),
+                    ));
+                }
+                sum += value * weight;
+                if !sum.is_finite() {
+                    return Err(ModelError::Shape(
+                        "quantized matmul produced a non-finite value".to_owned(),
+                    ));
+                }
+            }
+            output.push(sum);
+        }
+        Ok(output)
     }
 }
 
@@ -525,6 +643,69 @@ impl GgufModel {
             Ok::<(), ModelError>(())
         })?;
         Ok(tensors)
+    }
+
+    /// Loads one rank-2 quantized GGUF matrix without expanding it to F32.
+    ///
+    /// The encoded block bytes are copied into an owned buffer so the returned
+    /// matrix remains valid after the file mapping is released. This is the
+    /// CPU fallback boundary for direct quantized products and token lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tensor is missing, not a supported quantized
+    /// matrix, malformed, or the model bytes changed after indexing.
+    pub fn load_quantized(&self, name: &str) -> Result<QuantizedMatrix, ModelError> {
+        let descriptor = self
+            .tensor(name)
+            .ok_or_else(|| ModelError::TensorNotFound(name.to_owned()))?;
+        let (rows, columns) = match descriptor.shape.as_slice() {
+            [rows, columns] => (*rows, *columns),
+            shape => {
+                return Err(ModelError::Shape(format!(
+                    "quantized matrix requires rank 2, got {shape:?}"
+                )));
+            }
+        };
+        let (block_values, block_bytes) = quantized_block_layout(descriptor.value_type)
+            .ok_or_else(|| ModelError::UnsupportedTensorType {
+                name: descriptor.name.clone(),
+                value_type: descriptor.value_type,
+            })?;
+        if !rows.is_multiple_of(block_values) {
+            return Err(ModelError::Shape(format!(
+                "quantized matrix rows must be a multiple of {block_values}"
+            )));
+        }
+        let expected_bytes = rows
+            .checked_mul(columns)
+            .and_then(|elements| elements.checked_div(block_values))
+            .and_then(|blocks| blocks.checked_mul(block_bytes))
+            .ok_or_else(|| {
+                ModelError::Shape("quantized matrix byte length overflows".to_owned())
+            })?;
+        if usize::try_from(descriptor.byte_len).ok() != Some(expected_bytes) {
+            return Err(ModelError::Shape(format!(
+                "quantized matrix byte length {}, expected {expected_bytes}",
+                descriptor.byte_len
+            )));
+        }
+        self.with_validated_bytes(|bytes| {
+            let start = usize::try_from(descriptor.byte_offset)
+                .map_err(|_| ModelError::Shape("tensor offset exceeds usize".to_owned()))?;
+            let end = start
+                .checked_add(expected_bytes)
+                .ok_or_else(|| ModelError::Shape("tensor range overflows usize".to_owned()))?;
+            let tensor_bytes = bytes
+                .get(start..end)
+                .ok_or_else(|| ModelError::Parse("tensor range is outside the file".to_owned()))?;
+            Ok(QuantizedMatrix {
+                rows,
+                columns,
+                value_type: descriptor.value_type,
+                bytes: tensor_bytes.to_vec(),
+            })
+        })
     }
 
     /// Converts one rank-2 quantized GGUF matrix directly to MLX affine
@@ -1994,6 +2175,24 @@ mod tests {
                 .unwrap(),
             &[32.0, 64.0]
         );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn loads_quantized_matrix_for_columns_and_direct_products() {
+        let mut encoded = vec![0x00, 0x3c];
+        encoded.extend(std::iter::repeat_n(0x99, 16));
+        encoded.extend([0x00, 0x3c]);
+        encoded.extend(std::iter::repeat_n(0xaa, 16));
+        let path = write_fixture(&fixture(2, &[32, 2], &encoded));
+        let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
+        let matrix = model.load_quantized("probe.tensor").unwrap();
+        assert_eq!(matrix.rows(), 32);
+        assert_eq!(matrix.columns(), 2);
+        assert_eq!(matrix.value_type().raw(), 2);
+        assert_eq!(matrix.column(0).unwrap(), vec![1.0; 32]);
+        assert_eq!(matrix.column(1).unwrap(), vec![2.0; 32]);
+        assert_eq!(matrix.matmul_f32(&[1.0; 32]).unwrap(), &[32.0, 64.0]);
         fs::remove_file(path).unwrap();
     }
 
