@@ -1924,8 +1924,11 @@ struct LayerWeights {
     attn_output_bias: Option<Vec<f32>>,
     ffn_norm: Tensor,
     ffn_gate: CpuMatrix,
+    ffn_gate_bias: Option<Vec<f32>>,
     ffn_down: CpuMatrix,
+    ffn_down_bias: Option<Vec<f32>>,
     ffn_up: CpuMatrix,
+    ffn_up_bias: Option<Vec<f32>>,
 }
 
 /// A CPU-resident Llama model with checked incremental decoding.
@@ -1993,6 +1996,9 @@ impl LlamaCpuModel {
                 "attn_k.bias",
                 "attn_v.bias",
                 "attn_output.bias",
+                "ffn_gate.bias",
+                "ffn_down.bias",
+                "ffn_up.bias",
             ] {
                 let name = format!("{prefix}.{suffix}");
                 if model.model.tensor(&name).is_some() {
@@ -2130,8 +2136,23 @@ impl LlamaCpuModel {
                 )?,
                 ffn_norm: take_vector(&mut vectors, &format!("{prefix}.ffn_norm.weight"))?,
                 ffn_gate: take_matrix(&mut matrices, &format!("{prefix}.ffn_gate.weight"))?,
+                ffn_gate_bias: take_optional_bias(
+                    &mut vectors,
+                    &format!("{prefix}.ffn_gate.bias"),
+                    config.feed_forward_length,
+                )?,
                 ffn_down: take_matrix(&mut matrices, &format!("{prefix}.ffn_down.weight"))?,
+                ffn_down_bias: take_optional_bias(
+                    &mut vectors,
+                    &format!("{prefix}.ffn_down.bias"),
+                    config.embedding_length,
+                )?,
                 ffn_up: take_matrix(&mut matrices, &format!("{prefix}.ffn_up.weight"))?,
+                ffn_up_bias: take_optional_bias(
+                    &mut vectors,
+                    &format!("{prefix}.ffn_up.bias"),
+                    config.feed_forward_length,
+                )?,
             });
         }
         Ok(Self {
@@ -2184,6 +2205,9 @@ impl LlamaCpuModel {
                 "attn_k.bias",
                 "attn_v.bias",
                 "attn_output.bias",
+                "ffn_gate.bias",
+                "ffn_down.bias",
+                "ffn_up.bias",
             ] {
                 let name = format!("{prefix}.{suffix}");
                 if model.model.tensor(&name).is_some() {
@@ -2318,6 +2342,11 @@ impl LlamaCpuModel {
                             ))
                         })?,
                 )?,
+                ffn_gate_bias: take_optional_loaded_bias(
+                    &mut loaded,
+                    &format!("{prefix}.ffn_gate.bias"),
+                    config.feed_forward_length,
+                )?,
                 ffn_down: CpuMatrix::from_tensor(
                     loaded
                         .remove(&format!("{prefix}.ffn_down.weight"))
@@ -2327,6 +2356,11 @@ impl LlamaCpuModel {
                             ))
                         })?,
                 )?,
+                ffn_down_bias: take_optional_loaded_bias(
+                    &mut loaded,
+                    &format!("{prefix}.ffn_down.bias"),
+                    config.embedding_length,
+                )?,
                 ffn_up: CpuMatrix::from_tensor(
                     loaded
                         .remove(&format!("{prefix}.ffn_up.weight"))
@@ -2335,6 +2369,11 @@ impl LlamaCpuModel {
                                 "GGUF loader did not return {prefix}.ffn_up.weight"
                             ))
                         })?,
+                )?,
+                ffn_up_bias: take_optional_loaded_bias(
+                    &mut loaded,
+                    &format!("{prefix}.ffn_up.bias"),
+                    config.feed_forward_length,
                 )?,
             });
         }
@@ -2777,9 +2816,20 @@ impl<'a> LlamaSession<'a> {
                         embedding_width,
                         layer.ffn_norm.data().to_vec(),
                     )?)?;
-            let gate = layer.ffn_gate.matmul_tensor(&normalized)?.silu()?;
-            let up = layer.ffn_up.matmul_tensor(&normalized)?;
-            let feed_forward = layer.ffn_down.matmul_tensor(&gate.mul(&up)?)?;
+            let mut gate = layer.ffn_gate.matmul_tensor(&normalized)?.into_data();
+            add_projection_bias(&mut gate, layer.ffn_gate_bias.as_deref(), "FFN gate")?;
+            let gate =
+                Tensor::from_data([1, self.model.config.feed_forward_length], gate)?.silu()?;
+            let mut up = layer.ffn_up.matmul_tensor(&normalized)?.into_data();
+            add_projection_bias(&mut up, layer.ffn_up_bias.as_deref(), "FFN up")?;
+            let up = Tensor::from_data([1, self.model.config.feed_forward_length], up)?;
+            let mut feed_forward = layer.ffn_down.matmul_tensor(&gate.mul(&up)?)?.into_data();
+            add_projection_bias(
+                &mut feed_forward,
+                layer.ffn_down_bias.as_deref(),
+                "FFN down",
+            )?;
+            let feed_forward = Tensor::from_data([1, embedding_width], feed_forward)?;
             hidden = hidden.add(&feed_forward)?;
         }
         let normalized = hidden
@@ -3549,17 +3599,26 @@ fn validate_layout(model: &GgufModel, config: &LlamaConfig) -> Result<(), LlamaE
                 require_shape(model, &name, &[width])?;
             }
         }
-        for suffix in [
-            "attn_qkv.bias",
-            "ffn_gate.bias",
-            "ffn_down.bias",
-            "ffn_up.bias",
+        let name = format!("{prefix}.attn_qkv.bias");
+        if model.tensor(&name).is_some() {
+            return Err(LlamaError::InvalidConfig(format!(
+                "unsupported decoder bias tensor {name}"
+            )));
+        }
+        for (suffix, width) in [
+            ("ffn_gate.bias", config.feed_forward_length),
+            ("ffn_down.bias", config.embedding_length),
+            ("ffn_up.bias", config.feed_forward_length),
         ] {
             let name = format!("{prefix}.{suffix}");
             if model.tensor(&name).is_some() {
-                return Err(LlamaError::InvalidConfig(format!(
-                    "unsupported decoder bias tensor {name}"
-                )));
+                if architecture == "mistral3" {
+                    require_shape(model, &name, &[width])?;
+                } else {
+                    return Err(LlamaError::InvalidConfig(format!(
+                        "unsupported decoder bias tensor {name}"
+                    )));
+                }
             }
         }
     }
