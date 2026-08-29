@@ -709,7 +709,7 @@ impl GgufModel {
     /// Materializes one tensor as F32 values in the checked CPU tensor engine.
     ///
     /// F32, F16, BF16, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q2_K`, `Q3_K`, `Q4_K`,
-    /// `Q5_K`, `Q6_K`, `Q8_0`, and `Q8_K` storage are supported. Quantized
+    /// `Q5_K`, `Q6_K`, `Q8_0`, `Q8_K`, and `IQ2_XXS` storage are supported. Quantized
     /// formats are
     /// decoded on the CPU into owned F32 values; the encoded bytes remain
     /// content-bound to the digest captured by [`Self::open`].
@@ -881,8 +881,8 @@ impl GgufModel {
     /// The input must have the length of the descriptor's first dimension.
     /// GGML stores matrix values in column-major tensor order, so each output
     /// column is decoded and dotted against the input row. `Q4_0`, `Q4_1`,
-    /// `Q5_0`, `Q5_1`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0`, and
-    /// `Q8_K` are supported. The operation walks the encoded blocks directly
+    /// `Q5_0`, `Q5_1`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0`, `Q8_K`,
+    /// and `IQ2_XXS` are supported. The operation walks the encoded blocks directly
     /// and does not allocate a temporary F32 matrix.
     ///
     /// # Errors
@@ -1053,7 +1053,7 @@ impl GgufModel {
     fn materialize_f32(bytes: &[u8], descriptor: &TensorDescriptor) -> Result<Tensor, ModelError> {
         if !matches!(
             descriptor.value_type.raw(),
-            0 | 1 | 2 | 3 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15 | 30
+            0 | 1 | 2 | 3 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 30
         ) {
             return Err(ModelError::UnsupportedTensorType {
                 name: descriptor.name.clone(),
@@ -1080,6 +1080,268 @@ impl GgufModel {
     }
 }
 
+// The IQ2_XXS codebook is the fixed 256-entry lattice used by GGML. Each
+// entry packs eight unsigned 8-bit magnitudes in little-endian order.
+#[allow(clippy::unreadable_literal)]
+const IQ2_XXS_GRID: [u64; 256] = [
+    0x0808080808080808,
+    0x080808080808082b,
+    0x0808080808081919,
+    0x0808080808082b08,
+    0x0808080808082b2b,
+    0x0808080808190819,
+    0x0808080808191908,
+    0x08080808082b0808,
+    0x08080808082b082b,
+    0x08080808082b2b08,
+    0x08080808082b2b2b,
+    0x0808080819080819,
+    0x0808080819081908,
+    0x0808080819190808,
+    0x0808080819192b08,
+    0x08080808192b0819,
+    0x08080808192b1908,
+    0x080808082b080808,
+    0x080808082b08082b,
+    0x080808082b082b2b,
+    0x080808082b2b082b,
+    0x0808081908080819,
+    0x0808081908081908,
+    0x0808081908190808,
+    0x0808081908191919,
+    0x0808081919080808,
+    0x080808192b081908,
+    0x080808192b192b08,
+    0x0808082b08080808,
+    0x0808082b0808082b,
+    0x0808082b082b082b,
+    0x0808082b2b08082b,
+    0x0808190808080819,
+    0x0808190808081908,
+    0x0808190808190808,
+    0x08081908082b0819,
+    0x08081908082b1908,
+    0x0808190819080808,
+    0x080819081908082b,
+    0x0808190819082b08,
+    0x08081908192b0808,
+    0x080819082b080819,
+    0x080819082b081908,
+    0x080819082b190808,
+    0x080819082b2b1908,
+    0x0808191908080808,
+    0x080819190808082b,
+    0x0808191908082b08,
+    0x08081919082b0808,
+    0x080819191908192b,
+    0x08081919192b2b19,
+    0x080819192b080808,
+    0x080819192b190819,
+    0x0808192b08082b19,
+    0x0808192b08190808,
+    0x0808192b19080808,
+    0x0808192b2b081908,
+    0x0808192b2b2b1908,
+    0x08082b0808080808,
+    0x08082b0808081919,
+    0x08082b0808082b08,
+    0x08082b0808191908,
+    0x08082b08082b2b08,
+    0x08082b0819080819,
+    0x08082b0819081908,
+    0x08082b0819190808,
+    0x08082b081919082b,
+    0x08082b082b082b08,
+    0x08082b1908081908,
+    0x08082b1919080808,
+    0x08082b2b0808082b,
+    0x08082b2b08191908,
+    0x0819080808080819,
+    0x0819080808081908,
+    0x0819080808190808,
+    0x08190808082b0819,
+    0x0819080819080808,
+    0x08190808192b0808,
+    0x081908082b081908,
+    0x081908082b190808,
+    0x081908082b191919,
+    0x0819081908080808,
+    0x0819081908082b08,
+    0x08190819082b0808,
+    0x0819081919190808,
+    0x0819081919192b2b,
+    0x081908192b080808,
+    0x0819082b082b1908,
+    0x0819082b19081919,
+    0x0819190808080808,
+    0x0819190808082b08,
+    0x08191908082b0808,
+    0x08191908082b1919,
+    0x0819190819082b19,
+    0x081919082b080808,
+    0x0819191908192b08,
+    0x08191919192b082b,
+    0x0819192b08080808,
+    0x0819192b0819192b,
+    0x08192b0808080819,
+    0x08192b0808081908,
+    0x08192b0808190808,
+    0x08192b0819080808,
+    0x08192b082b080819,
+    0x08192b1908080808,
+    0x08192b1908081919,
+    0x08192b192b2b0808,
+    0x08192b2b19190819,
+    0x082b080808080808,
+    0x082b08080808082b,
+    0x082b080808082b2b,
+    0x082b080819081908,
+    0x082b0808192b0819,
+    0x082b08082b080808,
+    0x082b08082b08082b,
+    0x082b0819082b2b19,
+    0x082b081919082b08,
+    0x082b082b08080808,
+    0x082b082b0808082b,
+    0x082b190808080819,
+    0x082b190808081908,
+    0x082b190808190808,
+    0x082b190819080808,
+    0x082b19081919192b,
+    0x082b191908080808,
+    0x082b191919080819,
+    0x082b1919192b1908,
+    0x082b192b2b190808,
+    0x082b2b0808082b08,
+    0x082b2b08082b0808,
+    0x082b2b082b191908,
+    0x082b2b2b19081908,
+    0x1908080808080819,
+    0x1908080808081908,
+    0x1908080808190808,
+    0x1908080808192b08,
+    0x19080808082b0819,
+    0x19080808082b1908,
+    0x1908080819080808,
+    0x1908080819082b08,
+    0x190808081919192b,
+    0x19080808192b0808,
+    0x190808082b080819,
+    0x190808082b081908,
+    0x190808082b190808,
+    0x1908081908080808,
+    0x19080819082b0808,
+    0x19080819192b0819,
+    0x190808192b080808,
+    0x190808192b081919,
+    0x1908082b08080819,
+    0x1908082b08190808,
+    0x1908082b19082b08,
+    0x1908082b1919192b,
+    0x1908082b192b2b08,
+    0x1908190808080808,
+    0x1908190808082b08,
+    0x19081908082b0808,
+    0x190819082b080808,
+    0x190819082b192b19,
+    0x190819190819082b,
+    0x19081919082b1908,
+    0x1908192b08080808,
+    0x19082b0808080819,
+    0x19082b0808081908,
+    0x19082b0808190808,
+    0x19082b0819080808,
+    0x19082b0819081919,
+    0x19082b1908080808,
+    0x19082b1919192b08,
+    0x19082b19192b0819,
+    0x19082b192b08082b,
+    0x19082b2b19081919,
+    0x19082b2b2b190808,
+    0x1919080808080808,
+    0x1919080808082b08,
+    0x1919080808190819,
+    0x1919080808192b19,
+    0x19190808082b0808,
+    0x191908082b080808,
+    0x191908082b082b08,
+    0x1919081908081908,
+    0x191908191908082b,
+    0x191908192b2b1908,
+    0x1919082b2b190819,
+    0x191919082b190808,
+    0x191919082b19082b,
+    0x1919191908082b2b,
+    0x1919192b08080819,
+    0x1919192b19191908,
+    0x19192b0808080808,
+    0x19192b0808190819,
+    0x19192b0808192b19,
+    0x19192b08192b1908,
+    0x19192b1919080808,
+    0x19192b2b08082b08,
+    0x192b080808081908,
+    0x192b080808190808,
+    0x192b080819080808,
+    0x192b0808192b2b08,
+    0x192b081908080808,
+    0x192b081919191919,
+    0x192b082b08192b08,
+    0x192b082b192b0808,
+    0x192b190808080808,
+    0x192b190808081919,
+    0x192b191908190808,
+    0x192b19190819082b,
+    0x192b19192b081908,
+    0x192b2b081908082b,
+    0x2b08080808080808,
+    0x2b0808080808082b,
+    0x2b08080808082b2b,
+    0x2b08080819080819,
+    0x2b0808082b08082b,
+    0x2b08081908081908,
+    0x2b08081908192b08,
+    0x2b08081919080808,
+    0x2b08082b08190819,
+    0x2b08190808080819,
+    0x2b08190808081908,
+    0x2b08190808190808,
+    0x2b08190808191919,
+    0x2b08190819080808,
+    0x2b081908192b0808,
+    0x2b08191908080808,
+    0x2b0819191908192b,
+    0x2b0819192b191908,
+    0x2b08192b08082b19,
+    0x2b08192b19080808,
+    0x2b08192b192b0808,
+    0x2b082b080808082b,
+    0x2b082b1908081908,
+    0x2b082b2b08190819,
+    0x2b19080808081908,
+    0x2b19080808190808,
+    0x2b190808082b1908,
+    0x2b19080819080808,
+    0x2b1908082b2b0819,
+    0x2b1908190819192b,
+    0x2b1908192b080808,
+    0x2b19082b19081919,
+    0x2b19190808080808,
+    0x2b191908082b082b,
+    0x2b19190819081908,
+    0x2b19191919190819,
+    0x2b192b082b080819,
+    0x2b192b19082b0808,
+    0x2b2b08080808082b,
+    0x2b2b080819190808,
+    0x2b2b08082b081919,
+    0x2b2b081908082b19,
+    0x2b2b082b08080808,
+    0x2b2b190808192b08,
+    0x2b2b2b0819190808,
+    0x2b2b2b1908081908,
+];
+
 fn decode_values(value_type: TensorType, bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
     match value_type.raw() {
         0 => decode_f32(bytes),
@@ -1096,6 +1358,7 @@ fn decode_values(value_type: TensorType, bytes: &[u8]) -> Result<Vec<f32>, Model
         13 => decode_q5_k(bytes),
         14 => decode_q6_k(bytes),
         15 => decode_q8_k(bytes),
+        16 => decode_iq2_xxs(bytes),
         _ => Err(ModelError::UnsupportedTensorType {
             name: "<unknown>".to_owned(),
             value_type,
@@ -1159,7 +1422,7 @@ fn validate_affine_quantization(group_size: usize, bits: usize) -> Result<(), Mo
 
 fn affine_quantized_candidate(descriptor: &TensorDescriptor, group_size: usize) -> bool {
     descriptor.shape.len() == 2
-        && matches!(descriptor.value_type.raw(), 2 | 3 | 6 | 7 | 8)
+        && matches!(descriptor.value_type.raw(), 2 | 3 | 6 | 7 | 8 | 16)
         && quantized_block_layout(descriptor.value_type).is_some()
         && descriptor.shape[0].is_multiple_of(group_size)
 }
@@ -1316,6 +1579,7 @@ fn quantized_block_layout(value_type: TensorType) -> Option<(usize, usize)> {
         13 => Some((256, 176)),
         14 => Some((256, 210)),
         15 => Some((256, 292)),
+        16 => Some((256, 66)),
         _ => None,
     }
 }
@@ -1395,6 +1659,7 @@ fn quantized_value_at(
         13 => q5_k_value_at(bytes, index),
         14 => q6_k_value_at(bytes, index),
         15 => q8_k_value_at(bytes, index),
+        16 => iq2_xxs_value_at(bytes, index),
         _ => unreachable!("value type validated above"),
     }
 }
@@ -1465,6 +1730,41 @@ fn decode_q8_0(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
                 .iter()
                 .map(|value| f32::from(i8::from_ne_bytes([*value])) * scale),
         );
+    }
+    Ok(values)
+}
+
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn decode_iq2_xxs(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
+    const BLOCK_BYTES: usize = 66;
+    const BLOCK_VALUES: usize = 256;
+    let (blocks, remainder) = bytes.as_chunks::<BLOCK_BYTES>();
+    if !remainder.is_empty() {
+        return Err(ModelError::Shape(
+            "IQ2_XXS tensor byte length is not block aligned".to_owned(),
+        ));
+    }
+    let mut values = Vec::with_capacity(blocks.len() * BLOCK_VALUES);
+    for block in blocks {
+        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let qs = &block[2..];
+        for ib32 in 0..8 {
+            let offset = ib32 * 8;
+            let aux32_g = u32::from(u16::from_le_bytes([qs[offset], qs[offset + 1]]))
+                | (u32::from(u16::from_le_bytes([qs[offset + 2], qs[offset + 3]])) << 16);
+            let aux32_s = u32::from(u16::from_le_bytes([qs[offset + 4], qs[offset + 5]]))
+                | (u32::from(u16::from_le_bytes([qs[offset + 6], qs[offset + 7]])) << 16);
+            let block_scale = scale * (0.5 + (aux32_s >> 28) as f32) * 0.25;
+            for group in 0..4 {
+                let grid = IQ2_XXS_GRID[((aux32_g >> (8 * group)) & 0xff) as usize].to_le_bytes();
+                let sign_index = ((aux32_s >> (7 * group)) & 0x7f) as u8;
+                let signs = sign_index | (sign_index.count_ones() as u8 % 2) << 7;
+                for (index, magnitude) in grid.iter().enumerate() {
+                    let sign = if signs & (1 << index) == 0 { 1.0 } else { -1.0 };
+                    values.push(block_scale * f32::from(*magnitude) * sign);
+                }
+            }
+        }
     }
     Ok(values)
 }
@@ -1577,6 +1877,42 @@ fn q8_0_value_at(bytes: &[u8], index: usize) -> Result<f32, ModelError> {
         .ok_or_else(|| ModelError::Shape("Q8_0 block is outside the tensor".to_owned()))?;
     let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
     Ok(f32::from(i8::from_ne_bytes([block[2 + offset]])) * scale)
+}
+
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn iq2_xxs_value_at(bytes: &[u8], index: usize) -> Result<f32, ModelError> {
+    const BLOCK_BYTES: usize = 66;
+    let block_index = index / 256;
+    let offset = index % 256;
+    let start = block_index
+        .checked_mul(BLOCK_BYTES)
+        .ok_or_else(|| ModelError::Shape("IQ2_XXS index overflows".to_owned()))?;
+    let end = start
+        .checked_add(BLOCK_BYTES)
+        .ok_or_else(|| ModelError::Shape("IQ2_XXS block range overflows".to_owned()))?;
+    let block = bytes
+        .get(start..end)
+        .ok_or_else(|| ModelError::Shape("IQ2_XXS block is outside the tensor".to_owned()))?;
+    let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let qs = &block[2..];
+    let ib32 = offset / 32;
+    let group = (offset % 32) / 8;
+    let index_in_group = offset % 8;
+    let q_offset = ib32 * 8;
+    let aux32_g = u32::from(u16::from_le_bytes([qs[q_offset], qs[q_offset + 1]]))
+        | (u32::from(u16::from_le_bytes([qs[q_offset + 2], qs[q_offset + 3]])) << 16);
+    let aux32_s = u32::from(u16::from_le_bytes([qs[q_offset + 4], qs[q_offset + 5]]))
+        | (u32::from(u16::from_le_bytes([qs[q_offset + 6], qs[q_offset + 7]])) << 16);
+    let block_scale = scale * (0.5 + (aux32_s >> 28) as f32) * 0.25;
+    let grid = IQ2_XXS_GRID[((aux32_g >> (8 * group)) & 0xff) as usize].to_le_bytes();
+    let sign_index = ((aux32_s >> (7 * group)) & 0x7f) as u8;
+    let signs = sign_index | (sign_index.count_ones() as u8 % 2) << 7;
+    let sign = if signs & (1 << index_in_group) == 0 {
+        1.0
+    } else {
+        -1.0
+    };
+    Ok(block_scale * f32::from(grid[index_in_group]) * sign)
 }
 
 fn q4_k_value_at(bytes: &[u8], index: usize) -> Result<f32, ModelError> {
@@ -2319,6 +2655,44 @@ mod tests {
     }
 
     #[test]
+    fn materializes_iq2_xxs_tensor() {
+        let mut encoded = vec![0x00, 0x3c];
+        encoded.extend(std::iter::repeat_n(0, 64));
+        let path = write_fixture(&fixture(16, &[256, 1], &encoded));
+        let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
+        let values = model.load_f32("probe.tensor").unwrap();
+        assert_eq!(values.data(), &[1.0; 256]);
+        let matrix = model.load_quantized("probe.tensor").unwrap();
+        assert_eq!(matrix.value_type().raw(), 16);
+        assert_eq!(matrix.column(0).unwrap(), vec![1.0; 256]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn converts_iq2_xxs_matrix_directly_to_mlx_affine_layout() {
+        let mut encoded = vec![0x00, 0x3c];
+        encoded.extend(std::iter::repeat_n(0, 64));
+        let path = write_fixture(&fixture(16, &[256, 1], &encoded));
+        let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
+        let quantized = model.load_affine_quantized("probe.tensor", 64, 4).unwrap();
+        assert_eq!(quantized.rows(), 1);
+        assert_eq!(quantized.columns(), 256);
+        assert_eq!(quantized.group_size(), 64);
+        assert_eq!(quantized.bits(), 4);
+        assert_eq!(quantized.scales(), &[-1e-7; 4]);
+        assert_eq!(quantized.biases(), &[1.0; 4]);
+        let mut observed = None;
+        model
+            .for_each_tensor(&["probe.tensor"], 64, 4, |_, tensor| {
+                observed = Some(tensor);
+                Ok::<(), ModelError>(())
+            })
+            .unwrap();
+        assert!(matches!(observed, Some(LoadedTensor::AffineQuantized(_))));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn multiplies_q4_0_matrix_without_materializing_f32_values() {
         let mut encoded = vec![0x00, 0x3c];
         encoded.extend(std::iter::repeat_n(0x99, 16));
@@ -2689,7 +3063,7 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_tensor_materialization() {
-        let path = write_fixture(&fixture(16, &[256], &[0; 66]));
+        let path = write_fixture(&fixture(17, &[256], &[0; 66]));
         let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
         assert!(matches!(
             model.load_f32("probe.tensor"),
