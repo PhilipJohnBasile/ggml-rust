@@ -376,6 +376,61 @@ impl Tensor {
         checked_output(vec![indices.len(), columns], result, "gather_rows")
     }
 
+    /// Concatenates two tensors along one axis.
+    ///
+    /// Both tensors must have the same rank and identical dimensions on every
+    /// axis except `axis`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the axis or input shapes are incompatible, the
+    /// output shape overflows, or an output value is non-finite.
+    pub fn concatenate(&self, rhs: &Self, axis: usize) -> Result<Self, TensorError> {
+        if self.rank() != rhs.rank() || axis >= self.rank() {
+            return Err(TensorError::ShapeMismatch {
+                left: self.shape.clone(),
+                right: rhs.shape.clone(),
+            });
+        }
+        for dimension in 0..self.rank() {
+            if dimension != axis && self.shape[dimension] != rhs.shape[dimension] {
+                return Err(TensorError::ShapeMismatch {
+                    left: self.shape.clone(),
+                    right: rhs.shape.clone(),
+                });
+            }
+        }
+        let concatenated = self.shape[axis]
+            .checked_add(rhs.shape[axis])
+            .ok_or(TensorError::ElementCountOverflow)?;
+        let mut output_shape = self.shape.clone();
+        output_shape[axis] = concatenated;
+        let output_len = element_count(&output_shape)?;
+        let mut result = Vec::with_capacity(output_len);
+        let mut coordinates = vec![0_usize; self.rank()];
+        for _ in 0..output_len {
+            let mut source_coordinates = coordinates.clone();
+            let source = if coordinates[axis] < self.shape[axis] {
+                &self.data
+            } else {
+                source_coordinates[axis] -= self.shape[axis];
+                &rhs.data
+            };
+            let source_shape = if coordinates[axis] < self.shape[axis] {
+                &self.shape
+            } else {
+                &rhs.shape
+            };
+            let mut source_index = 0_usize;
+            for (dimension, &size) in source_shape.iter().enumerate() {
+                source_index = source_index * size + source_coordinates[dimension];
+            }
+            result.push(source[source_index]);
+            increment_index(&mut coordinates, &output_shape);
+        }
+        checked_output(output_shape, result, "concatenate")
+    }
+
     /// Broadcasts this tensor to a larger, right-aligned shape by copying
     /// values. A source dimension must equal the destination dimension or be
     /// one, matching MLX's broadcasting rule.
@@ -1112,6 +1167,22 @@ mod tests {
                 index: 3,
                 upper_bound: 3,
             }
+        );
+    }
+
+    #[test]
+    fn concatenates_along_each_supported_axis() {
+        let left = Tensor::from_data([2, 1], [1.0, 2.0]).unwrap();
+        let right = Tensor::from_data([2, 2], [3.0, 4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(
+            left.concatenate(&right, 1).unwrap().data(),
+            &[1.0, 3.0, 4.0, 2.0, 5.0, 6.0]
+        );
+        let upper = Tensor::from_data([1, 2], [7.0, 8.0]).unwrap();
+        let lower = Tensor::from_data([2, 2], [9.0, 10.0, 11.0, 12.0]).unwrap();
+        assert_eq!(
+            upper.concatenate(&lower, 0).unwrap().data(),
+            &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
         );
     }
 

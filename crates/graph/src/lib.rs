@@ -79,6 +79,9 @@ enum Operation {
     Transpose2d,
     Permute(Vec<usize>),
     GatherRows(Vec<usize>),
+    Concatenate {
+        axis: usize,
+    },
     Broadcast(Vec<usize>),
     RmsNorm {
         epsilon: f32,
@@ -265,6 +268,23 @@ impl Graph {
             return Err(GraphError::Tensor(TensorError::ZeroDimension));
         }
         Ok(self.push(Operation::GatherRows(indices), vec![input]))
+    }
+
+    /// Adds a concatenation node along one axis.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either handle is invalid. Input rank and axis
+    /// compatibility are checked during evaluation.
+    pub fn concatenate(
+        &mut self,
+        left: ValueId,
+        right: ValueId,
+        axis: usize,
+    ) -> Result<ValueId, GraphError> {
+        self.require(left)?;
+        self.require(right)?;
+        Ok(self.push(Operation::Concatenate { axis }, vec![left, right]))
     }
 
     /// Adds a right-aligned broadcast node.
@@ -551,6 +571,8 @@ impl Graph {
                     Operation::GatherRows(indices) => {
                         values[self.input_index(node, 0)?].gather_rows(indices)?
                     }
+                    Operation::Concatenate { axis } => values[self.input_index(node, 0)?]
+                        .concatenate(&values[self.input_index(node, 1)?], *axis)?,
                     Operation::Broadcast(shape) => {
                         values[self.input_index(node, 0)?].broadcast_to(shape.clone())?
                     }
@@ -756,6 +778,25 @@ mod tests {
             .unwrap();
         assert_eq!(result[0].shape(), &[2, 2]);
         assert_eq!(result[0].data(), &[5.0, 6.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn evaluates_concatenation_graph() {
+        let mut graph = Graph::new();
+        let left = graph.input([2, 1]).unwrap();
+        let right = graph.input([2, 2]).unwrap();
+        let joined = graph.concatenate(left, right, 1).unwrap();
+        let result = graph
+            .evaluate(
+                &[
+                    Tensor::from_data([2, 1], [1.0, 2.0]).unwrap(),
+                    Tensor::from_data([2, 2], [3.0, 4.0, 5.0, 6.0]).unwrap(),
+                ],
+                &[joined],
+            )
+            .unwrap();
+        assert_eq!(result[0].shape(), &[2, 3]);
+        assert_eq!(result[0].data(), &[1.0, 3.0, 4.0, 2.0, 5.0, 6.0]);
     }
 
     #[test]
