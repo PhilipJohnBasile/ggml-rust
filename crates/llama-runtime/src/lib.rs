@@ -889,6 +889,7 @@ const MAX_CONFIG_ARRAY_ELEMENTS: u64 = 4096;
 enum TokenizerKind {
     SentencePiece,
     Gpt2Bpe,
+    TekkenBpe,
 }
 
 /// A bounded GGUF tokenizer vocabulary with `SentencePiece` and GPT-2 BPE modes.
@@ -972,7 +973,20 @@ impl LlamaTokenizer {
         }
         let kind = match model.metadata_scalar("tokenizer.ggml.model")? {
             None => TokenizerKind::SentencePiece,
-            Some(MetadataScalar::String(value)) if value == "gpt2" => TokenizerKind::Gpt2Bpe,
+            Some(MetadataScalar::String(value)) if value == "gpt2" => {
+                match model.metadata_scalar("tokenizer.ggml.pre")? {
+                    Some(MetadataScalar::String(pre)) if pre == "tekken" => {
+                        TokenizerKind::TekkenBpe
+                    }
+                    None | Some(MetadataScalar::String(_)) => TokenizerKind::Gpt2Bpe,
+                    Some(value) => {
+                        return Err(LlamaError::InvalidMetadata {
+                            key: "tokenizer.ggml.pre",
+                            value: format!("expected a string, got {value:?}"),
+                        });
+                    }
+                }
+            }
             Some(MetadataScalar::String(value)) if value == "llama" || value == "sentencepiece" => {
                 TokenizerKind::SentencePiece
             }
@@ -983,7 +997,7 @@ impl LlamaTokenizer {
                 });
             }
         };
-        let token_ids = if kind == TokenizerKind::Gpt2Bpe {
+        let token_ids = if matches!(kind, TokenizerKind::Gpt2Bpe | TokenizerKind::TekkenBpe) {
             tokens
                 .iter()
                 .enumerate()
@@ -992,7 +1006,7 @@ impl LlamaTokenizer {
         } else {
             HashMap::new()
         };
-        let merge_ranks = if kind == TokenizerKind::Gpt2Bpe {
+        let merge_ranks = if matches!(kind, TokenizerKind::Gpt2Bpe | TokenizerKind::TekkenBpe) {
             let merges = model
                 .metadata_string_array("tokenizer.ggml.merges", MAX_TOKENIZER_ELEMENTS)?
                 .ok_or(LlamaError::MissingMetadata("tokenizer.ggml.merges"))?;
@@ -1054,7 +1068,7 @@ impl LlamaTokenizer {
     ///
     /// Returns an error when the text cannot be represented by this vocabulary.
     pub fn encode(&self, text: &str) -> Result<Vec<usize>, LlamaError> {
-        if self.kind == TokenizerKind::Gpt2Bpe {
+        if matches!(self.kind, TokenizerKind::Gpt2Bpe | TokenizerKind::TekkenBpe) {
             return self.encode_gpt2_bpe(text);
         }
         let normalized = normalize_sentencepiece(text);
@@ -1098,7 +1112,12 @@ impl LlamaTokenizer {
     fn encode_gpt2_bpe(&self, text: &str) -> Result<Vec<usize>, LlamaError> {
         let encoder = byte_encoder_table();
         let mut token_ids = Vec::new();
-        for chunk in gpt2_pretokenize(text) {
+        let chunks = if self.kind == TokenizerKind::TekkenBpe {
+            gpt2_pretokenize_tekken(text)
+        } else {
+            gpt2_pretokenize(text)
+        };
+        for chunk in chunks {
             let symbols = chunk
                 .as_bytes()
                 .iter()
@@ -1407,6 +1426,89 @@ fn gpt2_pretokenize(text: &str) -> Vec<String> {
         chunks.push(chunk);
     }
     chunks
+}
+
+/// Splits the byte-level BPE stream used by Mistral's Tekken tokenizer.
+///
+/// Tekken keeps numbers as single-character chunks and does not special-case
+/// English contractions. Keeping those boundaries here is important because
+/// the subsequent merge table is byte-ranked and cannot repair a different
+/// pre-tokenization boundary.
+fn gpt2_pretokenize_tekken(text: &str) -> Vec<String> {
+    let characters = text.chars().collect::<Vec<_>>();
+    let mut chunks = Vec::new();
+    let mut index = 0;
+    while index < characters.len() {
+        let start = index;
+        let character = characters[index];
+
+        if character == '\r' || character == '\n' {
+            index += 1;
+            while index < characters.len()
+                && (characters[index] == '\r' || characters[index] == '\n')
+            {
+                index += 1;
+            }
+        } else if character.is_whitespace()
+            && !(character == ' '
+                && index + 1 < characters.len()
+                && characters[index + 1].is_alphabetic())
+        {
+            index += 1;
+            while index < characters.len()
+                && characters[index].is_whitespace()
+                && characters[index] != '\r'
+                && characters[index] != '\n'
+            {
+                index += 1;
+            }
+        } else if character.is_numeric() {
+            index += 1;
+        } else if character.is_alphabetic() {
+            index = tekken_word_end(&characters, index);
+        } else if index + 1 < characters.len() && characters[index + 1].is_alphabetic() {
+            // The Tekken pattern allows one non-letter prefix on a word. This
+            // is what makes a contraction such as "can't" become "can" +
+            // "'t" instead of one GPT-style contraction chunk.
+            index += 1;
+            index = tekken_word_end(&characters, index);
+        } else {
+            index += 1;
+            while index < characters.len()
+                && !characters[index].is_whitespace()
+                && !characters[index].is_alphabetic()
+                && !characters[index].is_numeric()
+                && characters[index] != '\r'
+                && characters[index] != '\n'
+            {
+                index += 1;
+            }
+        }
+        chunks.push(characters[start..index].iter().collect());
+    }
+    chunks
+}
+
+fn tekken_word_end(characters: &[char], mut index: usize) -> usize {
+    let starts_lowercase = characters[index].is_lowercase();
+    let mut saw_lowercase = false;
+    while index < characters.len() && characters[index].is_alphabetic() {
+        let character = characters[index];
+        if starts_lowercase {
+            if character.is_uppercase() && saw_lowercase {
+                break;
+            }
+        } else if character.is_lowercase() {
+            saw_lowercase = true;
+        } else if saw_lowercase && character.is_uppercase() {
+            break;
+        }
+        if character.is_lowercase() {
+            saw_lowercase = true;
+        }
+        index += 1;
+    }
+    index
 }
 
 fn normalize_sentencepiece(text: &str) -> String {
@@ -3412,6 +3514,14 @@ mod tests {
         };
         assert_eq!(tokenizer.encode("hello").unwrap(), [4]);
         assert_eq!(tokenizer.decode(&[4]).unwrap(), "hello");
+    }
+
+    #[test]
+    fn tekken_pretokenizer_keeps_digits_atomic_and_contractions_separate() {
+        assert_eq!(
+            gpt2_pretokenize_tekken("Hello 123 can't"),
+            ["Hello", " ", "1", "2", "3", " can", "'t"]
+        );
     }
 
     #[test]
