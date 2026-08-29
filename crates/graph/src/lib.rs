@@ -124,6 +124,10 @@ enum Operation {
         axis: usize,
         keepdims: bool,
     },
+    Cumsum {
+        axis: usize,
+        reverse: bool,
+    },
     Clamp {
         minimum: f32,
         maximum: f32,
@@ -594,6 +598,22 @@ impl Graph {
         Ok(self.push(Operation::Mean { axis, keepdims }, vec![input]))
     }
 
+    /// Adds an inclusive cumulative sum node along one axis.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid. Axis validation is
+    /// completed during evaluation against the concrete tensor rank.
+    pub fn cumsum(
+        &mut self,
+        input: ValueId,
+        axis: usize,
+        reverse: bool,
+    ) -> Result<ValueId, GraphError> {
+        self.require(input)?;
+        Ok(self.push(Operation::Cumsum { axis, reverse }, vec![input]))
+    }
+
     /// Adds an interleaved rotary position embedding node.
     ///
     /// The input must evaluate to `[heads, head_dim]`; only the leading
@@ -785,6 +805,9 @@ impl Graph {
                     }
                     Operation::Mean { axis, keepdims } => {
                         values[self.input_index(node, 0)?].mean(*axis, *keepdims)?
+                    }
+                    Operation::Cumsum { axis, reverse } => {
+                        values[self.input_index(node, 0)?].cumsum(*axis, *reverse)?
                     }
                     Operation::Rotary {
                         rotary_dimension,
@@ -1086,6 +1109,22 @@ mod tests {
         assert_eq!(result[0].data(), &[5.0, 7.0, 9.0]);
         assert_eq!(result[1].shape(), &[2, 1]);
         assert_eq!(result[1].data(), &[2.0, 5.0]);
+    }
+
+    #[test]
+    fn evaluates_cumulative_sum_nodes() {
+        let mut graph = Graph::new();
+        let input = graph.input([2, 3]).unwrap();
+        let forward = graph.cumsum(input, 1, false).unwrap();
+        let reverse = graph.cumsum(input, 0, true).unwrap();
+        let result = graph
+            .evaluate(
+                &[Tensor::from_data([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()],
+                &[forward, reverse],
+            )
+            .unwrap();
+        assert_eq!(result[0].data(), &[1.0, 3.0, 6.0, 4.0, 9.0, 15.0]);
+        assert_eq!(result[1].data(), &[5.0, 7.0, 9.0, 4.0, 5.0, 6.0]);
     }
 
     #[test]

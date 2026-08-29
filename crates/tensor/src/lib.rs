@@ -1229,6 +1229,51 @@ impl Tensor {
         self.reduce_axis(axis, keepdims, true)
     }
 
+    /// Computes an inclusive cumulative sum along one axis.
+    ///
+    /// When `reverse` is true, accumulation proceeds from the end of the axis
+    /// toward the beginning while preserving the original output layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `axis` is outside the tensor rank or an internal
+    /// shape calculation overflows.
+    pub fn cumsum(&self, axis: usize, reverse: bool) -> Result<Self, TensorError> {
+        let rank = self.shape.len();
+        if axis >= rank {
+            return Err(TensorError::InvalidAxis { axis, rank });
+        }
+        let axis_width = self.shape[axis];
+        let inner = self.shape[axis + 1..]
+            .iter()
+            .try_fold(1_usize, |value, &dimension| value.checked_mul(dimension))
+            .ok_or(TensorError::ElementCountOverflow)?;
+        let block = axis_width
+            .checked_mul(inner)
+            .ok_or(TensorError::ElementCountOverflow)?;
+        let outer = self.len() / block;
+        let mut output = vec![0.0; self.len()];
+        for outer_index in 0..outer {
+            for inner_index in 0..inner {
+                let mut total = 0.0_f32;
+                if reverse {
+                    for position in (0..axis_width).rev() {
+                        let index = (outer_index * axis_width + position) * inner + inner_index;
+                        total += self.data[index];
+                        output[index] = total;
+                    }
+                } else {
+                    for position in 0..axis_width {
+                        let index = (outer_index * axis_width + position) * inner + inner_index;
+                        total += self.data[index];
+                        output[index] = total;
+                    }
+                }
+            }
+        }
+        Self::from_data(self.shape.clone(), output)
+    }
+
     #[allow(clippy::cast_precision_loss)]
     fn reduce_axis(&self, axis: usize, keepdims: bool, mean: bool) -> Result<Self, TensorError> {
         let rank = self.shape.len();
@@ -1830,6 +1875,23 @@ mod tests {
         let vector = Tensor::from_data([3], [1.0, 2.0, 6.0]).unwrap();
         assert_eq!(vector.sum_last_dim().unwrap().shape(), &[1]);
         assert_eq!(vector.sum_last_dim().unwrap().data(), &[9.0]);
+    }
+
+    #[test]
+    fn cumulative_sum_supports_arbitrary_and_reverse_axes() {
+        let tensor = Tensor::from_data([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(
+            tensor.cumsum(1, false).unwrap().data(),
+            &[1.0, 3.0, 6.0, 4.0, 9.0, 15.0]
+        );
+        assert_eq!(
+            tensor.cumsum(0, true).unwrap().data(),
+            &[5.0, 7.0, 9.0, 4.0, 5.0, 6.0]
+        );
+        assert!(matches!(
+            tensor.cumsum(2, false),
+            Err(TensorError::InvalidAxis { axis: 2, rank: 2 })
+        ));
     }
 
     #[test]
