@@ -957,12 +957,13 @@ fn materialize_affine_quantized(
     let mut scales = Vec::with_capacity(affine_len);
     let mut biases = Vec::with_capacity(affine_len);
     let n_bins = f32::from((1_u16 << bits) - 1);
+    let mut group_values = vec![0.0_f32; group_size];
     for output_index in 0..output {
         for group_index in 0..groups {
             let group_start = group_index * group_size;
             let mut minimum = f32::INFINITY;
             let mut maximum = f32::NEG_INFINITY;
-            for offset in 0..group_size {
+            for (offset, value_slot) in group_values.iter_mut().enumerate() {
                 let index = output_index
                     .checked_mul(input)
                     .and_then(|base| base.checked_add(group_start + offset))
@@ -975,6 +976,7 @@ fn materialize_affine_quantized(
                         "quantized matrix contains a non-finite value".to_owned(),
                     ));
                 }
+                *value_slot = value;
                 minimum = minimum.min(value);
                 maximum = maximum.max(value);
             }
@@ -998,14 +1000,7 @@ fn materialize_affine_quantized(
             biases.push(bias);
             let packed_start =
                 output_index * packed_columns + group_index * (group_size * bits / 32);
-            for offset in 0..group_size {
-                let index = output_index
-                    .checked_mul(input)
-                    .and_then(|base| base.checked_add(group_start + offset))
-                    .ok_or_else(|| {
-                        ModelError::Shape("quantized matrix index overflows".to_owned())
-                    })?;
-                let value = quantized_value_at(descriptor.value_type, tensor_bytes, index)?;
+            for (offset, &value) in group_values.iter().enumerate() {
                 let quantized = ((value - bias) / scale).round().clamp(0.0, n_bins) as u32;
                 let bit_offset = offset * bits;
                 let word = packed_start + bit_offset / 32;
