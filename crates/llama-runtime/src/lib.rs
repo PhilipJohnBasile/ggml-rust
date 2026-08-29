@@ -558,7 +558,7 @@ impl LlamaTokenizer {
         self.eos_token_id
     }
 
-    /// Encodes text using normalized whitespace markers and SentencePiece
+    /// Encodes text using normalized whitespace markers and `SentencePiece`
     /// unigram Viterbi segmentation.
     ///
     /// This covers the standard Llama `SentencePiece` vocabulary representation.
@@ -644,11 +644,10 @@ impl LlamaTokenizer {
                     self.relax_encoding_path(&mut paths, offset, offset + 1, token_id, 1, &path)?;
                 }
             }
-            if allow_unknown {
-                if let (Some(unk_token_id), Some(end)) = (self.unk_token_id, character_ends[offset])
-                {
-                    self.relax_encoding_path(&mut paths, offset, end, unk_token_id, 2, &path)?;
-                }
+            if allow_unknown
+                && let (Some(unk_token_id), Some(end)) = (self.unk_token_id, character_ends[offset])
+            {
+                self.relax_encoding_path(&mut paths, offset, end, unk_token_id, 2, &path)?;
             }
         }
         Ok(paths)
@@ -683,8 +682,8 @@ impl LlamaTokenizer {
             kind,
         };
         let replace = paths[end].as_ref().is_none_or(|current| {
-            candidate.score > current.score
-                || (candidate.score == current.score
+            candidate.score.total_cmp(&current.score).is_gt()
+                || (candidate.score.total_cmp(&current.score).is_eq()
                     && (candidate.token_count < current.token_count
                         || (candidate.token_count == current.token_count
                             && (candidate.kind < current.kind
