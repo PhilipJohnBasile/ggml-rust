@@ -47,6 +47,7 @@ pub enum TensorError {
     ZeroDimension,
     InvalidEpsilon,
     InvalidScale,
+    InvalidClamp,
     RotaryShapeMismatch {
         shape: Vec<usize>,
     },
@@ -94,6 +95,7 @@ impl fmt::Display for TensorError {
                 formatter.write_str("RMSNorm epsilon must be finite and nonnegative")
             }
             Self::InvalidScale => formatter.write_str("attention scale must be finite"),
+            Self::InvalidClamp => formatter.write_str("clamp bounds must be finite and ordered"),
             Self::RotaryShapeMismatch { shape } => write!(
                 formatter,
                 "rotary embedding requires a rank-2 head tensor, got {shape:?}"
@@ -346,6 +348,24 @@ impl Tensor {
         self.binary_op(rhs, "mul", |left, right| left * right)
     }
 
+    /// Subtracts two tensors element by element.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when shapes differ or an output value is non-finite.
+    pub fn sub(&self, rhs: &Self) -> Result<Self, TensorError> {
+        self.binary_op(rhs, "sub", |left, right| left - right)
+    }
+
+    /// Divides two tensors element by element.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when shapes differ or an output value is non-finite.
+    pub fn div(&self, rhs: &Self) -> Result<Self, TensorError> {
+        self.binary_op(rhs, "div", |left, right| left / right)
+    }
+
     /// Multiplies every value by one scalar.
     ///
     /// # Errors
@@ -358,6 +378,98 @@ impl Tensor {
             .map(|value| value * factor)
             .collect::<Vec<_>>();
         checked_output(self.shape.clone(), result, "scale")
+    }
+
+    /// Negates every value elementwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an output value is non-finite.
+    pub fn neg(&self) -> Result<Self, TensorError> {
+        self.unary_op("neg", |value| -value)
+    }
+
+    /// Computes the absolute value elementwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an output value is non-finite.
+    pub fn abs(&self) -> Result<Self, TensorError> {
+        self.unary_op("abs", f32::abs)
+    }
+
+    /// Computes the square elementwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an output value is non-finite.
+    pub fn sqr(&self) -> Result<Self, TensorError> {
+        self.unary_op("sqr", |value| value * value)
+    }
+
+    /// Computes the square root elementwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an input is negative or an output value is
+    /// non-finite.
+    pub fn sqrt(&self) -> Result<Self, TensorError> {
+        self.unary_op("sqrt", f32::sqrt)
+    }
+
+    /// Computes the natural exponential elementwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an output value is non-finite.
+    pub fn exp(&self) -> Result<Self, TensorError> {
+        self.unary_op("exp", f32::exp)
+    }
+
+    /// Computes the natural logarithm elementwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an input is non-positive or an output value is
+    /// non-finite.
+    pub fn log(&self) -> Result<Self, TensorError> {
+        self.unary_op("log", f32::ln)
+    }
+
+    /// Computes the hyperbolic tangent elementwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an output value is non-finite.
+    pub fn tanh(&self) -> Result<Self, TensorError> {
+        self.unary_op("tanh", f32::tanh)
+    }
+
+    /// Computes the logistic sigmoid elementwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an output value is non-finite.
+    pub fn sigmoid(&self) -> Result<Self, TensorError> {
+        self.unary_op("sigmoid", |value| 1.0 / (1.0 + (-value).exp()))
+    }
+
+    /// Clamps every value to the inclusive interval `[minimum, maximum]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when bounds are non-finite, the interval is inverted,
+    /// or an output value is non-finite.
+    pub fn clamp(&self, minimum: f32, maximum: f32) -> Result<Self, TensorError> {
+        if !minimum.is_finite() || !maximum.is_finite() || minimum > maximum {
+            return Err(TensorError::InvalidClamp);
+        }
+        let result = self
+            .data
+            .iter()
+            .map(|value| value.clamp(minimum, maximum))
+            .collect::<Vec<_>>();
+        checked_output(self.shape.clone(), result, "clamp")
     }
 
     /// Multiplies two row-major rank-2 matrices.
@@ -735,6 +847,14 @@ impl Tensor {
             .collect::<Vec<_>>();
         checked_output(self.shape.clone(), result, operation)
     }
+
+    fn unary_op<F>(&self, operation: &'static str, function: F) -> Result<Self, TensorError>
+    where
+        F: Fn(f32) -> f32,
+    {
+        let result = self.data.iter().copied().map(function).collect::<Vec<_>>();
+        checked_output(self.shape.clone(), result, operation)
+    }
 }
 
 fn validate_shape(shape: &[usize]) -> Result<(), TensorError> {
@@ -839,6 +959,33 @@ mod tests {
             left.add(&right),
             Err(TensorError::ShapeMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn extended_elementwise_ops_match_scalar_math() {
+        let tensor = Tensor::from_data([4], [-2.0, 0.5, 1.0, 4.0]).unwrap();
+        assert_eq!(
+            tensor.sub(&Tensor::scalar(1.0)),
+            Err(TensorError::ShapeMismatch {
+                left: vec![4],
+                right: vec![],
+            })
+        );
+        let rhs = Tensor::from_data([4], [1.0, 0.5, 2.0, 2.0]).unwrap();
+        assert_eq!(tensor.sub(&rhs).unwrap().data(), &[-3.0, 0.0, -1.0, 2.0]);
+        assert_eq!(tensor.div(&rhs).unwrap().data(), &[-2.0, 1.0, 0.5, 2.0]);
+        assert_eq!(tensor.neg().unwrap().data(), &[2.0, -0.5, -1.0, -4.0]);
+        assert_eq!(tensor.abs().unwrap().data(), &[2.0, 0.5, 1.0, 4.0]);
+        assert_eq!(tensor.sqr().unwrap().data(), &[4.0, 0.25, 1.0, 16.0]);
+        assert_eq!(
+            tensor.clamp(-1.0, 1.0).unwrap().data(),
+            &[-1.0, 0.5, 1.0, 1.0]
+        );
+        let positive = Tensor::from_data([3], [0.5, 1.0, 4.0]).unwrap();
+        assert!((positive.exp().unwrap().data()[0] - 0.5_f32.exp()).abs() < 1.0e-6);
+        assert!((positive.log().unwrap().data()[1] - 0.0).abs() < 1.0e-6);
+        assert!((tensor.tanh().unwrap().data()[1] - 0.5_f32.tanh()).abs() < 1.0e-6);
+        assert!((positive.sigmoid().unwrap().data()[0] - 0.62245935).abs() < 1.0e-6);
     }
 
     #[test]

@@ -71,7 +71,9 @@ enum Operation {
     },
     Constant(Tensor),
     Add,
+    Subtract,
     Multiply,
+    Divide,
     Matmul,
     Reshape(Vec<usize>),
     Transpose2d,
@@ -81,6 +83,21 @@ enum Operation {
     },
     RmsNormWeighted {
         epsilon: f32,
+    },
+    Scale {
+        factor: f32,
+    },
+    Negate,
+    Absolute,
+    Square,
+    SquareRoot,
+    Exponential,
+    Logarithm,
+    Tanh,
+    Sigmoid,
+    Clamp {
+        minimum: f32,
+        maximum: f32,
     },
     Silu,
     SoftmaxLastDim,
@@ -155,6 +172,24 @@ impl Graph {
     /// Returns an error when either handle is not in this graph.
     pub fn multiply(&mut self, left: ValueId, right: ValueId) -> Result<ValueId, GraphError> {
         self.binary(Operation::Multiply, left, right)
+    }
+
+    /// Adds elementwise subtraction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either handle is not in this graph.
+    pub fn subtract(&mut self, left: ValueId, right: ValueId) -> Result<ValueId, GraphError> {
+        self.binary(Operation::Subtract, left, right)
+    }
+
+    /// Adds elementwise division.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either handle is not in this graph.
+    pub fn divide(&mut self, left: ValueId, right: ValueId) -> Result<ValueId, GraphError> {
+        self.binary(Operation::Divide, left, right)
     }
 
     /// Adds a matrix multiplication node.
@@ -232,6 +267,102 @@ impl Graph {
         self.require(input)?;
         self.require(weight)?;
         Ok(self.push(Operation::RmsNormWeighted { epsilon }, vec![input, weight]))
+    }
+
+    /// Adds a scalar multiplication node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid.
+    pub fn scale(&mut self, input: ValueId, factor: f32) -> Result<ValueId, GraphError> {
+        self.unary(Operation::Scale { factor }, input)
+    }
+
+    /// Adds an elementwise negation node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid.
+    pub fn negate(&mut self, input: ValueId) -> Result<ValueId, GraphError> {
+        self.unary(Operation::Negate, input)
+    }
+
+    /// Adds an elementwise absolute-value node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid.
+    pub fn absolute(&mut self, input: ValueId) -> Result<ValueId, GraphError> {
+        self.unary(Operation::Absolute, input)
+    }
+
+    /// Adds an elementwise square node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid.
+    pub fn square(&mut self, input: ValueId) -> Result<ValueId, GraphError> {
+        self.unary(Operation::Square, input)
+    }
+
+    /// Adds an elementwise square-root node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid.
+    pub fn square_root(&mut self, input: ValueId) -> Result<ValueId, GraphError> {
+        self.unary(Operation::SquareRoot, input)
+    }
+
+    /// Adds an elementwise exponential node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid.
+    pub fn exponential(&mut self, input: ValueId) -> Result<ValueId, GraphError> {
+        self.unary(Operation::Exponential, input)
+    }
+
+    /// Adds an elementwise natural-logarithm node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid.
+    pub fn logarithm(&mut self, input: ValueId) -> Result<ValueId, GraphError> {
+        self.unary(Operation::Logarithm, input)
+    }
+
+    /// Adds an elementwise hyperbolic-tangent node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid.
+    pub fn tanh(&mut self, input: ValueId) -> Result<ValueId, GraphError> {
+        self.unary(Operation::Tanh, input)
+    }
+
+    /// Adds an elementwise logistic-sigmoid node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid.
+    pub fn sigmoid(&mut self, input: ValueId) -> Result<ValueId, GraphError> {
+        self.unary(Operation::Sigmoid, input)
+    }
+
+    /// Adds an inclusive elementwise clamp node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid or bounds are
+    /// non-finite or inverted.
+    pub fn clamp(
+        &mut self,
+        input: ValueId,
+        minimum: f32,
+        maximum: f32,
+    ) -> Result<ValueId, GraphError> {
+        self.unary(Operation::Clamp { minimum, maximum }, input)
     }
 
     /// Adds a `SiLU` node.
@@ -344,8 +475,12 @@ impl Graph {
                     Operation::Constant(tensor) => tensor.clone(),
                     Operation::Add => values[self.input_index(node, 0)?]
                         .add(&values[self.input_index(node, 1)?])?,
+                    Operation::Subtract => values[self.input_index(node, 0)?]
+                        .sub(&values[self.input_index(node, 1)?])?,
                     Operation::Multiply => values[self.input_index(node, 0)?]
                         .mul(&values[self.input_index(node, 1)?])?,
+                    Operation::Divide => values[self.input_index(node, 0)?]
+                        .div(&values[self.input_index(node, 1)?])?,
                     Operation::Matmul => values[self.input_index(node, 0)?]
                         .matmul(&values[self.input_index(node, 1)?])?,
                     Operation::Reshape(shape) => values[self.input_index(node, 0)?]
@@ -360,6 +495,20 @@ impl Graph {
                     }
                     Operation::RmsNormWeighted { epsilon } => values[self.input_index(node, 0)?]
                         .rms_norm_with_weight(&values[self.input_index(node, 1)?], *epsilon)?,
+                    Operation::Scale { factor } => {
+                        values[self.input_index(node, 0)?].scale(*factor)?
+                    }
+                    Operation::Negate => values[self.input_index(node, 0)?].neg()?,
+                    Operation::Absolute => values[self.input_index(node, 0)?].abs()?,
+                    Operation::Square => values[self.input_index(node, 0)?].sqr()?,
+                    Operation::SquareRoot => values[self.input_index(node, 0)?].sqrt()?,
+                    Operation::Exponential => values[self.input_index(node, 0)?].exp()?,
+                    Operation::Logarithm => values[self.input_index(node, 0)?].log()?,
+                    Operation::Tanh => values[self.input_index(node, 0)?].tanh()?,
+                    Operation::Sigmoid => values[self.input_index(node, 0)?].sigmoid()?,
+                    Operation::Clamp { minimum, maximum } => {
+                        values[self.input_index(node, 0)?].clamp(*minimum, *maximum)?
+                    }
                     Operation::Silu => values[self.input_index(node, 0)?].silu()?,
                     Operation::SoftmaxLastDim => {
                         values[self.input_index(node, 0)?].softmax_last_dim()?
