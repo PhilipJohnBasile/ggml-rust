@@ -148,6 +148,8 @@ pub struct LlamaConfig {
     block_count: usize,
     head_count: usize,
     head_count_kv: usize,
+    key_length: usize,
+    value_length: usize,
     feed_forward_length: usize,
     vocab_size: usize,
     rms_norm_epsilon: f32,
@@ -167,6 +169,8 @@ struct LlamaMetadataKeys {
     block_count: &'static str,
     head_count: &'static str,
     head_count_kv: &'static str,
+    attention_key_length: &'static str,
+    attention_value_length: &'static str,
     feed_forward_length: &'static str,
     vocab_size: &'static str,
     rms_norm_epsilon: &'static str,
@@ -199,6 +203,8 @@ fn metadata_keys(architecture: &str) -> Option<LlamaMetadataKeys> {
             block_count: "llama.block_count",
             head_count: "llama.attention.head_count",
             head_count_kv: "llama.attention.head_count_kv",
+            attention_key_length: "llama.attention.key_length",
+            attention_value_length: "llama.attention.value_length",
             feed_forward_length: "llama.feed_forward_length",
             vocab_size: "llama.vocab_size",
             rms_norm_epsilon: "llama.attention.layer_norm_rms_epsilon",
@@ -227,6 +233,8 @@ fn metadata_keys(architecture: &str) -> Option<LlamaMetadataKeys> {
             block_count: "qwen2.block_count",
             head_count: "qwen2.attention.head_count",
             head_count_kv: "qwen2.attention.head_count_kv",
+            attention_key_length: "qwen2.attention.key_length",
+            attention_value_length: "qwen2.attention.value_length",
             feed_forward_length: "qwen2.feed_forward_length",
             vocab_size: "qwen2.vocab_size",
             rms_norm_epsilon: "qwen2.attention.layer_norm_rms_epsilon",
@@ -255,6 +263,8 @@ fn metadata_keys(architecture: &str) -> Option<LlamaMetadataKeys> {
             block_count: "mistral.block_count",
             head_count: "mistral.attention.head_count",
             head_count_kv: "mistral.attention.head_count_kv",
+            attention_key_length: "mistral.attention.key_length",
+            attention_value_length: "mistral.attention.value_length",
             feed_forward_length: "mistral.feed_forward_length",
             vocab_size: "mistral.vocab_size",
             rms_norm_epsilon: "mistral.attention.layer_norm_rms_epsilon",
@@ -283,6 +293,8 @@ fn metadata_keys(architecture: &str) -> Option<LlamaMetadataKeys> {
             block_count: "mistral3.block_count",
             head_count: "mistral3.attention.head_count",
             head_count_kv: "mistral3.attention.head_count_kv",
+            attention_key_length: "mistral3.attention.key_length",
+            attention_value_length: "mistral3.attention.value_length",
             feed_forward_length: "mistral3.feed_forward_length",
             vocab_size: "mistral3.vocab_size",
             rms_norm_epsilon: "mistral3.attention.layer_norm_rms_epsilon",
@@ -475,6 +487,8 @@ impl LlamaConfig {
             block_count,
             head_count,
             head_count_kv,
+            key_length: embedding_length.checked_div(head_count).unwrap_or(0),
+            value_length: embedding_length.checked_div(head_count).unwrap_or(0),
             feed_forward_length,
             vocab_size,
             rms_norm_epsilon,
@@ -521,6 +535,16 @@ impl LlamaConfig {
         let head_count = required_usize_value(values.next().flatten(), keys.head_count)?;
         let head_count_kv = optional_usize_value(values.next().flatten(), keys.head_count_kv)?
             .unwrap_or(head_count);
+        let key_length = optional_usize_value(
+            model.metadata_scalar(keys.attention_key_length)?,
+            keys.attention_key_length,
+        )?
+        .unwrap_or_else(|| embedding_length.checked_div(head_count).unwrap_or(0));
+        let value_length = optional_usize_value(
+            model.metadata_scalar(keys.attention_value_length)?,
+            keys.attention_value_length,
+        )?
+        .unwrap_or(key_length);
         let feed_forward_length =
             required_usize_value(values.next().flatten(), keys.feed_forward_length)?;
         let vocab_size = match values.next().flatten() {
@@ -598,6 +622,8 @@ impl LlamaConfig {
         )?;
         config.attention_temperature_scale = attention_temperature_scale;
         config.attention_temperature_context = attention_temperature_context;
+        config.key_length = key_length;
+        config.value_length = value_length;
         config.validate()?;
         Ok(config)
     }
@@ -630,6 +656,18 @@ impl LlamaConfig {
     #[must_use]
     pub const fn head_count_kv(&self) -> usize {
         self.head_count_kv
+    }
+
+    /// Returns the key/query width of one attention head.
+    #[must_use]
+    pub const fn key_length(&self) -> usize {
+        self.key_length
+    }
+
+    /// Returns the value width of one attention head.
+    #[must_use]
+    pub const fn value_length(&self) -> usize {
+        self.value_length
     }
 
     /// Returns the feed-forward hidden width.
@@ -806,7 +844,17 @@ impl LlamaConfig {
                 "embedding_length must be divisible by head_count".to_owned(),
             ));
         }
-        let head_dim = self.embedding_length / self.head_count;
+        if self.key_length == 0 || self.value_length == 0 {
+            return Err(LlamaError::InvalidConfig(
+                "attention key and value lengths must be greater than zero".to_owned(),
+            ));
+        }
+        if self.key_length != self.value_length {
+            return Err(LlamaError::InvalidConfig(
+                "attention key and value lengths must match for this decoder".to_owned(),
+            ));
+        }
+        let head_dim = self.key_length;
         if !head_dim.is_multiple_of(2) {
             return Err(LlamaError::InvalidConfig(
                 "head dimension must be even for rotary embeddings".to_owned(),
@@ -1987,19 +2035,19 @@ impl LlamaCpuModel {
                 attn_q_bias: take_optional_bias(
                     &mut vectors,
                     &format!("{prefix}.attn_q.bias"),
-                    config.embedding_length,
+                    config.head_count * config.key_length,
                 )?,
                 attn_k: take_matrix(&mut matrices, &format!("{prefix}.attn_k.weight"))?,
                 attn_k_bias: take_optional_bias(
                     &mut vectors,
                     &format!("{prefix}.attn_k.bias"),
-                    config.head_count_kv * (config.embedding_length / config.head_count),
+                    config.head_count_kv * config.value_length,
                 )?,
                 attn_v: take_matrix(&mut matrices, &format!("{prefix}.attn_v.weight"))?,
                 attn_v_bias: take_optional_bias(
                     &mut vectors,
                     &format!("{prefix}.attn_v.bias"),
-                    config.head_count_kv * (config.embedding_length / config.head_count),
+                    config.head_count_kv * config.value_length,
                 )?,
                 attn_output: take_matrix(&mut matrices, &format!("{prefix}.attn_output.weight"))?,
                 attn_output_bias: take_optional_bias(
@@ -2121,7 +2169,7 @@ impl LlamaCpuModel {
                 attn_q_bias: take_optional_loaded_bias(
                     &mut loaded,
                     &format!("{prefix}.attn_q.bias"),
-                    config.embedding_length,
+                    config.head_count * config.key_length,
                 )?,
                 attn_k: CpuMatrix::from_tensor(
                     loaded
@@ -2135,7 +2183,7 @@ impl LlamaCpuModel {
                 attn_k_bias: take_optional_loaded_bias(
                     &mut loaded,
                     &format!("{prefix}.attn_k.bias"),
-                    config.head_count_kv * (config.embedding_length / config.head_count),
+                    config.head_count_kv * config.value_length,
                 )?,
                 attn_v: CpuMatrix::from_tensor(
                     loaded
@@ -2149,7 +2197,7 @@ impl LlamaCpuModel {
                 attn_v_bias: take_optional_loaded_bias(
                     &mut loaded,
                     &format!("{prefix}.attn_v.bias"),
-                    config.head_count_kv * (config.embedding_length / config.head_count),
+                    config.head_count_kv * config.value_length,
                 )?,
                 attn_output: CpuMatrix::from_tensor(
                     loaded
@@ -2405,9 +2453,8 @@ impl LlamaKvCache {
     /// address space.
     pub fn new(config: &LlamaConfig) -> Result<Self, LlamaError> {
         let kv_width = config
-            .embedding_length
-            .checked_mul(config.head_count_kv)
-            .and_then(|width| width.checked_div(config.head_count))
+            .head_count_kv
+            .checked_mul(config.value_length)
             .ok_or_else(|| {
                 LlamaError::InvalidConfig(
                     "KV cache width overflows the host address space".to_owned(),
@@ -2514,7 +2561,8 @@ impl<'a> LlamaSession<'a> {
         let embedding_width = self.model.config.embedding_length;
         let hidden = self.model.token_embedding.column(token_id)?;
         let mut hidden = row_tensor(embedding_width, hidden)?;
-        let head_dim = embedding_width / self.model.config.head_count;
+        let head_dim = self.model.config.key_length;
+        let attention_width = self.model.config.head_count * self.model.config.value_length;
         #[allow(clippy::cast_precision_loss)]
         let attention_scale = (head_dim as f32).sqrt().recip()
             * self
@@ -2577,7 +2625,7 @@ impl<'a> LlamaSession<'a> {
                 LlamaError::InvalidConfig("KV layer index is out of range".to_owned())
             })?;
             layer_cache.append(self.position, &key_values, &value_values)?;
-            let mut attended = vec![0.0; embedding_width];
+            let mut attended = vec![0.0; attention_width];
             let query_groups = self.model.config.head_count / self.model.config.head_count_kv;
             let cached_tokens = layer_cache.end_position();
             let attention_start = self
@@ -2648,7 +2696,7 @@ impl<'a> LlamaSession<'a> {
                 layer.attn_output_bias.as_deref(),
                 "attention output",
             )?;
-            let attended = row_tensor(embedding_width, attended)?;
+            let attended = row_tensor(attention_width, attended)?;
             hidden = hidden.add(&attended)?;
             let normalized =
                 hidden
@@ -3292,6 +3340,7 @@ fn as_f32(value: MetadataScalar) -> Result<f32, String> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_layout(model: &GgufModel, config: &LlamaConfig) -> Result<(), LlamaError> {
     require_shape(
         model,
@@ -3317,18 +3366,23 @@ fn validate_layout(model: &GgufModel, config: &LlamaConfig) -> Result<(), LlamaE
             actual: output_bias.shape().to_vec(),
         });
     }
-    if architecture == "qwen2"
-        && config.rope_dimension_count() != config.embedding_length() / config.head_count()
-    {
+    if architecture == "qwen2" && config.rope_dimension_count() != config.key_length() {
         return Err(LlamaError::InvalidConfig(
             "qwen2 requires rotary embeddings across the full attention head".to_owned(),
         ));
     }
     require_shape(model, "output_norm.weight", &[config.embedding_length])?;
+    let query_width = config
+        .head_count
+        .checked_mul(config.key_length)
+        .ok_or_else(|| {
+            LlamaError::InvalidConfig(
+                "query projection width overflows the host address space".to_owned(),
+            )
+        })?;
     let kv_width = config
-        .embedding_length
-        .checked_mul(config.head_count_kv)
-        .and_then(|width| width.checked_div(config.head_count))
+        .head_count_kv
+        .checked_mul(config.value_length)
         .ok_or_else(|| {
             LlamaError::InvalidConfig(
                 "key/value projection width overflows the host address space".to_owned(),
@@ -3338,15 +3392,15 @@ fn validate_layout(model: &GgufModel, config: &LlamaConfig) -> Result<(), LlamaE
         let prefix = format!("blk.{layer}");
         for (suffix, shape) in [
             ("attn_norm.weight", vec![config.embedding_length]),
-            (
-                "attn_q.weight",
-                vec![config.embedding_length, config.embedding_length],
-            ),
+            ("attn_q.weight", vec![config.embedding_length, query_width]),
             ("attn_k.weight", vec![config.embedding_length, kv_width]),
             ("attn_v.weight", vec![config.embedding_length, kv_width]),
             (
                 "attn_output.weight",
-                vec![config.embedding_length, config.embedding_length],
+                vec![
+                    config.value_length * config.head_count,
+                    config.embedding_length,
+                ],
             ),
             ("ffn_norm.weight", vec![config.embedding_length]),
             (
@@ -3365,7 +3419,7 @@ fn validate_layout(model: &GgufModel, config: &LlamaConfig) -> Result<(), LlamaE
             require_shape(model, &format!("{prefix}.{suffix}"), &shape)?;
         }
         for (suffix, width) in [
-            ("attn_q.bias", config.embedding_length),
+            ("attn_q.bias", query_width),
             ("attn_k.bias", kv_width),
             ("attn_v.bias", kv_width),
             ("attn_output.bias", config.embedding_length),
