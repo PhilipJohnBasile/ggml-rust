@@ -15,6 +15,15 @@ pub enum LlamaRopeScaling {
     None,
     /// Divide token positions by the configured linear factor.
     Linear { factor: f32 },
+    /// Apply `YaRN` frequency interpolation and magnitude scaling.
+    Yarn {
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        original_context_length: usize,
+        attention_factor: f32,
+        ext_factor: f32,
+    },
 }
 
 impl LlamaRopeScaling {
@@ -23,7 +32,7 @@ impl LlamaRopeScaling {
     pub const fn factor(self) -> f32 {
         match self {
             Self::None => 1.0,
-            Self::Linear { factor } => factor,
+            Self::Linear { factor } | Self::Yarn { factor, .. } => factor,
         }
     }
 
@@ -33,6 +42,56 @@ impl LlamaRopeScaling {
         match self {
             Self::None => "none",
             Self::Linear { .. } => "linear",
+            Self::Yarn { .. } => "yarn",
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn phase(
+        self,
+        position: f32,
+        pair: usize,
+        head_dim: f32,
+        rotary_dimension_count: usize,
+        frequency_base: f32,
+    ) -> (f32, f32) {
+        #[allow(clippy::cast_precision_loss)]
+        let exponent = -2.0 * pair as f32 / head_dim;
+        let theta_extrap = position * frequency_base.powf(exponent);
+        match self {
+            Self::None => (theta_extrap, 1.0),
+            Self::Linear { factor } => (theta_extrap / factor, 1.0),
+            Self::Yarn {
+                factor,
+                beta_fast,
+                beta_slow,
+                original_context_length,
+                attention_factor,
+                ext_factor,
+            } => {
+                let freq_scale = 1.0 / factor;
+                let theta_interp = freq_scale * theta_extrap;
+                let low = rope_yarn_correction_dim(
+                    beta_fast,
+                    rotary_dimension_count,
+                    frequency_base,
+                    original_context_length,
+                )
+                .floor()
+                .max(0.0);
+                let high = rope_yarn_correction_dim(
+                    beta_slow,
+                    rotary_dimension_count,
+                    frequency_base,
+                    original_context_length,
+                )
+                .ceil()
+                .min(rotary_dimension_count.saturating_sub(1) as f32);
+                let ramp = rope_yarn_ramp(low, high, pair * 2) * ext_factor;
+                let theta = theta_interp * (1.0 - ramp) + theta_extrap * ramp;
+                let magnitude = attention_factor * (1.0 + 0.1 * (1.0 / freq_scale).ln());
+                (theta, magnitude)
+            }
         }
     }
 
@@ -41,6 +100,41 @@ impl LlamaRopeScaling {
             return Err(LlamaError::InvalidConfig(
                 "rope scaling factor must be finite and positive".to_owned(),
             ));
+        }
+        if let Self::Yarn {
+            beta_fast,
+            beta_slow,
+            original_context_length,
+            attention_factor,
+            ext_factor,
+            ..
+        } = self
+        {
+            if !beta_fast.is_finite() || beta_fast <= 0.0 {
+                return Err(LlamaError::InvalidConfig(
+                    "YaRN beta_fast must be finite and positive".to_owned(),
+                ));
+            }
+            if !beta_slow.is_finite() || beta_slow <= 0.0 {
+                return Err(LlamaError::InvalidConfig(
+                    "YaRN beta_slow must be finite and positive".to_owned(),
+                ));
+            }
+            if original_context_length == 0 {
+                return Err(LlamaError::InvalidConfig(
+                    "YaRN original context length must be greater than zero".to_owned(),
+                ));
+            }
+            if !attention_factor.is_finite() || attention_factor <= 0.0 {
+                return Err(LlamaError::InvalidConfig(
+                    "YaRN attention factor must be finite and positive".to_owned(),
+                ));
+            }
+            if !ext_factor.is_finite() || ext_factor < 0.0 {
+                return Err(LlamaError::InvalidConfig(
+                    "YaRN extension factor must be finite and nonnegative".to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -60,6 +154,8 @@ pub struct LlamaConfig {
     rope_freq_base: f32,
     rope_dimension_count: usize,
     rope_scaling: LlamaRopeScaling,
+    attention_temperature_scale: f32,
+    attention_temperature_context: usize,
     attention_window: Option<usize>,
     attention_window_pattern: Option<Vec<bool>>,
 }
@@ -78,10 +174,23 @@ struct LlamaMetadataKeys {
     rope_dimension_count: &'static str,
     rope_scaling_type: &'static str,
     rope_scaling_factor: &'static str,
+    rope_scaling_attn_factor: &'static str,
+    rope_scaling_original_context_length: &'static str,
+    rope_scaling_yarn_log_multiplier: &'static str,
+    rope_scaling_yarn_ext_factor: &'static str,
+    rope_scaling_yarn_attn_factor: &'static str,
+    rope_scaling_yarn_beta_fast: &'static str,
+    rope_scaling_yarn_beta_slow: &'static str,
+    rope_scaling_beta_fast_legacy: &'static str,
+    rope_scaling_beta_slow_legacy: &'static str,
+    rope_scaling_mscale_all_dim_legacy: &'static str,
+    rope_scaling_beta_legacy: &'static str,
+    attention_temperature_scale: &'static str,
     attention_window: &'static str,
     attention_window_pattern: &'static str,
 }
 
+#[allow(clippy::too_many_lines)]
 fn metadata_keys(architecture: &str) -> Option<LlamaMetadataKeys> {
     match architecture {
         "llama" => Some(LlamaMetadataKeys {
@@ -97,6 +206,18 @@ fn metadata_keys(architecture: &str) -> Option<LlamaMetadataKeys> {
             rope_dimension_count: "llama.rope.dimension_count",
             rope_scaling_type: "llama.rope.scaling.type",
             rope_scaling_factor: "llama.rope.scaling.factor",
+            rope_scaling_attn_factor: "llama.rope.scaling.attn_factor",
+            rope_scaling_original_context_length: "llama.rope.scaling.original_context_length",
+            rope_scaling_yarn_log_multiplier: "llama.rope.scaling.yarn_log_multiplier",
+            rope_scaling_yarn_ext_factor: "llama.rope.scaling.yarn_ext_factor",
+            rope_scaling_yarn_attn_factor: "llama.rope.scaling.yarn_attn_factor",
+            rope_scaling_yarn_beta_fast: "llama.rope.scaling.yarn_beta_fast",
+            rope_scaling_yarn_beta_slow: "llama.rope.scaling.yarn_beta_slow",
+            rope_scaling_beta_fast_legacy: "llama.rope.scaling.beta_fast",
+            rope_scaling_beta_slow_legacy: "llama.rope.scaling.beta_slow",
+            rope_scaling_mscale_all_dim_legacy: "llama.rope.scaling.mscale_all_dim",
+            rope_scaling_beta_legacy: "llama.rope.scaling_beta",
+            attention_temperature_scale: "llama.attention.temperature_scale",
             attention_window: "llama.attention.sliding_window",
             attention_window_pattern: "llama.attention.sliding_window_pattern",
         }),
@@ -113,6 +234,18 @@ fn metadata_keys(architecture: &str) -> Option<LlamaMetadataKeys> {
             rope_dimension_count: "qwen2.rope.dimension_count",
             rope_scaling_type: "qwen2.rope.scaling.type",
             rope_scaling_factor: "qwen2.rope.scaling.factor",
+            rope_scaling_attn_factor: "qwen2.rope.scaling.attn_factor",
+            rope_scaling_original_context_length: "qwen2.rope.scaling.original_context_length",
+            rope_scaling_yarn_log_multiplier: "qwen2.rope.scaling.yarn_log_multiplier",
+            rope_scaling_yarn_ext_factor: "qwen2.rope.scaling.yarn_ext_factor",
+            rope_scaling_yarn_attn_factor: "qwen2.rope.scaling.yarn_attn_factor",
+            rope_scaling_yarn_beta_fast: "qwen2.rope.scaling.yarn_beta_fast",
+            rope_scaling_yarn_beta_slow: "qwen2.rope.scaling.yarn_beta_slow",
+            rope_scaling_beta_fast_legacy: "qwen2.rope.scaling.beta_fast",
+            rope_scaling_beta_slow_legacy: "qwen2.rope.scaling.beta_slow",
+            rope_scaling_mscale_all_dim_legacy: "qwen2.rope.scaling.mscale_all_dim",
+            rope_scaling_beta_legacy: "qwen2.rope.scaling_beta",
+            attention_temperature_scale: "qwen2.attention.temperature_scale",
             attention_window: "qwen2.attention.sliding_window",
             attention_window_pattern: "qwen2.attention.sliding_window_pattern",
         }),
@@ -129,6 +262,18 @@ fn metadata_keys(architecture: &str) -> Option<LlamaMetadataKeys> {
             rope_dimension_count: "mistral.rope.dimension_count",
             rope_scaling_type: "mistral.rope.scaling.type",
             rope_scaling_factor: "mistral.rope.scaling.factor",
+            rope_scaling_attn_factor: "mistral.rope.scaling.attn_factor",
+            rope_scaling_original_context_length: "mistral.rope.scaling.original_context_length",
+            rope_scaling_yarn_log_multiplier: "mistral.rope.scaling.yarn_log_multiplier",
+            rope_scaling_yarn_ext_factor: "mistral.rope.scaling.yarn_ext_factor",
+            rope_scaling_yarn_attn_factor: "mistral.rope.scaling.yarn_attn_factor",
+            rope_scaling_yarn_beta_fast: "mistral.rope.scaling.yarn_beta_fast",
+            rope_scaling_yarn_beta_slow: "mistral.rope.scaling.yarn_beta_slow",
+            rope_scaling_beta_fast_legacy: "mistral.rope.scaling.beta_fast",
+            rope_scaling_beta_slow_legacy: "mistral.rope.scaling.beta_slow",
+            rope_scaling_mscale_all_dim_legacy: "mistral.rope.scaling.mscale_all_dim",
+            rope_scaling_beta_legacy: "mistral.rope.scaling_beta",
+            attention_temperature_scale: "mistral.attention.temperature_scale",
             attention_window: "mistral.attention.sliding_window",
             attention_window_pattern: "mistral.attention.sliding_window_pattern",
         }),
@@ -145,6 +290,18 @@ fn metadata_keys(architecture: &str) -> Option<LlamaMetadataKeys> {
             rope_dimension_count: "mistral3.rope.dimension_count",
             rope_scaling_type: "mistral3.rope.scaling.type",
             rope_scaling_factor: "mistral3.rope.scaling.factor",
+            rope_scaling_attn_factor: "mistral3.rope.scaling.attn_factor",
+            rope_scaling_original_context_length: "mistral3.rope.scaling.original_context_length",
+            rope_scaling_yarn_log_multiplier: "mistral3.rope.scaling.yarn_log_multiplier",
+            rope_scaling_yarn_ext_factor: "mistral3.rope.scaling.yarn_ext_factor",
+            rope_scaling_yarn_attn_factor: "mistral3.rope.scaling.yarn_attn_factor",
+            rope_scaling_yarn_beta_fast: "mistral3.rope.scaling.yarn_beta_fast",
+            rope_scaling_yarn_beta_slow: "mistral3.rope.scaling.yarn_beta_slow",
+            rope_scaling_beta_fast_legacy: "mistral3.rope.scaling.beta_fast",
+            rope_scaling_beta_slow_legacy: "mistral3.rope.scaling.beta_slow",
+            rope_scaling_mscale_all_dim_legacy: "mistral3.rope.scaling.mscale_all_dim",
+            rope_scaling_beta_legacy: "mistral3.rope.scaling_beta",
+            attention_temperature_scale: "mistral3.attention.temperature_scale",
             attention_window: "mistral3.attention.sliding_window",
             attention_window_pattern: "mistral3.attention.sliding_window_pattern",
         }),
@@ -324,6 +481,8 @@ impl LlamaConfig {
             rope_freq_base,
             rope_dimension_count,
             rope_scaling,
+            attention_temperature_scale: 0.0,
+            attention_temperature_context: 0,
             attention_window,
             attention_window_pattern,
         };
@@ -337,6 +496,7 @@ impl LlamaConfig {
     ///
     /// Returns an error when metadata is missing, malformed, or the model
     /// architecture is unsupported or not Llama-compatible.
+    #[allow(clippy::too_many_lines)]
     pub fn from_model(model: &GgufModel) -> Result<Self, LlamaError> {
         let architecture = model.architecture().unwrap_or("missing");
         let keys = metadata_keys(architecture)
@@ -392,14 +552,36 @@ impl LlamaConfig {
             model.metadata_scalar(keys.rope_scaling_factor)?,
             keys.rope_scaling_factor,
         )?;
-        let rope_scaling = parse_rope_scaling(rope_scaling_type, rope_scaling_factor)?;
+        let rope_scaling = parse_model_rope_scaling(
+            model,
+            &keys,
+            rope_scaling_type,
+            rope_scaling_factor,
+            context_length,
+        )?;
+        let attention_temperature_scale = optional_f32_value(
+            model
+                .metadata_scalar(keys.attention_temperature_scale)?
+                .or(model.metadata_scalar(keys.rope_scaling_beta_legacy)?),
+            keys.attention_temperature_scale,
+        )?
+        .unwrap_or(0.0);
+        let attention_temperature_context = if attention_temperature_scale == 0.0 {
+            0
+        } else {
+            optional_usize_value(
+                model.metadata_scalar(keys.rope_scaling_original_context_length)?,
+                keys.rope_scaling_original_context_length,
+            )?
+            .unwrap_or(context_length)
+        };
         let attention_window = optional_usize_value(
             model.metadata_scalar(keys.attention_window)?,
             keys.attention_window,
         )?;
         let attention_window_pattern =
             parse_attention_window_pattern(model, keys.attention_window_pattern, block_count)?;
-        Self::new_with_rope_scaling_and_attention_window_and_pattern(
+        let mut config = Self::new_with_rope_scaling_and_attention_window_and_pattern(
             context_length,
             embedding_length,
             block_count,
@@ -413,7 +595,11 @@ impl LlamaConfig {
             rope_scaling,
             attention_window,
             attention_window_pattern,
-        )
+        )?;
+        config.attention_temperature_scale = attention_temperature_scale;
+        config.attention_temperature_context = attention_temperature_context;
+        config.validate()?;
+        Ok(config)
     }
 
     /// Returns the maximum sequence length.
@@ -486,6 +672,47 @@ impl LlamaConfig {
     #[must_use]
     pub const fn rope_scaling_factor(&self) -> f32 {
         self.rope_scaling.factor()
+    }
+
+    /// Returns the rotary angle and magnitude for one pair of head values.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn rope_phase(&self, position: f32, pair: usize, head_dim: usize) -> (f32, f32) {
+        self.rope_scaling.phase(
+            position,
+            pair,
+            head_dim as f32,
+            self.rope_dimension_count,
+            self.rope_freq_base,
+        )
+    }
+
+    /// Returns the `YaRN` or model-specific attention magnitude applied to `RoPE`.
+    #[must_use]
+    pub const fn rope_attention_factor(&self) -> f32 {
+        match self.rope_scaling {
+            LlamaRopeScaling::Yarn {
+                attention_factor, ..
+            } => attention_factor,
+            _ => 1.0,
+        }
+    }
+
+    /// Returns the configured attention-temperature scale coefficient.
+    #[must_use]
+    pub const fn attention_temperature_scale(&self) -> f32 {
+        self.attention_temperature_scale
+    }
+
+    /// Returns the dynamic query multiplier used by Mistral3 temperature tuning.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn attention_temperature_multiplier(&self, position: usize) -> f32 {
+        if self.attention_temperature_scale == 0.0 {
+            return 1.0;
+        }
+        let floor = self.attention_temperature_context.max(1);
+        ((position / floor) as f32 + 1.0).ln() * self.attention_temperature_scale + 1.0
     }
 
     /// Returns the optional causal attention window in tokens.
@@ -605,6 +832,16 @@ impl LlamaConfig {
             ));
         }
         self.rope_scaling.validate()?;
+        if !self.attention_temperature_scale.is_finite() {
+            return Err(LlamaError::InvalidConfig(
+                "attention temperature scale must be finite".to_owned(),
+            ));
+        }
+        if self.attention_temperature_scale != 0.0 && self.attention_temperature_context == 0 {
+            return Err(LlamaError::InvalidConfig(
+                "attention temperature context must be greater than zero when temperature scaling is enabled".to_owned(),
+            ));
+        }
         if self.attention_window == Some(0) {
             return Err(LlamaError::InvalidConfig(
                 "attention_window must be greater than zero".to_owned(),
@@ -2194,6 +2431,7 @@ impl<'a> LlamaSession<'a> {
     /// Returns an error when the token or context bound is invalid, or when a
     /// checked tensor operation produces a non-finite result.
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::cast_precision_loss)]
     pub fn forward_token(&mut self, token_id: usize) -> Result<Vec<f32>, LlamaError> {
         if token_id >= self.model.config.vocab_size {
             return Err(LlamaError::InvalidConfig(format!(
@@ -2212,7 +2450,11 @@ impl<'a> LlamaSession<'a> {
         let mut hidden = row_tensor(embedding_width, hidden)?;
         let head_dim = embedding_width / self.model.config.head_count;
         #[allow(clippy::cast_precision_loss)]
-        let attention_scale = (head_dim as f32).sqrt().recip();
+        let attention_scale = (head_dim as f32).sqrt().recip()
+            * self
+                .model
+                .config
+                .attention_temperature_multiplier(self.position);
         for (layer_index, layer) in self.model.layers.iter().enumerate() {
             let normalized =
                 hidden
@@ -2227,21 +2469,23 @@ impl<'a> LlamaSession<'a> {
             let mut query_values = query.into_data();
             let mut key_values = key.into_data();
             let value_values = value.into_data();
-            apply_rope(
+            apply_rope_with_scaling(
                 &mut query_values,
                 self.model.config.head_count,
                 head_dim,
                 self.model.config.rope_dimension_count,
-                self.model.config.scaled_rope_position(self.position),
+                self.position as f32,
                 self.model.config.rope_freq_base,
+                self.model.config.rope_scaling,
             )?;
-            apply_rope(
+            apply_rope_with_scaling(
                 &mut key_values,
                 self.model.config.head_count_kv,
                 head_dim,
                 self.model.config.rope_dimension_count,
-                self.model.config.scaled_rope_position(self.position),
+                self.position as f32,
                 self.model.config.rope_freq_base,
+                self.model.config.rope_scaling,
             )?;
             if key_values.len() != self.cache.kv_width {
                 return Err(LlamaError::Tensor(
@@ -2430,6 +2674,7 @@ impl<'a> LlamaSession<'a> {
     }
 }
 
+#[cfg(test)]
 fn apply_rope(
     values: &mut [f32],
     head_count: usize,
@@ -2438,20 +2683,44 @@ fn apply_rope(
     position: f32,
     frequency_base: f32,
 ) -> Result<(), LlamaError> {
+    apply_rope_with_scaling(
+        values,
+        head_count,
+        head_dim,
+        rope_dimension_count,
+        position,
+        frequency_base,
+        LlamaRopeScaling::None,
+    )
+}
+
+fn apply_rope_with_scaling(
+    values: &mut [f32],
+    head_count: usize,
+    head_dim: usize,
+    rope_dimension_count: usize,
+    position: f32,
+    frequency_base: f32,
+    scaling: LlamaRopeScaling,
+) -> Result<(), LlamaError> {
     let head_width = head_dim;
     #[allow(clippy::cast_precision_loss)]
     let head_dim = head_width as f32;
     for head in 0..head_count {
         let start = head * head_width;
         for pair in 0..rope_dimension_count / 2 {
-            #[allow(clippy::cast_precision_loss)]
-            let exponent = -2.0 * pair as f32 / head_dim;
-            let angle = position * frequency_base.powf(exponent);
+            let (angle, magnitude) = scaling.phase(
+                position,
+                pair,
+                head_dim,
+                rope_dimension_count,
+                frequency_base,
+            );
             let (sine, cosine) = angle.sin_cos();
             let first = values[start + pair * 2];
             let second = values[start + pair * 2 + 1];
-            let rotated_first = first * cosine - second * sine;
-            let rotated_second = first * sine + second * cosine;
+            let rotated_first = (first * cosine - second * sine) * magnitude;
+            let rotated_second = (first * sine + second * cosine) * magnitude;
             if !rotated_first.is_finite() || !rotated_second.is_finite() {
                 return Err(LlamaError::Tensor(
                     "rotary embedding is not finite".to_owned(),
@@ -2674,6 +2943,124 @@ fn parse_rope_scaling(
             value: format!("expected a string, got {value:?}"),
         }),
     }
+}
+
+fn parse_model_rope_scaling(
+    model: &GgufModel,
+    keys: &LlamaMetadataKeys,
+    kind: Option<MetadataScalar>,
+    factor: Option<f32>,
+    context_length: usize,
+) -> Result<LlamaRopeScaling, LlamaError> {
+    let is_yarn = matches!(kind, Some(MetadataScalar::String(ref value)) if value == "yarn");
+    if !is_yarn {
+        return parse_rope_scaling(kind, factor);
+    }
+    let factor = factor.ok_or(LlamaError::MissingMetadata(keys.rope_scaling_factor))?;
+    let beta_fast = optional_alias_f32(
+        model,
+        keys.rope_scaling_yarn_beta_fast,
+        keys.rope_scaling_beta_fast_legacy,
+    )?
+    .unwrap_or(32.0);
+    let beta_slow = optional_alias_f32(
+        model,
+        keys.rope_scaling_yarn_beta_slow,
+        keys.rope_scaling_beta_slow_legacy,
+    )?
+    .unwrap_or(1.0);
+    let original_context_length = optional_usize_value(
+        model.metadata_scalar(keys.rope_scaling_original_context_length)?,
+        keys.rope_scaling_original_context_length,
+    )?
+    .unwrap_or(context_length);
+    let log_multiplier = optional_alias_f32(
+        model,
+        keys.rope_scaling_yarn_log_multiplier,
+        keys.rope_scaling_mscale_all_dim_legacy,
+    )?
+    .unwrap_or(0.0);
+    let ext_factor = optional_f32_value(
+        model.metadata_scalar(keys.rope_scaling_yarn_ext_factor)?,
+        keys.rope_scaling_yarn_ext_factor,
+    )?
+    .unwrap_or(1.0);
+    let rope_attention_factor = optional_f32_value(
+        model.metadata_scalar(keys.rope_scaling_attn_factor)?,
+        keys.rope_scaling_attn_factor,
+    )?
+    .unwrap_or(1.0);
+    let configured_yarn_attention_factor = optional_f32_value(
+        model.metadata_scalar(keys.rope_scaling_yarn_attn_factor)?,
+        keys.rope_scaling_yarn_attn_factor,
+    )?;
+    let get_mscale = |scale: f32, multiplier: f32| {
+        if scale <= 1.0 {
+            1.0
+        } else {
+            0.1 * multiplier * scale.ln() + 1.0
+        }
+    };
+    let mut attention_factor = configured_yarn_attention_factor.unwrap_or_else(|| {
+        let mut inferred = if log_multiplier == 0.0 {
+            get_mscale(factor, 1.0)
+        } else {
+            get_mscale(factor, 1.0) / get_mscale(factor, log_multiplier)
+        };
+        if ext_factor != 0.0 {
+            inferred *= 1.0 / (1.0 + 0.1 * factor.ln());
+        }
+        inferred
+    });
+    attention_factor *= rope_attention_factor;
+    let scaling = LlamaRopeScaling::Yarn {
+        factor,
+        beta_fast,
+        beta_slow,
+        original_context_length,
+        attention_factor,
+        ext_factor,
+    };
+    scaling.validate().map_err(|error| match error {
+        LlamaError::InvalidConfig(value) => LlamaError::InvalidMetadata {
+            key: keys.rope_scaling_factor,
+            value,
+        },
+        other => other,
+    })?;
+    Ok(scaling)
+}
+
+fn optional_alias_f32(
+    model: &GgufModel,
+    primary_key: &'static str,
+    alias_key: &'static str,
+) -> Result<Option<f32>, LlamaError> {
+    optional_f32_value(
+        model
+            .metadata_scalar(primary_key)?
+            .or(model.metadata_scalar(alias_key)?),
+        primary_key,
+    )
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn rope_yarn_correction_dim(
+    rotations: f32,
+    rotary_dimension_count: usize,
+    frequency_base: f32,
+    original_context_length: usize,
+) -> f32 {
+    #[allow(clippy::cast_precision_loss)]
+    let dimension = rotary_dimension_count as f32;
+    dimension * ((original_context_length as f32) / (rotations * 2.0 * std::f32::consts::PI)).ln()
+        / (2.0 * frequency_base.ln())
+}
+
+fn rope_yarn_ramp(low: f32, high: f32, pair_index: usize) -> f32 {
+    #[allow(clippy::cast_precision_loss)]
+    let value = (pair_index as f32 - low) / (0.001_f32.max(high - low));
+    1.0 - value.clamp(0.0, 1.0)
 }
 
 fn parse_attention_window_pattern(
@@ -2946,7 +3333,8 @@ mod tests {
         bytes.extend_from_slice(b"GGUF");
         bytes.extend_from_slice(&3_u32.to_le_bytes());
         bytes.extend_from_slice(&(config.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&13_u64.to_le_bytes());
+        let metadata_count: u64 = if architecture == "mistral3" { 19 } else { 13 };
+        bytes.extend_from_slice(&metadata_count.to_le_bytes());
         push_string(&mut bytes, "general.architecture");
         bytes.extend_from_slice(&8_u32.to_le_bytes());
         push_string(&mut bytes, architecture);
@@ -2979,6 +3367,18 @@ mod tests {
             &format!("{architecture}.rope.freq_base"),
             10_000.0,
         );
+        if architecture == "mistral3" {
+            push_string_metadata(&mut bytes, "mistral3.rope.scaling.type", "yarn");
+            push_f32_metadata(&mut bytes, "mistral3.rope.scaling.factor", 4.0);
+            push_f32_metadata(&mut bytes, "mistral3.rope.scaling.yarn_beta_fast", 32.0);
+            push_f32_metadata(&mut bytes, "mistral3.rope.scaling.yarn_beta_slow", 1.0);
+            push_u32_metadata(
+                &mut bytes,
+                "mistral3.rope.scaling.original_context_length",
+                8,
+            );
+            push_f32_metadata(&mut bytes, "mistral3.attention.temperature_scale", 0.1);
+        }
         push_string(&mut bytes, "general.name");
         bytes.extend_from_slice(&8_u32.to_le_bytes());
         push_string(&mut bytes, "fixture");
@@ -3240,6 +3640,38 @@ mod tests {
     }
 
     #[test]
+    fn applies_yarn_phase_mix_and_magnitude_scaling() {
+        let scaling = LlamaRopeScaling::Yarn {
+            factor: 4.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            original_context_length: 4096,
+            attention_factor: 1.0,
+            ext_factor: 1.0,
+        };
+        assert_eq!(scaling.kind(), "yarn");
+        assert!((scaling.factor() - 4.0).abs() < f32::EPSILON);
+        scaling.validate().unwrap();
+        let (angle, magnitude) = scaling.phase(4096.0, 0, 128.0, 4, 10_000.0);
+        assert!(angle.is_finite());
+        assert!(magnitude.is_finite());
+        let mut values = vec![1.0, 0.0, 0.0, 1.0];
+        apply_rope_with_scaling(&mut values, 1, 4, 4, 4096.0, 10_000.0, scaling).unwrap();
+        assert!(values.iter().all(|value| value.is_finite()));
+        assert!((values[0].hypot(values[1]) - magnitude).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn applies_attention_temperature_multiplier_by_original_context() {
+        let mut config = LlamaConfig::new(16, 8, 1, 2, 1, 16, 32, 1.0e-5, 10_000.0).unwrap();
+        config.attention_temperature_scale = 0.1;
+        config.attention_temperature_context = 8;
+        assert!((config.attention_temperature_multiplier(0) - 1.0).abs() < f32::EPSILON);
+        let expected = 1.0 + 0.1 * 3.0_f32.ln();
+        assert!((config.attention_temperature_multiplier(16) - expected).abs() < 1.0e-6);
+    }
+
+    #[test]
     fn applies_a_bounded_sliding_attention_window() {
         let config = LlamaConfig::new_with_rope_scaling_and_attention_window(
             16,
@@ -3397,6 +3829,9 @@ mod tests {
         let path = write_fixture(&llama_fixture_for("mistral3"));
         let model = LlamaModel::open(&path, 1 << 20).unwrap();
         assert_eq!(model.config().embedding_length(), 4);
+        assert_eq!(model.config().rope_scaling().kind(), "yarn");
+        assert!((model.config().rope_scaling_factor() - 4.0).abs() < f32::EPSILON);
+        assert!((model.config().attention_temperature_scale() - 0.1).abs() < f32::EPSILON);
         assert_eq!(model.config().kv_cache_capacity_for_layer(0), 16);
         let cpu = model.load_cpu().unwrap();
         assert_eq!(cpu.forward_token(1).unwrap().len(), 8);
