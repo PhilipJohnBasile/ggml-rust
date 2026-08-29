@@ -1502,6 +1502,7 @@ fn materialize_affine_quantized(
     let n_bins = f32::from((1_u16 << bits) - 1);
     let mut group_values = vec![0.0_f32; group_size];
     for output_index in 0..output {
+        let mut iq2_block = None;
         for group_index in 0..groups {
             let group_start = group_index * group_size;
             let mut minimum = f32::INFINITY;
@@ -1513,7 +1514,36 @@ fn materialize_affine_quantized(
                     .ok_or_else(|| {
                         ModelError::Shape("quantized matrix index overflows".to_owned())
                     })?;
-                let value = quantized_value_at(descriptor.value_type, tensor_bytes, index)?;
+                let value = if descriptor.value_type.raw() == 16 {
+                    let block_index = index / 256;
+                    let block_offset = index % 256;
+                    let needs_reload = iq2_block
+                        .as_ref()
+                        .is_none_or(|(cached_index, _)| *cached_index != block_index);
+                    if needs_reload {
+                        let block_start = block_index.checked_mul(66).ok_or_else(|| {
+                            ModelError::Shape("IQ2_XXS block offset overflows".to_owned())
+                        })?;
+                        let block_end = block_start.checked_add(66).ok_or_else(|| {
+                            ModelError::Shape("IQ2_XXS block range overflows".to_owned())
+                        })?;
+                        let block = tensor_bytes
+                            .get(block_start..block_end)
+                            .and_then(|slice| <&[u8; 66]>::try_from(slice).ok())
+                            .ok_or_else(|| {
+                                ModelError::Shape("IQ2_XXS block is outside the tensor".to_owned())
+                            })?;
+                        iq2_block = Some((block_index, decode_iq2_xxs_block(block)));
+                    }
+                    iq2_block
+                        .as_ref()
+                        .map(|(_, values)| values[block_offset])
+                        .ok_or_else(|| {
+                            ModelError::Shape("IQ2_XXS block cache is empty".to_owned())
+                        })?
+                } else {
+                    quantized_value_at(descriptor.value_type, tensor_bytes, index)?
+                };
                 if !value.is_finite() {
                     return Err(ModelError::Shape(
                         "quantized matrix contains a non-finite value".to_owned(),
@@ -1746,27 +1776,36 @@ fn decode_iq2_xxs(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
     }
     let mut values = Vec::with_capacity(blocks.len() * BLOCK_VALUES);
     for block in blocks {
-        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
-        let qs = &block[2..];
-        for ib32 in 0..8 {
-            let offset = ib32 * 8;
-            let aux32_g = u32::from(u16::from_le_bytes([qs[offset], qs[offset + 1]]))
-                | (u32::from(u16::from_le_bytes([qs[offset + 2], qs[offset + 3]])) << 16);
-            let aux32_s = u32::from(u16::from_le_bytes([qs[offset + 4], qs[offset + 5]]))
-                | (u32::from(u16::from_le_bytes([qs[offset + 6], qs[offset + 7]])) << 16);
-            let block_scale = scale * (0.5 + (aux32_s >> 28) as f32) * 0.25;
-            for group in 0..4 {
-                let grid = IQ2_XXS_GRID[((aux32_g >> (8 * group)) & 0xff) as usize].to_le_bytes();
-                let sign_index = ((aux32_s >> (7 * group)) & 0x7f) as u8;
-                let signs = sign_index | (sign_index.count_ones() as u8 % 2) << 7;
-                for (index, magnitude) in grid.iter().enumerate() {
-                    let sign = if signs & (1 << index) == 0 { 1.0 } else { -1.0 };
-                    values.push(block_scale * f32::from(*magnitude) * sign);
-                }
+        values.extend(decode_iq2_xxs_block(block));
+    }
+    Ok(values)
+}
+
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn decode_iq2_xxs_block(block: &[u8; 66]) -> [f32; 256] {
+    let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let qs = &block[2..];
+    let mut values = [0.0_f32; 256];
+    let mut value_index = 0;
+    for ib32 in 0..8 {
+        let offset = ib32 * 8;
+        let aux32_g = u32::from(u16::from_le_bytes([qs[offset], qs[offset + 1]]))
+            | (u32::from(u16::from_le_bytes([qs[offset + 2], qs[offset + 3]])) << 16);
+        let aux32_s = u32::from(u16::from_le_bytes([qs[offset + 4], qs[offset + 5]]))
+            | (u32::from(u16::from_le_bytes([qs[offset + 6], qs[offset + 7]])) << 16);
+        let block_scale = scale * (0.5 + (aux32_s >> 28) as f32) * 0.25;
+        for group in 0..4 {
+            let grid = IQ2_XXS_GRID[((aux32_g >> (8 * group)) & 0xff) as usize].to_le_bytes();
+            let sign_index = ((aux32_s >> (7 * group)) & 0x7f) as u8;
+            let signs = sign_index | (sign_index.count_ones() as u8 % 2) << 7;
+            for (index, magnitude) in grid.iter().enumerate() {
+                let sign = if signs & (1 << index) == 0 { 1.0 } else { -1.0 };
+                values[value_index] = block_scale * f32::from(*magnitude) * sign;
+                value_index += 1;
             }
         }
     }
-    Ok(values)
+    values
 }
 
 fn q4_0_value_at(bytes: &[u8], index: usize) -> Result<f32, ModelError> {
