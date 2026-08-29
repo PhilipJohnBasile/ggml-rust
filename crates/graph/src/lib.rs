@@ -108,6 +108,8 @@ enum Operation {
     Absolute,
     Square,
     SquareRoot,
+    Reciprocal,
+    Rsqrt,
     Exponential,
     Logarithm,
     Sine,
@@ -464,6 +466,24 @@ impl Graph {
         self.unary(Operation::SquareRoot, input)
     }
 
+    /// Adds an elementwise reciprocal node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid.
+    pub fn reciprocal(&mut self, input: ValueId) -> Result<ValueId, GraphError> {
+        self.unary(Operation::Reciprocal, input)
+    }
+
+    /// Adds an elementwise reciprocal square-root node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input handle is invalid.
+    pub fn rsqrt(&mut self, input: ValueId) -> Result<ValueId, GraphError> {
+        self.unary(Operation::Rsqrt, input)
+    }
+
     /// Adds an elementwise exponential node.
     ///
     /// # Errors
@@ -800,6 +820,8 @@ impl Graph {
                 Operation::Absolute => values[self.input_index(node, 0)?].abs()?,
                 Operation::Square => values[self.input_index(node, 0)?].sqr()?,
                 Operation::SquareRoot => values[self.input_index(node, 0)?].sqrt()?,
+                Operation::Reciprocal => values[self.input_index(node, 0)?].reciprocal()?,
+                Operation::Rsqrt => values[self.input_index(node, 0)?].rsqrt()?,
                 Operation::Exponential => values[self.input_index(node, 0)?].exp()?,
                 Operation::Logarithm => values[self.input_index(node, 0)?].log()?,
                 Operation::Sine => values[self.input_index(node, 0)?].sin()?,
@@ -1107,6 +1129,22 @@ mod tests {
         assert!(result[0].data()[2].abs() < 1.0e-6);
         assert!(result[1].data()[1].abs() < 1.0e-6);
         assert!((result[1].data()[2] + 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn evaluates_reciprocal_graph_nodes() {
+        let mut graph = Graph::new();
+        let input = graph.input([3]).unwrap();
+        let reciprocal = graph.reciprocal(input).unwrap();
+        let rsqrt = graph.rsqrt(input).unwrap();
+        let result = graph
+            .evaluate(
+                &[Tensor::from_data([3], [0.25, 1.0, 4.0]).unwrap()],
+                &[reciprocal, rsqrt],
+            )
+            .unwrap();
+        assert_eq!(result[0].data(), &[4.0, 1.0, 0.25]);
+        assert_eq!(result[1].data(), &[2.0, 1.0, 0.5]);
     }
 
     #[test]

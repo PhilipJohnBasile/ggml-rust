@@ -792,6 +792,24 @@ impl Tensor {
         self.unary_op("sqrt", f32::sqrt)
     }
 
+    /// Computes the elementwise reciprocal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an input or output value is non-finite.
+    pub fn reciprocal(&self) -> Result<Self, TensorError> {
+        self.unary_op("reciprocal", f32::recip)
+    }
+
+    /// Computes the elementwise reciprocal square root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an input or output value is non-finite.
+    pub fn rsqrt(&self) -> Result<Self, TensorError> {
+        self.unary_op("rsqrt", |value| value.sqrt().recip())
+    }
+
     /// Computes the natural exponential elementwise.
     ///
     /// # Errors
@@ -1845,6 +1863,11 @@ mod tests {
         let positive = Tensor::from_data([3], [0.5, 1.0, 4.0]).unwrap();
         assert!((positive.exp().unwrap().data()[0] - 0.5_f32.exp()).abs() < 1.0e-6);
         assert!((positive.log().unwrap().data()[1] - 0.0).abs() < 1.0e-6);
+        assert_eq!(positive.reciprocal().unwrap().data(), &[2.0, 1.0, 0.25]);
+        assert_eq!(
+            positive.rsqrt().unwrap().data(),
+            &[2.0_f32.sqrt(), 1.0, 0.5]
+        );
         let angles = Tensor::from_data(
             [3],
             [0.0, std::f32::consts::FRAC_PI_2, std::f32::consts::PI],
