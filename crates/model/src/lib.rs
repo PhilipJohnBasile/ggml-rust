@@ -136,27 +136,7 @@ impl QuantizedMatrix {
     /// Returns an error when `column` is outside the matrix or a decoded value
     /// is malformed or non-finite.
     pub fn column(&self, column: usize) -> Result<Vec<f32>, ModelError> {
-        if column >= self.columns {
-            return Err(ModelError::Shape(format!(
-                "quantized matrix column {column} is outside {} columns",
-                self.columns
-            )));
-        }
-        let mut output = Vec::with_capacity(self.rows);
-        for row in 0..self.rows {
-            let index = column
-                .checked_mul(self.rows)
-                .and_then(|base| base.checked_add(row))
-                .ok_or_else(|| ModelError::Shape("quantized matrix index overflows".to_owned()))?;
-            let value = quantized_value_at(self.value_type, &self.bytes, index)?;
-            if !value.is_finite() {
-                return Err(ModelError::Shape(
-                    "quantized matrix decoded a non-finite value".to_owned(),
-                ));
-            }
-            output.push(value);
-        }
-        Ok(output)
+        self.decode_column(column)
     }
 
     /// Computes a row-vector product directly from the encoded matrix.
@@ -184,20 +164,9 @@ impl QuantizedMatrix {
         }
         let mut output = Vec::with_capacity(self.columns);
         for column in 0..self.columns {
+            let weights = self.decode_column(column)?;
             let mut sum = 0.0_f32;
-            for (row, &value) in input.iter().enumerate() {
-                let index = column
-                    .checked_mul(self.rows)
-                    .and_then(|base| base.checked_add(row))
-                    .ok_or_else(|| {
-                        ModelError::Shape("quantized matrix index overflows".to_owned())
-                    })?;
-                let weight = quantized_value_at(self.value_type, &self.bytes, index)?;
-                if !weight.is_finite() {
-                    return Err(ModelError::Shape(
-                        "quantized matrix decoded a non-finite value".to_owned(),
-                    ));
-                }
+            for (&value, &weight) in input.iter().zip(&weights) {
                 sum += value * weight;
                 if !sum.is_finite() {
                     return Err(ModelError::Shape(
@@ -208,6 +177,58 @@ impl QuantizedMatrix {
             output.push(sum);
         }
         Ok(output)
+    }
+
+    fn decode_column(&self, column: usize) -> Result<Vec<f32>, ModelError> {
+        if column >= self.columns {
+            return Err(ModelError::Shape(format!(
+                "quantized matrix column {column} is outside {} columns",
+                self.columns
+            )));
+        }
+        let (block_values, block_bytes) =
+            quantized_block_layout(self.value_type).ok_or_else(|| {
+                ModelError::UnsupportedTensorType {
+                    name: "<quantized-matrix>".to_owned(),
+                    value_type: self.value_type,
+                }
+            })?;
+        if !self.rows.is_multiple_of(block_values) {
+            return Err(ModelError::Shape(
+                "quantized matrix rows are not block aligned".to_owned(),
+            ));
+        }
+        let column_bytes = self
+            .rows
+            .checked_div(block_values)
+            .and_then(|blocks| blocks.checked_mul(block_bytes))
+            .ok_or_else(|| {
+                ModelError::Shape("quantized matrix byte length overflows".to_owned())
+            })?;
+        let start = column
+            .checked_mul(column_bytes)
+            .ok_or_else(|| ModelError::Shape("quantized matrix index overflows".to_owned()))?;
+        let end = start
+            .checked_add(column_bytes)
+            .ok_or_else(|| ModelError::Shape("quantized matrix range overflows".to_owned()))?;
+        let bytes = self
+            .bytes
+            .get(start..end)
+            .ok_or_else(|| ModelError::Shape("quantized matrix bytes are truncated".to_owned()))?;
+        let values = decode_values(self.value_type, bytes)?;
+        if values.len() != self.rows {
+            return Err(ModelError::Shape(format!(
+                "quantized matrix column decoded {} values, expected {}",
+                values.len(),
+                self.rows
+            )));
+        }
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(ModelError::Shape(
+                "quantized matrix decoded a non-finite value".to_owned(),
+            ));
+        }
+        Ok(values)
     }
 }
 
