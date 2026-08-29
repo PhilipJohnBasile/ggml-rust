@@ -213,6 +213,116 @@ impl LlamaConfig {
     }
 }
 
+/// Sampling parameters for incremental Llama generation.
+///
+/// A temperature of zero selects the highest finite logit and preserves the
+/// deterministic greedy behavior. A positive temperature enables sampling,
+/// optionally restricted by `top_k` and nucleus `top_p`. A zero `top_k` means
+/// that no top-k limit is applied. The seed is deterministic, including when
+/// it is zero.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LlamaSamplingConfig {
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    seed: u64,
+}
+
+impl Default for LlamaSamplingConfig {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            seed: 0,
+        }
+    }
+}
+
+impl LlamaSamplingConfig {
+    /// Creates validated sampling parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when temperature or nucleus probability is invalid.
+    pub fn new(temperature: f32, top_k: usize, top_p: f32, seed: u64) -> Result<Self, LlamaError> {
+        if !temperature.is_finite() || temperature < 0.0 {
+            return Err(LlamaError::InvalidConfig(
+                "sampling temperature must be finite and nonnegative".to_owned(),
+            ));
+        }
+        if !top_p.is_finite() || top_p <= 0.0 || top_p > 1.0 {
+            return Err(LlamaError::InvalidConfig(
+                "sampling top_p must be finite and in (0, 1]".to_owned(),
+            ));
+        }
+        Ok(Self {
+            temperature,
+            top_k,
+            top_p,
+            seed,
+        })
+    }
+
+    /// Returns the temperature. Zero selects greedy decoding.
+    #[must_use]
+    pub const fn temperature(self) -> f32 {
+        self.temperature
+    }
+
+    /// Returns the top-k limit. Zero means unlimited.
+    #[must_use]
+    pub const fn top_k(self) -> usize {
+        self.top_k
+    }
+
+    /// Returns the nucleus probability limit.
+    #[must_use]
+    pub const fn top_p(self) -> f32 {
+        self.top_p
+    }
+
+    /// Returns the deterministic sampling seed.
+    #[must_use]
+    pub const fn seed(self) -> u64 {
+        self.seed
+    }
+}
+
+/// Stateful sampler that applies one validated policy to a stream of logits.
+#[derive(Debug, Clone, Copy)]
+pub struct LlamaSampler {
+    config: LlamaSamplingConfig,
+    rng: DeterministicRng,
+}
+
+impl LlamaSampler {
+    /// Creates a sampler with deterministic state initialized from `config`.
+    #[must_use]
+    pub fn new(config: LlamaSamplingConfig) -> Self {
+        Self {
+            rng: DeterministicRng::new(config.seed()),
+            config,
+        }
+    }
+
+    /// Returns the policy used by this sampler.
+    #[must_use]
+    pub const fn config(&self) -> LlamaSamplingConfig {
+        self.config
+    }
+
+    /// Selects one token from finite vocabulary logits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when logits are empty, non-finite, or cannot produce a
+    /// valid probability distribution.
+    pub fn sample(&mut self, logits: &[f32]) -> Result<usize, LlamaError> {
+        sample_logits(logits, self.config, &mut self.rng)
+    }
+}
+
 /// Errors returned by Llama configuration and model admission.
 #[derive(Debug)]
 pub enum LlamaError {
@@ -724,6 +834,23 @@ impl LlamaCpuModel {
     /// Returns an error when tokenizer metadata is absent, text cannot be
     /// encoded, or decoding exceeds the model context.
     pub fn generate_text(&self, prompt: &str, max_new_tokens: usize) -> Result<String, LlamaError> {
+        self.generate_text_with_sampling(prompt, max_new_tokens, LlamaSamplingConfig::default())
+    }
+
+    /// Generates text with validated temperature, top-k, top-p, and seed
+    /// controls.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when tokenizer metadata is absent, text cannot be
+    /// encoded, sampling parameters are invalid, or decoding exceeds the
+    /// model context.
+    pub fn generate_text_with_sampling(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        sampling: LlamaSamplingConfig,
+    ) -> Result<String, LlamaError> {
         let tokenizer = self
             .tokenizer
             .as_ref()
@@ -733,7 +860,7 @@ impl LlamaCpuModel {
             prompt_ids.insert(0, bos);
         }
         let mut session = self.session()?;
-        let generated = session.generate_greedy(&prompt_ids, max_new_tokens)?;
+        let generated = session.generate_with_sampling(&prompt_ids, max_new_tokens, sampling)?;
         tokenizer.decode(&generated)
     }
 }
@@ -991,6 +1118,27 @@ impl<'a> LlamaSession<'a> {
         prompt_ids: &[usize],
         max_new_tokens: usize,
     ) -> Result<Vec<usize>, LlamaError> {
+        self.generate_with_sampling(prompt_ids, max_new_tokens, LlamaSamplingConfig::default())
+    }
+
+    /// Generates up to `max_new_tokens` with validated sampling controls.
+    ///
+    /// The returned ids contain only newly generated tokens. An EOS token ends
+    /// generation and is not included in the result. Sampling uses a small
+    /// deterministic PRNG owned by this call, so the same logits,
+    /// configuration, and seed produce the same token sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the prompt exceeds the context, the model has no
+    /// valid vocabulary logits, or sampling produces a non-finite value.
+    pub fn generate_with_sampling(
+        &mut self,
+        prompt_ids: &[usize],
+        max_new_tokens: usize,
+        sampling: LlamaSamplingConfig,
+    ) -> Result<Vec<usize>, LlamaError> {
+        let mut sampler = LlamaSampler::new(sampling);
         let mut logits = if let Some(logits) = self.decode(prompt_ids)?.pop() {
             logits
         } else if let Some(bos) = self
@@ -1012,7 +1160,7 @@ impl<'a> LlamaSession<'a> {
             .and_then(|tokenizer| tokenizer.eos_token_id);
         let mut generated = Vec::with_capacity(max_new_tokens);
         for _ in 0..max_new_tokens {
-            let token_id = argmax_finite(&logits)?;
+            let token_id = sampler.sample(&logits)?;
             if Some(token_id) == eos_token_id {
                 break;
             }
@@ -1056,6 +1204,125 @@ fn apply_rope(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DeterministicRng {
+    state: u64,
+}
+
+impl DeterministicRng {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: if seed == 0 {
+                0x9e37_79b9_7f4a_7c15
+            } else {
+                seed
+            },
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut value = self.state;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        self.state = value;
+        value
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn next_unit_f32(&mut self) -> f32 {
+        let mantissa = self.next_u64() >> 40;
+        mantissa as f32 / 16_777_216.0
+    }
+}
+
+fn sample_logits(
+    values: &[f32],
+    config: LlamaSamplingConfig,
+    rng: &mut DeterministicRng,
+) -> Result<usize, LlamaError> {
+    if values.is_empty() {
+        return Err(LlamaError::InvalidConfig(
+            "model returned an empty vocabulary".to_owned(),
+        ));
+    }
+    for value in values {
+        if !value.is_finite() {
+            return Err(LlamaError::Tensor(
+                "logits contain a non-finite value".to_owned(),
+            ));
+        }
+    }
+    if config.temperature() == 0.0 {
+        return argmax_finite(values);
+    }
+    let mut candidates = values
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, value)| {
+            let scaled = value / config.temperature();
+            (index, scaled)
+        })
+        .collect::<Vec<_>>();
+    if candidates.iter().any(|(_, value)| !value.is_finite()) {
+        return Err(LlamaError::Tensor(
+            "temperature-scaled logits contain a non-finite value".to_owned(),
+        ));
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    if config.top_k() != 0 {
+        candidates.truncate(config.top_k());
+    }
+    let maximum = candidates[0].1;
+    let mut weighted = candidates
+        .into_iter()
+        .map(|(index, value)| {
+            let weight = (value - maximum).exp();
+            (index, weight)
+        })
+        .collect::<Vec<_>>();
+    let total = weighted.iter().map(|(_, weight)| *weight).sum::<f32>();
+    if !total.is_finite() || total <= 0.0 {
+        return Err(LlamaError::Tensor(
+            "sampling probability total is invalid".to_owned(),
+        ));
+    }
+    let mut cumulative = 0.0_f32;
+    let mut keep = 0;
+    for (_, weight) in &weighted {
+        cumulative += *weight / total;
+        keep += 1;
+        if cumulative >= config.top_p() {
+            break;
+        }
+    }
+    weighted.truncate(keep.max(1));
+    let selected_total = weighted.iter().map(|(_, weight)| *weight).sum::<f32>();
+    if !selected_total.is_finite() || selected_total <= 0.0 {
+        return Err(LlamaError::Tensor(
+            "selected sampling probability total is invalid".to_owned(),
+        ));
+    }
+    let target = rng.next_unit_f32() * selected_total;
+    let mut accumulated = 0.0_f32;
+    for (index, weight) in &weighted {
+        accumulated += *weight;
+        if target < accumulated {
+            return Ok(*index);
+        }
+    }
+    weighted
+        .last()
+        .map(|(index, _)| *index)
+        .ok_or_else(|| LlamaError::InvalidConfig("sampling returned no candidate".to_owned()))
 }
 
 fn argmax_finite(values: &[f32]) -> Result<usize, LlamaError> {
@@ -1379,6 +1646,44 @@ mod tests {
         assert!(matches!(result, Err(LlamaError::InvalidConfig(_))));
         let result = LlamaConfig::new(1024, 1024, 2, 16, 4, 4096, 1000, 1.0e-5, f32::NAN);
         assert!(matches!(result, Err(LlamaError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn validates_sampling_parameters() {
+        assert!(LlamaSamplingConfig::new(-1.0, 0, 1.0, 1).is_err());
+        assert!(LlamaSamplingConfig::new(f32::NAN, 0, 1.0, 1).is_err());
+        assert!(LlamaSamplingConfig::new(1.0, 0, 0.0, 1).is_err());
+        assert!(LlamaSamplingConfig::new(1.0, 0, 1.1, 1).is_err());
+        let config = LlamaSamplingConfig::new(0.8, 12, 0.95, 42).unwrap();
+        assert!((config.temperature() - 0.8).abs() < f32::EPSILON);
+        assert_eq!(config.top_k(), 12);
+        assert!((config.top_p() - 0.95).abs() < f32::EPSILON);
+        assert_eq!(config.seed(), 42);
+    }
+
+    #[test]
+    fn sampling_is_seeded_and_respects_top_k() {
+        let config = LlamaSamplingConfig::new(1.0, 1, 1.0, 42).unwrap();
+        let mut first_rng = DeterministicRng::new(config.seed());
+        let mut second_rng = DeterministicRng::new(config.seed());
+        assert_eq!(
+            sample_logits(&[0.0, 1.0, 2.0, 3.0], config, &mut first_rng).unwrap(),
+            3
+        );
+        assert_eq!(
+            sample_logits(&[0.0, 1.0, 2.0, 3.0], config, &mut second_rng).unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn sampling_nucleus_keeps_the_highest_candidate() {
+        let config = LlamaSamplingConfig::new(1.0, 0, 0.5, 7).unwrap();
+        let mut rng = DeterministicRng::new(config.seed());
+        assert_eq!(
+            sample_logits(&[10.0, 0.0, 0.0], config, &mut rng).unwrap(),
+            0
+        );
     }
 
     #[test]
