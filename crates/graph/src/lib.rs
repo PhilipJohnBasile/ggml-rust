@@ -71,6 +71,8 @@ enum Operation {
     },
     Constant(Tensor),
     Add,
+    Maximum,
+    Minimum,
     Subtract,
     Multiply,
     Divide,
@@ -202,6 +204,24 @@ impl Graph {
     /// Returns an error when either handle is not in this graph.
     pub fn add(&mut self, left: ValueId, right: ValueId) -> Result<ValueId, GraphError> {
         self.binary(Operation::Add, left, right)
+    }
+
+    /// Adds an elementwise maximum node with broadcasting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either input handle is invalid.
+    pub fn maximum(&mut self, left: ValueId, right: ValueId) -> Result<ValueId, GraphError> {
+        self.binary(Operation::Maximum, left, right)
+    }
+
+    /// Adds an elementwise minimum node with broadcasting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either input handle is invalid.
+    pub fn minimum(&mut self, left: ValueId, right: ValueId) -> Result<ValueId, GraphError> {
+        self.binary(Operation::Minimum, left, right)
     }
 
     /// Adds elementwise multiplication.
@@ -768,6 +788,10 @@ impl Graph {
                 Operation::Add => {
                     values[self.input_index(node, 0)?].add(&values[self.input_index(node, 1)?])?
                 }
+                Operation::Maximum => values[self.input_index(node, 0)?]
+                    .maximum(&values[self.input_index(node, 1)?])?,
+                Operation::Minimum => values[self.input_index(node, 0)?]
+                    .minimum(&values[self.input_index(node, 1)?])?,
                 Operation::Subtract => {
                     values[self.input_index(node, 0)?].sub(&values[self.input_index(node, 1)?])?
                 }
@@ -954,6 +978,23 @@ mod tests {
         assert_eq!(result[0].shape(), &[2, 2]);
         assert!(result[0].data().iter().all(|value| value.is_finite()));
         assert_eq!(graph.len(), 5);
+    }
+
+    #[test]
+    fn evaluates_broadcasted_minimum_and_maximum() {
+        let mut graph = Graph::new();
+        let input = graph.input([2, 2]).unwrap();
+        let bound = graph.constant(Tensor::from_data([2], [0.0, 3.0]).unwrap());
+        let lower = graph.minimum(input, bound).unwrap();
+        let upper = graph.maximum(input, bound).unwrap();
+        let result = graph
+            .evaluate(
+                &[Tensor::from_data([2, 2], [-1.0, 2.0, 4.0, 5.0]).unwrap()],
+                &[lower, upper],
+            )
+            .unwrap();
+        assert_eq!(result[0].data(), &[-1.0, 2.0, 0.0, 3.0]);
+        assert_eq!(result[1].data(), &[0.0, 3.0, 4.0, 5.0]);
     }
 
     #[test]

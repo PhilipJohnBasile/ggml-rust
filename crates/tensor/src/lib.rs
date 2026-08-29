@@ -741,6 +741,26 @@ impl Tensor {
         self.binary_broadcast(rhs, "div", |left, right| left / right)
     }
 
+    /// Computes the elementwise maximum with right-aligned broadcasting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when shapes are incompatible or an output is
+    /// non-finite.
+    pub fn maximum(&self, rhs: &Self) -> Result<Self, TensorError> {
+        self.binary_broadcast(rhs, "maximum", f32::max)
+    }
+
+    /// Computes the elementwise minimum with right-aligned broadcasting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when shapes are incompatible or an output is
+    /// non-finite.
+    pub fn minimum(&self, rhs: &Self) -> Result<Self, TensorError> {
+        self.binary_broadcast(rhs, "minimum", f32::min)
+    }
+
     /// Multiplies every value by one scalar.
     ///
     /// # Errors
