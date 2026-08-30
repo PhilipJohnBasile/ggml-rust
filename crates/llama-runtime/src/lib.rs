@@ -54,10 +54,11 @@ impl LlamaRopeScaling {
         head_dim: f32,
         rotary_dimension_count: usize,
         frequency_base: f32,
+        frequency_factor: f32,
     ) -> (f32, f32) {
         #[allow(clippy::cast_precision_loss)]
         let exponent = -2.0 * pair as f32 / head_dim;
-        let theta_extrap = position * frequency_base.powf(exponent);
+        let theta_extrap = position * frequency_base.powf(exponent) / frequency_factor;
         match self {
             Self::None => (theta_extrap, 1.0),
             Self::Linear { factor } => (theta_extrap / factor, 1.0),
@@ -495,11 +496,7 @@ fn validate_architecture_tensors(model: &GgufModel, architecture: &str) -> Resul
         ));
     }
     if metadata_keys(architecture).is_some() {
-        for name in [
-            "rope_freqs.weight",
-            "rope_factors_long.weight",
-            "rope_factors_short.weight",
-        ] {
+        for name in ["rope_factors_long.weight", "rope_factors_short.weight"] {
             if model.tensor(name).is_some() {
                 return Err(LlamaError::InvalidConfig(format!(
                     "unsupported decoder rotary tensor {name}"
@@ -508,6 +505,49 @@ fn validate_architecture_tensors(model: &GgufModel, architecture: &str) -> Resul
         }
     }
     Ok(())
+}
+
+fn load_rope_freq_factors(
+    model: &GgufModel,
+    config: &LlamaConfig,
+    session: &GgufReadSession<'_>,
+) -> Result<Option<Vec<f32>>, LlamaError> {
+    const NAME: &str = "rope_freqs.weight";
+    let Some(descriptor) = model.tensor(NAME) else {
+        return Ok(None);
+    };
+    let expected = vec![config.rope_dimension_count / 2];
+    if descriptor.shape() != expected {
+        return Err(LlamaError::TensorShape {
+            name: NAME.to_owned(),
+            expected,
+            actual: descriptor.shape().to_vec(),
+        });
+    }
+    if descriptor.value_type().raw() != 0 {
+        return Err(LlamaError::InvalidConfig(format!(
+            "{NAME} must use F32 storage, got {}",
+            descriptor.value_type().name()
+        )));
+    }
+    let raw = session.load_raw(NAME)?;
+    let (chunks, remainder) = raw.encoded_bytes().as_chunks::<4>();
+    let mut factors = Vec::with_capacity(expected[0]);
+    for (index, bytes) in chunks.iter().enumerate() {
+        let factor = f32::from_le_bytes(*bytes);
+        if !factor.is_finite() || factor <= 0.0 {
+            return Err(LlamaError::InvalidConfig(format!(
+                "{NAME} factor at pair {index} must be finite and positive"
+            )));
+        }
+        factors.push(factor);
+    }
+    if !remainder.is_empty() || factors.len() != expected[0] {
+        return Err(LlamaError::Tensor(format!(
+            "{NAME} encoded byte length does not match its shape"
+        )));
+    }
+    Ok(Some(factors))
 }
 
 impl LlamaConfig {
@@ -920,6 +960,7 @@ impl LlamaConfig {
             head_dim as f32,
             self.rope_dimension_count,
             self.rope_freq_base,
+            1.0,
         )
     }
 
@@ -1286,6 +1327,7 @@ impl From<TensorError> for LlamaError {
 pub struct LlamaModel {
     model: GgufModel,
     config: LlamaConfig,
+    rope_freq_factors: Option<Vec<f32>>,
 }
 
 impl LlamaModel {
@@ -1301,9 +1343,14 @@ impl LlamaModel {
         validate_architecture_tensors(&model, architecture)?;
         let session = model.read_session()?;
         let config = LlamaConfig::from_metadata(&session, architecture)?;
+        let rope_freq_factors = load_rope_freq_factors(&model, &config, &session)?;
         session.verify_unchanged()?;
         validate_layout(&model, &config)?;
-        Ok(Self { model, config })
+        Ok(Self {
+            model,
+            config,
+            rope_freq_factors,
+        })
     }
 
     /// Validates a model against an explicit configuration.
@@ -1318,9 +1365,16 @@ impl LlamaModel {
             return Err(LlamaError::UnsupportedArchitecture(architecture.to_owned()));
         }
         validate_architecture_tensors(&model, architecture)?;
-        validate_architecture_metadata(&model, architecture)?;
+        let session = model.read_session()?;
+        validate_architecture_metadata(&session, architecture)?;
+        let rope_freq_factors = load_rope_freq_factors(&model, &config, &session)?;
+        session.verify_unchanged()?;
         validate_layout(&model, &config)?;
-        Ok(Self { model, config })
+        Ok(Self {
+            model,
+            config,
+            rope_freq_factors,
+        })
     }
 
     /// Returns the content-bound GGUF model index.
@@ -1333,6 +1387,39 @@ impl LlamaModel {
     #[must_use]
     pub const fn config(&self) -> &LlamaConfig {
         &self.config
+    }
+
+    /// Returns the validated optional per-pair rotary frequency factors.
+    ///
+    /// GGML divides each pair's unscaled rotary phase by the corresponding
+    /// factor before applying linear or `YaRN` interpolation.
+    #[must_use]
+    pub fn rope_freq_factors(&self) -> Option<&[f32]> {
+        self.rope_freq_factors.as_deref()
+    }
+
+    /// Loads and validates rotary frequency factors through an existing GGUF
+    /// read transaction.
+    ///
+    /// This lets a device backend admit the optional `rope_freqs.weight`
+    /// tensor without opening another mapping or hashing the model again. The
+    /// caller remains responsible for ending the transaction with
+    /// [`GgufReadSession::verify_unchanged`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session belongs to another model, or when the
+    /// factor tensor has the wrong type, shape, or values.
+    pub fn rope_freq_factors_from_session(
+        &self,
+        session: &GgufReadSession<'_>,
+    ) -> Result<Option<Vec<f32>>, LlamaError> {
+        if session.model() != &self.model {
+            return Err(LlamaError::Tensor(
+                "GGUF read session belongs to another model".to_owned(),
+            ));
+        }
+        load_rope_freq_factors(&self.model, &self.config, session)
     }
 
     /// Loads the validated model tensors into the checked CPU tensor engine.
@@ -2144,6 +2231,7 @@ struct LayerWeights {
 #[derive(Debug, Clone)]
 pub struct LlamaCpuModel {
     config: LlamaConfig,
+    rope_freq_factors: Option<Vec<f32>>,
     token_embedding: CpuMatrix,
     output: CpuMatrix,
     output_bias: Option<Vec<f32>>,
@@ -2156,21 +2244,23 @@ pub struct LlamaCpuModel {
 impl LlamaCpuModel {
     fn load(model: &LlamaModel, use_quantized: bool) -> Result<Self, LlamaError> {
         let config = model.config.clone();
+        let rope_freq_factors = model.rope_freq_factors.clone();
         let tokenizer = match model.tokenizer() {
             Ok(tokenizer) => Some(tokenizer),
             Err(LlamaError::MissingMetadata("tokenizer.ggml.tokens")) => None,
             Err(error) => return Err(error),
         };
         if !use_quantized {
-            return Self::load_f32_weights(model, config, tokenizer);
+            return Self::load_f32_weights(model, config, rope_freq_factors, tokenizer);
         }
-        Self::load_quantized_weights(model, config, tokenizer)
+        Self::load_quantized_weights(model, config, rope_freq_factors, tokenizer)
     }
 
     #[allow(clippy::too_many_lines)]
     fn load_quantized_weights(
         model: &LlamaModel,
         config: LlamaConfig,
+        rope_freq_factors: Option<Vec<f32>>,
         tokenizer: Option<LlamaTokenizer>,
     ) -> Result<Self, LlamaError> {
         let has_output_weight = model.model.tensor("output.weight").is_some();
@@ -2361,6 +2451,7 @@ impl LlamaCpuModel {
         }
         Ok(Self {
             config,
+            rope_freq_factors,
             token_embedding,
             output,
             output_bias,
@@ -2375,6 +2466,7 @@ impl LlamaCpuModel {
     fn load_f32_weights(
         model: &LlamaModel,
         config: LlamaConfig,
+        rope_freq_factors: Option<Vec<f32>>,
         tokenizer: Option<LlamaTokenizer>,
     ) -> Result<Self, LlamaError> {
         let has_output_weight = model.model.tensor("output.weight").is_some();
@@ -2583,6 +2675,7 @@ impl LlamaCpuModel {
         }
         Ok(Self {
             config,
+            rope_freq_factors,
             token_embedding,
             output,
             output_bias,
@@ -2946,7 +3039,7 @@ impl<'a> LlamaSession<'a> {
                 self.model.config.rms_norm_epsilon,
                 "attention key",
             )?;
-            apply_rope_with_scaling(
+            apply_rope_with_scaling_and_factors(
                 &mut query_values,
                 self.model.config.head_count,
                 head_dim,
@@ -2954,8 +3047,9 @@ impl<'a> LlamaSession<'a> {
                 self.position as f32,
                 self.model.config.rope_freq_base,
                 self.model.config.rope_scaling,
+                self.model.rope_freq_factors.as_deref(),
             )?;
-            apply_rope_with_scaling(
+            apply_rope_with_scaling_and_factors(
                 &mut key_values,
                 self.model.config.head_count_kv,
                 head_dim,
@@ -2963,6 +3057,7 @@ impl<'a> LlamaSession<'a> {
                 self.position as f32,
                 self.model.config.rope_freq_base,
                 self.model.config.rope_scaling,
+                self.model.rope_freq_factors.as_deref(),
             )?;
             if key_values.len() != self.cache.kv_width {
                 return Err(LlamaError::Tensor(
@@ -3156,6 +3251,7 @@ fn apply_rope(
     )
 }
 
+#[cfg(test)]
 fn apply_rope_with_scaling(
     values: &mut [f32],
     head_count: usize,
@@ -3165,18 +3261,60 @@ fn apply_rope_with_scaling(
     frequency_base: f32,
     scaling: LlamaRopeScaling,
 ) -> Result<(), LlamaError> {
+    apply_rope_with_scaling_and_factors(
+        values,
+        head_count,
+        head_dim,
+        rope_dimension_count,
+        position,
+        frequency_base,
+        scaling,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_rope_with_scaling_and_factors(
+    values: &mut [f32],
+    head_count: usize,
+    head_dim: usize,
+    rope_dimension_count: usize,
+    position: f32,
+    frequency_base: f32,
+    scaling: LlamaRopeScaling,
+    frequency_factors: Option<&[f32]>,
+) -> Result<(), LlamaError> {
+    let pair_count = rope_dimension_count / 2;
+    if let Some(factors) = frequency_factors {
+        if factors.len() != pair_count {
+            return Err(LlamaError::Tensor(format!(
+                "rotary frequency factor count {} does not match {pair_count} pairs",
+                factors.len()
+            )));
+        }
+        if factors
+            .iter()
+            .any(|factor| !factor.is_finite() || *factor <= 0.0)
+        {
+            return Err(LlamaError::Tensor(
+                "rotary frequency factors must be finite and positive".to_owned(),
+            ));
+        }
+    }
     let head_width = head_dim;
     #[allow(clippy::cast_precision_loss)]
     let head_dim = head_width as f32;
     for head in 0..head_count {
         let start = head * head_width;
-        for pair in 0..rope_dimension_count / 2 {
+        for pair in 0..pair_count {
+            let frequency_factor = frequency_factors.map_or(1.0, |factors| factors[pair]);
             let (angle, magnitude) = scaling.phase(
                 position,
                 pair,
                 head_dim,
                 rope_dimension_count,
                 frequency_base,
+                frequency_factor,
             );
             let (sine, cosine) = angle.sin_cos();
             let first = values[start + pair * 2];
@@ -3937,6 +4075,25 @@ mod tests {
         extra_u32_metadata: &[(&str, u32)],
         extra_string_array_metadata: &[(&str, &[&str])],
     ) -> Vec<u8> {
+        llama_fixture_with_encoded_additions(
+            architecture,
+            has_output_weight,
+            extra_tensors,
+            extra_u32_metadata,
+            extra_string_array_metadata,
+            &[],
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn llama_fixture_with_encoded_additions<'a>(
+        architecture: &str,
+        has_output_weight: bool,
+        extra_tensors: &[(&'a str, &'a [u64])],
+        extra_u32_metadata: &[(&str, u32)],
+        extra_string_array_metadata: &[(&str, &[&str])],
+        extra_tensor_encodings: &[(&str, u32, &[u8])],
+    ) -> Vec<u8> {
         let mut config = vec![
             ("token_embd.weight", vec![4_u64, 8]),
             ("output.weight", vec![4, 8]),
@@ -4051,16 +4208,46 @@ mod tests {
             for dimension in shape {
                 bytes.extend_from_slice(&dimension.to_le_bytes());
             }
-            bytes.extend_from_slice(&0_u32.to_le_bytes());
+            let value_type = extra_tensor_encodings
+                .iter()
+                .find_map(|(encoded_name, value_type, _)| {
+                    (*encoded_name == *name).then_some(*value_type)
+                })
+                .unwrap_or(0);
+            bytes.extend_from_slice(&value_type.to_le_bytes());
             bytes.extend_from_slice(&offset.to_le_bytes());
             let elements = shape.iter().product::<u64>();
-            let byte_len = elements * 4;
+            let byte_len = match value_type {
+                0 => elements * 4,
+                1 => elements * 2,
+                _ => panic!("unsupported fixture tensor type {value_type}"),
+            };
             offset += byte_len.div_ceil(32) * 32;
         }
         while bytes.len() % 32 != 0 {
             bytes.push(0);
         }
-        bytes.resize(bytes.len() + usize::try_from(offset).unwrap(), 0);
+        let data_start = bytes.len();
+        bytes.resize(data_start + usize::try_from(offset).unwrap(), 0);
+        let mut data_offset = 0_usize;
+        for (name, shape) in &config {
+            let encoding = extra_tensor_encodings
+                .iter()
+                .find(|(encoded_name, _, _)| *encoded_name == *name);
+            let value_type = encoding.map_or(0, |(_, value_type, _)| *value_type);
+            let elements = usize::try_from(shape.iter().product::<u64>()).unwrap();
+            let byte_len = match value_type {
+                0 => elements * 4,
+                1 => elements * 2,
+                _ => panic!("unsupported fixture tensor type {value_type}"),
+            };
+            if let Some((_, _, encoded)) = encoding {
+                assert_eq!(encoded.len(), byte_len);
+                bytes[data_start + data_offset..data_start + data_offset + byte_len]
+                    .copy_from_slice(encoded);
+            }
+            data_offset += byte_len.div_ceil(32) * 32;
+        }
         bytes
     }
 
@@ -4237,6 +4424,22 @@ mod tests {
         assert_invalid_config(&bytes, &format!("unsupported decoder rotary tensor {name}"));
     }
 
+    fn rope_freq_fixture(
+        architecture: &str,
+        shape: &[u64],
+        value_type: u32,
+        encoded: &[u8],
+    ) -> Vec<u8> {
+        llama_fixture_with_encoded_additions(
+            architecture,
+            true,
+            &[("rope_freqs.weight", shape)],
+            &[],
+            &[],
+            &[("rope_freqs.weight", value_type, encoded)],
+        )
+    }
+
     #[test]
     fn validates_grouped_query_attention_configuration() {
         let config =
@@ -4320,7 +4523,7 @@ mod tests {
         assert_eq!(scaling.kind(), "yarn");
         assert!((scaling.factor() - 4.0).abs() < f32::EPSILON);
         scaling.validate().unwrap();
-        let (angle, magnitude) = scaling.phase(4096.0, 0, 128.0, 4, 10_000.0);
+        let (angle, magnitude) = scaling.phase(4096.0, 0, 128.0, 4, 10_000.0, 1.0);
         assert!(angle.is_finite());
         assert!(magnitude.is_finite());
         let mut values = vec![1.0, 0.0, 0.0, 1.0];
@@ -4445,6 +4648,59 @@ mod tests {
     }
 
     #[test]
+    fn rope_frequency_factors_match_identity_and_scale_multiple_positions() {
+        for position in [1.0_f32, 2.0] {
+            let initial = vec![1.0, 0.0, 1.0, 0.0];
+            let mut baseline = initial.clone();
+            apply_rope_with_scaling(
+                &mut baseline,
+                1,
+                4,
+                4,
+                position,
+                10_000.0,
+                LlamaRopeScaling::None,
+            )
+            .unwrap();
+            let mut identity = initial.clone();
+            apply_rope_with_scaling_and_factors(
+                &mut identity,
+                1,
+                4,
+                4,
+                position,
+                10_000.0,
+                LlamaRopeScaling::None,
+                Some(&[1.0, 1.0]),
+            )
+            .unwrap();
+            assert_eq!(identity, baseline);
+
+            let mut scaled = initial;
+            apply_rope_with_scaling_and_factors(
+                &mut scaled,
+                1,
+                4,
+                4,
+                position,
+                10_000.0,
+                LlamaRopeScaling::None,
+                Some(&[2.0, 4.0]),
+            )
+            .unwrap();
+            let first_angle = position / 2.0;
+            let second_angle = position * 10_000.0_f32.powf(-0.5) / 4.0;
+            let (first_sine, first_cosine) = first_angle.sin_cos();
+            let (second_sine, second_cosine) = second_angle.sin_cos();
+            let expected = [first_cosine, first_sine, second_cosine, second_sine];
+            for (actual, expected) in scaled.iter().zip(expected) {
+                assert!((actual - expected).abs() < 1.0e-7);
+            }
+            assert_ne!(scaled, baseline);
+        }
+    }
+
+    #[test]
     fn validates_sampling_parameters() {
         assert!(LlamaSamplingConfig::new(-1.0, 0, 1.0, 1).is_err());
         assert!(LlamaSamplingConfig::new(f32::NAN, 0, 1.0, 1).is_err());
@@ -4501,6 +4757,7 @@ mod tests {
         assert_eq!(model.config().context_length(), 16);
         assert_eq!(model.config().head_count_kv(), 1);
         assert_eq!(model.model().tensors().len(), 12);
+        assert_eq!(model.rope_freq_factors(), None);
         fs::remove_file(path).unwrap();
     }
 
@@ -4529,8 +4786,88 @@ mod tests {
     }
 
     #[test]
-    fn rejects_llama_rotary_frequency_tensor() {
-        assert_unsupported_rotary_tensor("llama", "rope_freqs.weight");
+    fn accepts_rope_frequency_factors_for_all_admitted_decoders() {
+        let encoded = 2.5_f32.to_le_bytes();
+        for architecture in ["llama", "qwen2", "qwen3", "mistral", "mistral3"] {
+            let bytes = rope_freq_fixture(architecture, &[1], 0, &encoded);
+            let path = write_fixture(&bytes);
+            let model = LlamaModel::open(&path, 1 << 20).unwrap();
+            assert_eq!(model.rope_freq_factors(), Some(&[2.5][..]));
+            let session = model.model().read_session().unwrap();
+            assert_eq!(
+                model.rope_freq_factors_from_session(&session).unwrap(),
+                Some(vec![2.5])
+            );
+            session.verify_unchanged().unwrap();
+            let cpu = model.load_cpu().unwrap();
+            assert_eq!(cpu.rope_freq_factors.as_deref(), Some(&[2.5][..]));
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn from_model_admits_and_retains_rope_frequency_factors() {
+        let encoded = 3.0_f32.to_le_bytes();
+        let path = write_fixture(&rope_freq_fixture("llama", &[1], 0, &encoded));
+        let indexed = GgufModel::open(&path, 1 << 20).unwrap();
+        let config = LlamaConfig::from_model(&indexed).unwrap();
+        let model = LlamaModel::from_model(indexed, config).unwrap();
+        assert_eq!(model.rope_freq_factors(), Some(&[3.0][..]));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_wrong_rope_frequency_factor_shape() {
+        let encoded = [1.0_f32.to_le_bytes(), 2.0_f32.to_le_bytes()].concat();
+        let path = write_fixture(&rope_freq_fixture("llama", &[2], 0, &encoded));
+        let result = LlamaModel::open(&path, 1 << 20);
+        match result {
+            Err(LlamaError::TensorShape {
+                name,
+                expected,
+                actual,
+            }) => {
+                assert_eq!(name, "rope_freqs.weight");
+                assert_eq!(expected, [1]);
+                assert_eq!(actual, [2]);
+            }
+            other => panic!("expected TensorShape, got {other:?}"),
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_non_f32_rope_frequency_factors() {
+        let path = write_fixture(&rope_freq_fixture(
+            "llama",
+            &[1],
+            1,
+            &1.0_f32.to_le_bytes()[..2],
+        ));
+        let result = LlamaModel::open(&path, 1 << 20);
+        match result {
+            Err(LlamaError::InvalidConfig(message)) => {
+                assert_eq!(message, "rope_freqs.weight must use F32 storage, got F16");
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_nonfinite_or_nonpositive_rope_frequency_factors() {
+        for factor in [f32::NAN, f32::INFINITY, 0.0, -1.0] {
+            let path = write_fixture(&rope_freq_fixture("llama", &[1], 0, &factor.to_le_bytes()));
+            let result = LlamaModel::open(&path, 1 << 20);
+            match result {
+                Err(LlamaError::InvalidConfig(message)) => assert_eq!(
+                    message,
+                    "rope_freqs.weight factor at pair 0 must be finite and positive"
+                ),
+                other => panic!("expected InvalidConfig, got {other:?}"),
+            }
+            fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
@@ -4541,11 +4878,6 @@ mod tests {
     #[test]
     fn rejects_llama_short_rope_factors_tensor() {
         assert_unsupported_rotary_tensor("llama", "rope_factors_short.weight");
-    }
-
-    #[test]
-    fn rejects_mistral3_rotary_frequency_tensor() {
-        assert_unsupported_rotary_tensor("mistral3", "rope_freqs.weight");
     }
 
     #[test]
