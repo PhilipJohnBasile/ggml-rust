@@ -439,6 +439,77 @@ fn metadata_keys(architecture: &str) -> Option<LlamaMetadataKeys> {
     }
 }
 
+fn validate_architecture_metadata<S>(source: &S, architecture: &str) -> Result<(), LlamaError>
+where
+    S: MetadataSource + ?Sized,
+{
+    if architecture == "qwen3" && metadata_key_is_present(source, "qwen3.classifier.output_labels")?
+    {
+        return Err(LlamaError::InvalidConfig(
+            "unsupported qwen3 classifier or reranker metadata qwen3.classifier.output_labels"
+                .to_owned(),
+        ));
+    }
+    if architecture == "qwen3" {
+        let pooling_type = optional_usize_value(
+            source.metadata_scalar("qwen3.pooling_type")?,
+            "qwen3.pooling_type",
+        )?
+        .unwrap_or(0);
+        if pooling_type != 0 {
+            return Err(LlamaError::InvalidConfig(format!(
+                "unsupported qwen3.pooling_type {pooling_type}; causal decoding requires zero"
+            )));
+        }
+    }
+    if architecture == "mistral3" {
+        let expert_count = optional_usize_value(
+            source.metadata_scalar("mistral3.expert_count")?,
+            "mistral3.expert_count",
+        )?
+        .unwrap_or(0);
+        if expert_count > 0 {
+            return Err(LlamaError::InvalidConfig(format!(
+                "unsupported mistral3.expert_count {expert_count}; mixture-of-experts execution is unavailable"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn metadata_key_is_present<S>(source: &S, key: &str) -> Result<bool, LlamaError>
+where
+    S: MetadataSource + ?Sized,
+{
+    match source.metadata_scalar(key) {
+        Ok(value) => Ok(value.is_some()),
+        Err(ModelError::MetadataArray(array_key)) if array_key == key => Ok(true),
+        Err(error) => Err(LlamaError::Model(error)),
+    }
+}
+
+fn validate_architecture_tensors(model: &GgufModel, architecture: &str) -> Result<(), LlamaError> {
+    if architecture == "qwen3" && model.tensor("cls.output.weight").is_some() {
+        return Err(LlamaError::InvalidConfig(
+            "unsupported qwen3 classifier or reranker tensor cls.output.weight".to_owned(),
+        ));
+    }
+    if metadata_keys(architecture).is_some() {
+        for name in [
+            "rope_freqs.weight",
+            "rope_factors_long.weight",
+            "rope_factors_short.weight",
+        ] {
+            if model.tensor(name).is_some() {
+                return Err(LlamaError::InvalidConfig(format!(
+                    "unsupported decoder rotary tensor {name}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl LlamaConfig {
     /// Creates and validates a Llama configuration.
     ///
@@ -641,6 +712,7 @@ impl LlamaConfig {
     {
         let keys = metadata_keys(architecture)
             .ok_or_else(|| LlamaError::UnsupportedArchitecture(architecture.to_owned()))?;
+        validate_architecture_metadata(source, architecture)?;
         let metadata = [
             keys.context_length,
             keys.embedding_length,
@@ -1226,10 +1298,12 @@ impl LlamaModel {
     pub fn open(path: impl AsRef<Path>, max_file_bytes: u64) -> Result<Self, LlamaError> {
         let model = GgufModel::open(path, max_file_bytes)?;
         let architecture = model.architecture().unwrap_or("missing");
+        validate_architecture_tensors(&model, architecture)?;
         let session = model.read_session()?;
         let config = LlamaConfig::from_metadata(&session, architecture)?;
         session.verify_unchanged()?;
-        Self::from_model(model, config)
+        validate_layout(&model, &config)?;
+        Ok(Self { model, config })
     }
 
     /// Validates a model against an explicit configuration.
@@ -1243,6 +1317,8 @@ impl LlamaModel {
         if metadata_keys(architecture).is_none() {
             return Err(LlamaError::UnsupportedArchitecture(architecture.to_owned()));
         }
+        validate_architecture_tensors(&model, architecture)?;
+        validate_architecture_metadata(&model, architecture)?;
         validate_layout(&model, &config)?;
         Ok(Self { model, config })
     }
@@ -3647,6 +3723,7 @@ fn as_f32(value: MetadataScalar) -> Result<f32, String> {
 
 #[allow(clippy::too_many_lines)]
 fn validate_layout(model: &GgufModel, config: &LlamaConfig) -> Result<(), LlamaError> {
+    let architecture = model.architecture().unwrap_or_default();
     require_shape(
         model,
         "token_embd.weight",
@@ -3659,7 +3736,6 @@ fn validate_layout(model: &GgufModel, config: &LlamaConfig) -> Result<(), LlamaE
             &[config.embedding_length, config.vocab_size],
         )?;
     }
-    let architecture = model.architecture().unwrap_or_default();
     if let Some(output_bias) = model.tensor("output.bias")
         && output_bias.shape() != [config.vocab_size]
     {
@@ -3850,6 +3926,17 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     fn llama_fixture_for_output(architecture: &str, has_output_weight: bool) -> Vec<u8> {
+        llama_fixture_with_additions(architecture, has_output_weight, &[], &[], &[])
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn llama_fixture_with_additions<'a>(
+        architecture: &str,
+        has_output_weight: bool,
+        extra_tensors: &[(&'a str, &'a [u64])],
+        extra_u32_metadata: &[(&str, u32)],
+        extra_string_array_metadata: &[(&str, &[&str])],
+    ) -> Vec<u8> {
         let mut config = vec![
             ("token_embd.weight", vec![4_u64, 8]),
             ("output.weight", vec![4, 8]),
@@ -3880,11 +3967,19 @@ mod tests {
                 ("blk.0.ffn_up.bias", vec![8]),
             ]);
         }
+        config.extend(
+            extra_tensors
+                .iter()
+                .map(|(name, shape)| (*name, shape.to_vec())),
+        );
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"GGUF");
         bytes.extend_from_slice(&3_u32.to_le_bytes());
         bytes.extend_from_slice(&(config.len() as u64).to_le_bytes());
-        let metadata_count: u64 = if architecture == "mistral3" { 19 } else { 13 };
+        let base_metadata_count: u64 = if architecture == "mistral3" { 19 } else { 13 };
+        let extra_metadata_count =
+            u64::try_from(extra_u32_metadata.len() + extra_string_array_metadata.len()).unwrap();
+        let metadata_count = base_metadata_count + extra_metadata_count;
         bytes.extend_from_slice(&metadata_count.to_le_bytes());
         push_string(&mut bytes, "general.architecture");
         bytes.extend_from_slice(&8_u32.to_le_bytes());
@@ -3929,6 +4024,12 @@ mod tests {
                 8,
             );
             push_f32_metadata(&mut bytes, "mistral3.attention.temperature_scale", 0.1);
+        }
+        for (key, value) in extra_u32_metadata {
+            push_u32_metadata(&mut bytes, key, *value);
+        }
+        for (key, values) in extra_string_array_metadata {
+            push_string_array_metadata(&mut bytes, key, values);
         }
         push_string(&mut bytes, "general.name");
         bytes.extend_from_slice(&8_u32.to_le_bytes());
@@ -4118,6 +4219,22 @@ mod tests {
         let path = std::env::temp_dir().join(format!("llama-runtime-{id}.gguf"));
         fs::write(&path, bytes).unwrap();
         path
+    }
+
+    fn assert_invalid_config(bytes: &[u8], expected: &str) {
+        let path = write_fixture(bytes);
+        let result = LlamaModel::open(&path, 1 << 20);
+        match result {
+            Err(LlamaError::InvalidConfig(message)) => assert_eq!(message, expected),
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    fn assert_unsupported_rotary_tensor(architecture: &str, name: &str) {
+        let shape = [1_u64];
+        let bytes = llama_fixture_with_additions(architecture, true, &[(name, &shape)], &[], &[]);
+        assert_invalid_config(&bytes, &format!("unsupported decoder rotary tensor {name}"));
     }
 
     #[test]
@@ -4412,6 +4529,66 @@ mod tests {
     }
 
     #[test]
+    fn rejects_llama_rotary_frequency_tensor() {
+        assert_unsupported_rotary_tensor("llama", "rope_freqs.weight");
+    }
+
+    #[test]
+    fn rejects_llama_long_rope_factors_tensor() {
+        assert_unsupported_rotary_tensor("llama", "rope_factors_long.weight");
+    }
+
+    #[test]
+    fn rejects_llama_short_rope_factors_tensor() {
+        assert_unsupported_rotary_tensor("llama", "rope_factors_short.weight");
+    }
+
+    #[test]
+    fn rejects_mistral3_rotary_frequency_tensor() {
+        assert_unsupported_rotary_tensor("mistral3", "rope_freqs.weight");
+    }
+
+    #[test]
+    fn rejects_mistral3_long_rope_factors_tensor() {
+        assert_unsupported_rotary_tensor("mistral3", "rope_factors_long.weight");
+    }
+
+    #[test]
+    fn rejects_mistral3_short_rope_factors_tensor() {
+        assert_unsupported_rotary_tensor("mistral3", "rope_factors_short.weight");
+    }
+
+    #[test]
+    fn rejects_mistral3_mixture_of_experts_metadata() {
+        let bytes = llama_fixture_with_additions(
+            "mistral3",
+            true,
+            &[],
+            &[("mistral3.expert_count", 1)],
+            &[],
+        );
+        assert_invalid_config(
+            &bytes,
+            "unsupported mistral3.expert_count 1; mixture-of-experts execution is unavailable",
+        );
+    }
+
+    #[test]
+    fn accepts_mistral3_zero_expert_count_metadata() {
+        let bytes = llama_fixture_with_additions(
+            "mistral3",
+            true,
+            &[],
+            &[("mistral3.expert_count", 0)],
+            &[],
+        );
+        let path = write_fixture(&bytes);
+        let model = LlamaModel::open(&path, 1 << 20).unwrap();
+        assert_eq!(model.config().block_count(), 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn opens_qwen3_standard_layout() {
         let path = write_fixture(&llama_fixture_for("qwen3"));
         let model = LlamaModel::open(&path, 1 << 20).unwrap();
@@ -4419,6 +4596,59 @@ mod tests {
         assert_eq!(model.config().head_count_kv(), 1);
         let cpu = model.load_cpu().unwrap();
         assert_eq!(cpu.forward_token(1).unwrap().len(), 8);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_qwen3_classifier_output_tensor() {
+        let bytes = llama_fixture_with_additions(
+            "qwen3",
+            true,
+            &[("cls.output.weight", &[4, 2])],
+            &[],
+            &[],
+        );
+        assert_invalid_config(
+            &bytes,
+            "unsupported qwen3 classifier or reranker tensor cls.output.weight",
+        );
+    }
+
+    #[test]
+    fn rejects_qwen3_classifier_output_labels_metadata() {
+        let bytes = llama_fixture_with_additions(
+            "qwen3",
+            true,
+            &[],
+            &[],
+            &[(
+                "qwen3.classifier.output_labels",
+                &["not_relevant", "relevant"],
+            )],
+        );
+        assert_invalid_config(
+            &bytes,
+            "unsupported qwen3 classifier or reranker metadata qwen3.classifier.output_labels",
+        );
+    }
+
+    #[test]
+    fn rejects_qwen3_nonzero_pooling_type() {
+        let bytes =
+            llama_fixture_with_additions("qwen3", true, &[], &[("qwen3.pooling_type", 4)], &[]);
+        assert_invalid_config(
+            &bytes,
+            "unsupported qwen3.pooling_type 4; causal decoding requires zero",
+        );
+    }
+
+    #[test]
+    fn accepts_qwen3_zero_pooling_type() {
+        let bytes =
+            llama_fixture_with_additions("qwen3", true, &[], &[("qwen3.pooling_type", 0)], &[]);
+        let path = write_fixture(&bytes);
+        let model = LlamaModel::open(&path, 1 << 20).unwrap();
+        assert_eq!(model.config().block_count(), 1);
         fs::remove_file(path).unwrap();
     }
 
