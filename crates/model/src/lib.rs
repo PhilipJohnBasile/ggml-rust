@@ -524,6 +524,17 @@ pub struct GgufModel {
     max_file_bytes: u64,
 }
 
+/// A bounded, digest-checked read transaction over one GGUF model mapping.
+///
+/// The session validates the complete model when it is created. Call
+/// [`Self::verify_unchanged`] after the final read to detect in-place changes
+/// that occurred while tensors were being consumed.
+#[must_use = "verify the GGUF read session after consuming its tensors"]
+pub struct GgufReadSession<'model> {
+    model: &'model GgufModel,
+    mapped: MappedFile,
+}
+
 /// Errors returned by GGUF model indexing and tensor materialization.
 #[derive(Debug)]
 pub enum ModelError {
@@ -694,6 +705,28 @@ impl GgufModel {
     #[must_use]
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
+    }
+
+    /// Opens one reusable, digest-checked mapping for a bounded group of model
+    /// reads.
+    ///
+    /// This avoids remapping and hashing the complete artifact once per tensor
+    /// during device upload. Call [`GgufReadSession::verify_unchanged`] after
+    /// the final read before publishing any derived runtime state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model cannot be mapped or its content no
+    /// longer matches the digest captured by [`Self::open`].
+    pub fn read_session(&self) -> Result<GgufReadSession<'_>, ModelError> {
+        let mapped = map_model(&self.path, self.max_file_bytes)?;
+        if digest_bytes(mapped.as_bytes()) != self.digest {
+            return Err(ModelError::ContentChanged);
+        }
+        Ok(GgufReadSession {
+            model: self,
+            mapped,
+        })
     }
 
     /// Reads one scalar metadata value while enforcing the model digest.
@@ -977,23 +1010,7 @@ impl GgufModel {
         let descriptor = self
             .tensor(name)
             .ok_or_else(|| ModelError::TensorNotFound(name.to_owned()))?;
-        self.with_validated_bytes(|bytes| {
-            let start = usize::try_from(descriptor.byte_offset)
-                .map_err(|_| ModelError::Shape("tensor offset exceeds usize".to_owned()))?;
-            let length = usize::try_from(descriptor.byte_len)
-                .map_err(|_| ModelError::Shape("tensor byte length exceeds usize".to_owned()))?;
-            let end = start
-                .checked_add(length)
-                .ok_or_else(|| ModelError::Shape("tensor range overflows usize".to_owned()))?;
-            let encoded = bytes
-                .get(start..end)
-                .ok_or_else(|| ModelError::Parse("tensor range is outside the file".to_owned()))?;
-            Ok(RawTensor {
-                shape: descriptor.shape.clone(),
-                value_type: descriptor.value_type,
-                bytes: encoded.to_vec(),
-            })
-        })
+        self.with_validated_bytes(|bytes| materialize_raw(bytes, descriptor))
     }
 
     /// Loads several rank-2 quantized GGUF matrices through one validated
@@ -1346,6 +1363,67 @@ impl GgufModel {
             .validate_finite()
             .map_err(|error| ModelError::Shape(error.to_string()))?;
         Ok(tensor)
+    }
+}
+
+impl GgufReadSession<'_> {
+    /// Materializes one tensor as F32 from the already validated mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tensor is missing, malformed, or uses an
+    /// unsupported storage type.
+    pub fn load_f32(&self, name: &str) -> Result<Tensor, ModelError> {
+        let descriptor = self
+            .model
+            .tensor(name)
+            .ok_or_else(|| ModelError::TensorNotFound(name.to_owned()))?;
+        GgufModel::materialize_f32(self.mapped.as_bytes(), descriptor)
+    }
+
+    /// Loads one rank-2 compact quantized matrix from the already validated
+    /// mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tensor is missing, malformed, or is not a
+    /// supported quantized matrix.
+    pub fn load_quantized(&self, name: &str) -> Result<QuantizedMatrix, ModelError> {
+        let descriptor = self
+            .model
+            .tensor(name)
+            .ok_or_else(|| ModelError::TensorNotFound(name.to_owned()))?;
+        materialize_quantized(self.mapped.as_bytes(), descriptor)
+    }
+
+    /// Loads one tensor's original encoded bytes from the already validated
+    /// mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tensor is missing, malformed, or its indexed
+    /// byte range is outside the model.
+    pub fn load_raw(&self, name: &str) -> Result<RawTensor, ModelError> {
+        let descriptor = self
+            .model
+            .tensor(name)
+            .ok_or_else(|| ModelError::TensorNotFound(name.to_owned()))?;
+        materialize_raw(self.mapped.as_bytes(), descriptor)
+    }
+
+    /// Verifies that the mapped GGUF bytes still match the model digest after
+    /// all reads have completed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::ContentChanged`] when an in-place modification
+    /// occurred during the read transaction.
+    pub fn verify_unchanged(self) -> Result<(), ModelError> {
+        if digest_bytes(self.mapped.as_bytes()) == self.model.digest {
+            Ok(())
+        } else {
+            Err(ModelError::ContentChanged)
+        }
     }
 }
 
@@ -5764,6 +5842,24 @@ fn validate_quantized_matrix_descriptor(
     Ok((rows, columns, expected_bytes))
 }
 
+fn materialize_raw(bytes: &[u8], descriptor: &TensorDescriptor) -> Result<RawTensor, ModelError> {
+    let start = usize::try_from(descriptor.byte_offset)
+        .map_err(|_| ModelError::Shape("tensor offset exceeds usize".to_owned()))?;
+    let length = usize::try_from(descriptor.byte_len)
+        .map_err(|_| ModelError::Shape("tensor byte length exceeds usize".to_owned()))?;
+    let end = start
+        .checked_add(length)
+        .ok_or_else(|| ModelError::Shape("tensor range overflows usize".to_owned()))?;
+    let encoded = bytes
+        .get(start..end)
+        .ok_or_else(|| ModelError::Parse("tensor range is outside the file".to_owned()))?;
+    Ok(RawTensor {
+        shape: descriptor.shape.clone(),
+        value_type: descriptor.value_type,
+        bytes: encoded.to_vec(),
+    })
+}
+
 fn materialize_quantized(
     bytes: &[u8],
     descriptor: &TensorDescriptor,
@@ -7797,6 +7893,25 @@ mod tests {
         assert_eq!(batched.len(), 2);
         assert_eq!(batched[0].data(), &values);
         assert_eq!(batched[1].data(), &values);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn read_session_reuses_one_mapping_for_mixed_tensor_views() {
+        let values = [1.0_f32, -2.0, 3.5, 7.25];
+        let tensor_bytes = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let path = write_fixture(&f32_fixture(0, &tensor_bytes));
+        let model = GgufModel::open(&path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
+        let session = model.read_session().unwrap();
+        let raw = session.load_raw("probe.tensor").unwrap();
+        assert_eq!(raw.shape(), [2, 2]);
+        assert_eq!(raw.value_type().raw(), 0);
+        assert_eq!(raw.encoded_bytes(), tensor_bytes);
+        assert_eq!(session.load_f32("probe.tensor").unwrap().data(), values);
+        session.verify_unchanged().unwrap();
         fs::remove_file(path).unwrap();
     }
 
