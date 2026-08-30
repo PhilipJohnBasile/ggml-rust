@@ -3515,16 +3515,14 @@ fn validate_layout(model: &GgufModel, config: &LlamaConfig) -> Result<(), LlamaE
         "token_embd.weight",
         &[config.embedding_length, config.vocab_size],
     )?;
-    let architecture = model.architecture().unwrap_or_default();
     if model.tensor("output.weight").is_some() {
         require_shape(
             model,
             "output.weight",
             &[config.embedding_length, config.vocab_size],
         )?;
-    } else if !matches!(architecture, "qwen2" | "qwen3") {
-        return Err(LlamaError::MissingTensor("output.weight".to_owned()));
     }
+    let architecture = model.architecture().unwrap_or_default();
     if let Some(output_bias) = model.tensor("output.bias")
         && output_bias.shape() != [config.vocab_size]
     {
@@ -3710,6 +3708,11 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     fn llama_fixture_for(architecture: &str) -> Vec<u8> {
+        llama_fixture_for_output(architecture, true)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn llama_fixture_for_output(architecture: &str, has_output_weight: bool) -> Vec<u8> {
         let mut config = vec![
             ("token_embd.weight", vec![4_u64, 8]),
             ("output.weight", vec![4, 8]),
@@ -3724,6 +3727,9 @@ mod tests {
             ("blk.0.ffn_down.weight", vec![8, 4]),
             ("blk.0.ffn_up.weight", vec![4, 8]),
         ];
+        if !has_output_weight {
+            config.remove(1);
+        }
         if architecture == "qwen3" {
             config.extend([
                 ("blk.0.attn_q_norm.weight", vec![2]),
@@ -4241,6 +4247,16 @@ mod tests {
         assert_eq!(model.config().context_length(), 16);
         assert_eq!(model.config().head_count_kv(), 1);
         assert_eq!(model.model().tensors().len(), 12);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn loads_llama_with_output_tied_to_token_embeddings() {
+        let path = write_fixture(&llama_fixture_for_output("llama", false));
+        let model = LlamaModel::open(&path, 1 << 20).unwrap();
+        assert!(model.model().tensor("output.weight").is_none());
+        let cpu = model.load_cpu().unwrap();
+        assert_eq!(cpu.forward_token(1).unwrap(), vec![0.0; 8]);
         fs::remove_file(path).unwrap();
     }
 
