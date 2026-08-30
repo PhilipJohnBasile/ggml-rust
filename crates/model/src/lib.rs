@@ -5325,7 +5325,7 @@ const IQ4_NL_VALUES: [i8; 16] = [
 
 const MXFP4_VALUES: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 
-const TQ1_POW3: [u16; 5] = [1, 3, 9, 27, 81];
+const TQ1_POW3: [u8; 5] = [1, 3, 9, 27, 81];
 
 fn decode_values(value_type: TensorType, bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
     match value_type.raw() {
@@ -6092,7 +6092,8 @@ fn decode_nvfp4(bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
 }
 
 fn tq1_digit(packed: u8, power: usize) -> f32 {
-    let value = (u16::from(packed) * TQ1_POW3[power] * 3) >> 8;
+    let quantized = packed.wrapping_mul(TQ1_POW3[power]);
+    let value = (u16::from(quantized) * 3) >> 8;
     f32::from(value.cast_signed() - 1)
 }
 
@@ -8076,22 +8077,21 @@ mod tests {
 
     #[test]
     fn materializes_tq1_and_tq2_tensors() {
-        let mut tq1 = vec![0_u8; 54];
+        let mut tq1 = vec![0_u8; 108];
         tq1[52..54].copy_from_slice(&0x3c00_u16.to_le_bytes());
-        let tq1_path = write_fixture(&fixture(34, &[256, 1], &tq1));
+        tq1[54..106].fill(0xff);
+        tq1[106..108].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        let tq1_path = write_fixture(&fixture(34, &[256, 2], &tq1));
         let tq1_model = GgufModel::open(&tq1_path, DEFAULT_MODEL_BYTE_LIMIT).unwrap();
+        let mut expected_tq1 = vec![-1.0; 256];
+        expected_tq1.extend(std::iter::repeat_n(1.0, 256));
         assert_eq!(
             tq1_model.load_f32("probe.tensor").unwrap().data(),
-            &[-1.0; 256]
+            expected_tq1
         );
-        assert_eq!(
-            tq1_model
-                .load_quantized("probe.tensor")
-                .unwrap()
-                .column(0)
-                .unwrap(),
-            vec![-1.0; 256]
-        );
+        let tq1_matrix = tq1_model.load_quantized("probe.tensor").unwrap();
+        assert_eq!(tq1_matrix.column(0).unwrap(), vec![-1.0; 256]);
+        assert_eq!(tq1_matrix.column(1).unwrap(), vec![1.0; 256]);
         fs::remove_file(tq1_path).unwrap();
 
         let mut tq2 = vec![0xaa_u8; 66];
