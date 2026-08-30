@@ -1367,6 +1367,209 @@ impl GgufModel {
 }
 
 impl GgufReadSession<'_> {
+    /// Returns the indexed model that owns this read transaction.
+    #[must_use]
+    pub const fn model(&self) -> &GgufModel {
+        self.model
+    }
+
+    fn with_gguf<F, T>(&self, callback: F) -> Result<T, ModelError>
+    where
+        F: FnOnce(&Gguf<'_>) -> Result<T, ModelError>,
+    {
+        let gguf = Gguf::from_bytes(self.mapped.as_bytes())
+            .map_err(|error| ModelError::Parse(error.to_string()))?;
+        callback(&gguf)
+    }
+
+    /// Reads one scalar metadata value from the validated mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the metadata is malformed or is an array.
+    pub fn metadata_scalar(&self, key: &str) -> Result<Option<MetadataScalar>, ModelError> {
+        self.with_gguf(|gguf| {
+            let Some(value) = gguf.metadata_value(key) else {
+                return Ok(None);
+            };
+            match value {
+                ggml_gguf::MetadataValue::Scalar(value) => Ok(Some(owned_scalar(*value))),
+                ggml_gguf::MetadataValue::Array(_) => {
+                    Err(ModelError::MetadataArray(key.to_owned()))
+                }
+            }
+        })
+    }
+
+    /// Reads several scalar metadata values from one validated mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any requested value is malformed or is an array.
+    pub fn metadata_scalars(
+        &self,
+        keys: &[&str],
+    ) -> Result<Vec<Option<MetadataScalar>>, ModelError> {
+        self.with_gguf(|gguf| {
+            keys.iter()
+                .map(|key| {
+                    let Some(value) = gguf.metadata_value(key) else {
+                        return Ok(None);
+                    };
+                    match value {
+                        ggml_gguf::MetadataValue::Scalar(value) => Ok(Some(owned_scalar(*value))),
+                        ggml_gguf::MetadataValue::Array(_) => {
+                            Err(ModelError::MetadataArray((*key).to_owned()))
+                        }
+                    }
+                })
+                .collect()
+        })
+    }
+
+    /// Reads a bounded string metadata array from the validated mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value is malformed, has the wrong type, or
+    /// exceeds `max_elements`.
+    pub fn metadata_string_array(
+        &self,
+        key: &str,
+        max_elements: u64,
+    ) -> Result<Option<Vec<String>>, ModelError> {
+        self.with_gguf(|gguf| {
+            let Some(value) = gguf.metadata_value(key) else {
+                return Ok(None);
+            };
+            let ggml_gguf::MetadataValue::Array(array) = value else {
+                return Err(ModelError::MetadataArray(key.to_owned()));
+            };
+            if array.element_type() != ggml_gguf::MetadataType::String {
+                return Err(ModelError::MetadataArrayType {
+                    key: key.to_owned(),
+                    expected: "String",
+                    actual: format!("{:?}", array.element_type()),
+                });
+            }
+            let length = array.len();
+            if u64::try_from(length).unwrap_or(u64::MAX) > max_elements {
+                return Err(ModelError::MetadataArrayLimit {
+                    key: key.to_owned(),
+                    len: length,
+                    max: max_elements,
+                });
+            }
+            let mut values = Vec::with_capacity(length);
+            for index in 0..length {
+                let Some(ggml_gguf::ScalarValue::String(value)) = array.get(index) else {
+                    return Err(ModelError::Parse(format!(
+                        "GGUF metadata {key} string array contains an invalid element"
+                    )));
+                };
+                values.push(value.to_owned());
+            }
+            Ok(Some(values))
+        })
+    }
+
+    /// Reads a bounded F32 metadata array from the validated mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value is malformed, has the wrong type, is
+    /// non-finite, or exceeds `max_elements`.
+    pub fn metadata_f32_array(
+        &self,
+        key: &str,
+        max_elements: u64,
+    ) -> Result<Option<Vec<f32>>, ModelError> {
+        self.with_gguf(|gguf| {
+            let Some(value) = gguf.metadata_value(key) else {
+                return Ok(None);
+            };
+            let ggml_gguf::MetadataValue::Array(array) = value else {
+                return Err(ModelError::MetadataArray(key.to_owned()));
+            };
+            if array.element_type() != ggml_gguf::MetadataType::F32 {
+                return Err(ModelError::MetadataArrayType {
+                    key: key.to_owned(),
+                    expected: "F32",
+                    actual: format!("{:?}", array.element_type()),
+                });
+            }
+            let length = array.len();
+            if u64::try_from(length).unwrap_or(u64::MAX) > max_elements {
+                return Err(ModelError::MetadataArrayLimit {
+                    key: key.to_owned(),
+                    len: length,
+                    max: max_elements,
+                });
+            }
+            let mut values = Vec::with_capacity(length);
+            for index in 0..length {
+                let Some(ggml_gguf::ScalarValue::F32(value)) = array.get(index) else {
+                    return Err(ModelError::Parse(format!(
+                        "GGUF metadata {key} F32 array contains an invalid element"
+                    )));
+                };
+                if !value.is_finite() {
+                    return Err(ModelError::Parse(format!(
+                        "GGUF metadata {key} contains a non-finite value"
+                    )));
+                }
+                values.push(value);
+            }
+            Ok(Some(values))
+        })
+    }
+
+    /// Reads a bounded boolean metadata array from the validated mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value is malformed, has the wrong type, or
+    /// exceeds `max_elements`.
+    pub fn metadata_bool_array(
+        &self,
+        key: &str,
+        max_elements: u64,
+    ) -> Result<Option<Vec<bool>>, ModelError> {
+        self.with_gguf(|gguf| {
+            let Some(value) = gguf.metadata_value(key) else {
+                return Ok(None);
+            };
+            let ggml_gguf::MetadataValue::Array(array) = value else {
+                return Err(ModelError::MetadataArray(key.to_owned()));
+            };
+            if array.element_type() != ggml_gguf::MetadataType::Bool {
+                return Err(ModelError::MetadataArrayType {
+                    key: key.to_owned(),
+                    expected: "Bool",
+                    actual: format!("{:?}", array.element_type()),
+                });
+            }
+            let length = array.len();
+            if u64::try_from(length).unwrap_or(u64::MAX) > max_elements {
+                return Err(ModelError::MetadataArrayLimit {
+                    key: key.to_owned(),
+                    len: length,
+                    max: max_elements,
+                });
+            }
+            let mut values = Vec::with_capacity(length);
+            for index in 0..length {
+                let Some(ggml_gguf::ScalarValue::Bool(value)) = array.get(index) else {
+                    return Err(ModelError::Parse(format!(
+                        "GGUF metadata {key} boolean array contains an invalid element"
+                    )));
+                };
+                values.push(value);
+            }
+            Ok(Some(values))
+        })
+    }
+
     /// Materializes one tensor as F32 from the already validated mapping.
     ///
     /// # Errors

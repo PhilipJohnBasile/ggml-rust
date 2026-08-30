@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 
-use ggml_model::{GgufModel, MetadataScalar, ModelError, QuantizedMatrix};
+use ggml_model::{GgufModel, GgufReadSession, MetadataScalar, ModelError, QuantizedMatrix};
 use ggml_tensor::{Tensor, TensorError};
 
 /// Position scaling applied before rotary phase calculation.
@@ -192,6 +192,94 @@ struct LlamaMetadataKeys {
     attention_temperature_scale: &'static str,
     attention_window: &'static str,
     attention_window_pattern: &'static str,
+}
+
+trait MetadataSource {
+    fn metadata_scalar(&self, key: &str) -> Result<Option<MetadataScalar>, ModelError>;
+    fn metadata_scalars(&self, keys: &[&str]) -> Result<Vec<Option<MetadataScalar>>, ModelError>;
+    fn metadata_string_array(
+        &self,
+        key: &str,
+        max_elements: u64,
+    ) -> Result<Option<Vec<String>>, ModelError>;
+    fn metadata_f32_array(
+        &self,
+        key: &str,
+        max_elements: u64,
+    ) -> Result<Option<Vec<f32>>, ModelError>;
+    fn metadata_bool_array(
+        &self,
+        key: &str,
+        max_elements: u64,
+    ) -> Result<Option<Vec<bool>>, ModelError>;
+}
+
+impl MetadataSource for GgufModel {
+    fn metadata_scalar(&self, key: &str) -> Result<Option<MetadataScalar>, ModelError> {
+        self.metadata_scalar(key)
+    }
+
+    fn metadata_scalars(&self, keys: &[&str]) -> Result<Vec<Option<MetadataScalar>>, ModelError> {
+        self.metadata_scalars(keys)
+    }
+
+    fn metadata_string_array(
+        &self,
+        key: &str,
+        max_elements: u64,
+    ) -> Result<Option<Vec<String>>, ModelError> {
+        self.metadata_string_array(key, max_elements)
+    }
+
+    fn metadata_f32_array(
+        &self,
+        key: &str,
+        max_elements: u64,
+    ) -> Result<Option<Vec<f32>>, ModelError> {
+        self.metadata_f32_array(key, max_elements)
+    }
+
+    fn metadata_bool_array(
+        &self,
+        key: &str,
+        max_elements: u64,
+    ) -> Result<Option<Vec<bool>>, ModelError> {
+        self.metadata_bool_array(key, max_elements)
+    }
+}
+
+impl MetadataSource for GgufReadSession<'_> {
+    fn metadata_scalar(&self, key: &str) -> Result<Option<MetadataScalar>, ModelError> {
+        self.metadata_scalar(key)
+    }
+
+    fn metadata_scalars(&self, keys: &[&str]) -> Result<Vec<Option<MetadataScalar>>, ModelError> {
+        self.metadata_scalars(keys)
+    }
+
+    fn metadata_string_array(
+        &self,
+        key: &str,
+        max_elements: u64,
+    ) -> Result<Option<Vec<String>>, ModelError> {
+        self.metadata_string_array(key, max_elements)
+    }
+
+    fn metadata_f32_array(
+        &self,
+        key: &str,
+        max_elements: u64,
+    ) -> Result<Option<Vec<f32>>, ModelError> {
+        self.metadata_f32_array(key, max_elements)
+    }
+
+    fn metadata_bool_array(
+        &self,
+        key: &str,
+        max_elements: u64,
+    ) -> Result<Option<Vec<bool>>, ModelError> {
+        self.metadata_bool_array(key, max_elements)
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -543,6 +631,14 @@ impl LlamaConfig {
     #[allow(clippy::too_many_lines)]
     pub fn from_model(model: &GgufModel) -> Result<Self, LlamaError> {
         let architecture = model.architecture().unwrap_or("missing");
+        Self::from_metadata(model, architecture)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn from_metadata<S>(source: &S, architecture: &str) -> Result<Self, LlamaError>
+    where
+        S: MetadataSource + ?Sized,
+    {
         let keys = metadata_keys(architecture)
             .ok_or_else(|| LlamaError::UnsupportedArchitecture(architecture.to_owned()))?;
         let metadata = [
@@ -556,7 +652,7 @@ impl LlamaConfig {
             keys.rms_norm_epsilon,
             keys.rope_freq_base,
         ];
-        let values = model.metadata_scalars(&metadata)?;
+        let values = source.metadata_scalars(&metadata)?;
         let mut values = values.into_iter();
         let context_length = required_usize_value(values.next().flatten(), keys.context_length)?;
         let embedding_length =
@@ -566,12 +662,12 @@ impl LlamaConfig {
         let head_count_kv = optional_usize_value(values.next().flatten(), keys.head_count_kv)?
             .unwrap_or(head_count);
         let key_length = optional_usize_value(
-            model.metadata_scalar(keys.attention_key_length)?,
+            source.metadata_scalar(keys.attention_key_length)?,
             keys.attention_key_length,
         )?
         .unwrap_or_else(|| embedding_length.checked_div(head_count).unwrap_or(0));
         let value_length = optional_usize_value(
-            model.metadata_scalar(keys.attention_value_length)?,
+            source.metadata_scalar(keys.attention_value_length)?,
             keys.attention_value_length,
         )?
         .unwrap_or(key_length);
@@ -582,7 +678,7 @@ impl LlamaConfig {
                 key: keys.vocab_size,
                 value,
             })?,
-            None => model
+            None => source
                 .metadata_string_array("tokenizer.ggml.tokens", MAX_TOKENIZER_ELEMENTS)?
                 .ok_or(LlamaError::MissingMetadata(keys.vocab_size))?
                 .len(),
@@ -591,7 +687,7 @@ impl LlamaConfig {
             optional_f32_value(values.next().flatten(), keys.rms_norm_epsilon)?.unwrap_or(1.0e-5);
         let rope_freq_base =
             optional_f32_value(values.next().flatten(), keys.rope_freq_base)?.unwrap_or(10_000.0);
-        let rope_dimension_count = model
+        let rope_dimension_count = source
             .metadata_scalar(keys.rope_dimension_count)?
             .map(|value| {
                 as_usize(value).map_err(|value| LlamaError::InvalidMetadata {
@@ -601,22 +697,22 @@ impl LlamaConfig {
             })
             .transpose()?
             .unwrap_or_else(|| embedding_length.checked_div(head_count).unwrap_or(0));
-        let rope_scaling_type = model.metadata_scalar(keys.rope_scaling_type)?;
+        let rope_scaling_type = source.metadata_scalar(keys.rope_scaling_type)?;
         let rope_scaling_factor = optional_f32_value(
-            model.metadata_scalar(keys.rope_scaling_factor)?,
+            source.metadata_scalar(keys.rope_scaling_factor)?,
             keys.rope_scaling_factor,
         )?;
         let rope_scaling = parse_model_rope_scaling(
-            model,
+            source,
             &keys,
             rope_scaling_type,
             rope_scaling_factor,
             context_length,
         )?;
         let attention_temperature_scale = optional_f32_value(
-            model
+            source
                 .metadata_scalar(keys.attention_temperature_scale)?
-                .or(model.metadata_scalar(keys.rope_scaling_beta_legacy)?),
+                .or(source.metadata_scalar(keys.rope_scaling_beta_legacy)?),
             keys.attention_temperature_scale,
         )?
         .unwrap_or(0.0);
@@ -624,17 +720,17 @@ impl LlamaConfig {
             0
         } else {
             optional_usize_value(
-                model.metadata_scalar(keys.rope_scaling_original_context_length)?,
+                source.metadata_scalar(keys.rope_scaling_original_context_length)?,
                 keys.rope_scaling_original_context_length,
             )?
             .unwrap_or(context_length)
         };
         let attention_window = optional_usize_value(
-            model.metadata_scalar(keys.attention_window)?,
+            source.metadata_scalar(keys.attention_window)?,
             keys.attention_window,
         )?;
         let attention_window_pattern =
-            parse_attention_window_pattern(model, keys.attention_window_pattern, block_count)?;
+            parse_attention_window_pattern(source, keys.attention_window_pattern, block_count)?;
         let mut config = Self::new_with_rope_scaling_and_attention_window_and_pattern(
             context_length,
             embedding_length,
@@ -1129,7 +1225,10 @@ impl LlamaModel {
     /// invalid for a Llama model.
     pub fn open(path: impl AsRef<Path>, max_file_bytes: u64) -> Result<Self, LlamaError> {
         let model = GgufModel::open(path, max_file_bytes)?;
-        let config = LlamaConfig::from_model(&model)?;
+        let architecture = model.architecture().unwrap_or("missing");
+        let session = model.read_session()?;
+        let config = LlamaConfig::from_metadata(&session, architecture)?;
+        session.verify_unchanged()?;
         Self::from_model(model, config)
     }
 
@@ -1193,7 +1292,33 @@ impl LlamaModel {
     /// Returns an error when tokenizer arrays are absent, malformed, or do not
     /// match the model vocabulary.
     pub fn tokenizer(&self) -> Result<LlamaTokenizer, LlamaError> {
-        LlamaTokenizer::from_model(&self.model, self.config.vocab_size)
+        let session = self.model.read_session()?;
+        let tokenizer = self.tokenizer_from_session(&session)?;
+        session.verify_unchanged()?;
+        Ok(tokenizer)
+    }
+
+    /// Loads tokenizer tables through an existing validated GGUF read
+    /// transaction.
+    ///
+    /// This lets a device backend share one model mapping across tokenizer
+    /// admission and weight upload. The caller remains responsible for ending
+    /// the transaction with [`GgufReadSession::verify_unchanged`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session belongs to another model or tokenizer
+    /// metadata is absent, malformed, or inconsistent with the vocabulary.
+    pub fn tokenizer_from_session(
+        &self,
+        session: &GgufReadSession<'_>,
+    ) -> Result<LlamaTokenizer, LlamaError> {
+        if session.model() != &self.model {
+            return Err(LlamaError::Tensor(
+                "GGUF read session belongs to another model".to_owned(),
+            ));
+        }
+        LlamaTokenizer::from_metadata(session, self.config.vocab_size)
     }
 }
 
@@ -1231,8 +1356,11 @@ struct EncodingPath {
 
 impl LlamaTokenizer {
     #[allow(clippy::too_many_lines)]
-    fn from_model(model: &GgufModel, vocab_size: usize) -> Result<Self, LlamaError> {
-        let tokens = model
+    fn from_metadata<S>(source: &S, vocab_size: usize) -> Result<Self, LlamaError>
+    where
+        S: MetadataSource + ?Sized,
+    {
+        let tokens = source
             .metadata_string_array("tokenizer.ggml.tokens", MAX_TOKENIZER_ELEMENTS)?
             .ok_or(LlamaError::MissingMetadata("tokenizer.ggml.tokens"))?;
         if tokens.len() != vocab_size {
@@ -1244,7 +1372,7 @@ impl LlamaTokenizer {
                 ),
             });
         }
-        let scores = model
+        let scores = source
             .metadata_f32_array("tokenizer.ggml.scores", MAX_TOKENIZER_ELEMENTS)?
             .unwrap_or_else(|| vec![0.0; tokens.len()]);
         if scores.len() != tokens.len() {
@@ -1264,7 +1392,7 @@ impl LlamaTokenizer {
             "tokenizer.ggml.eos_token_id",
             "tokenizer.ggml.unknown_token_id",
         ];
-        let token_id_values = model.metadata_scalars(&token_id_keys)?;
+        let token_id_values = source.metadata_scalars(&token_id_keys)?;
         let mut token_id_values = token_id_values.into_iter();
         let bos_token_id =
             optional_usize_value(token_id_values.next().flatten(), token_id_keys[0])?;
@@ -1286,10 +1414,10 @@ impl LlamaTokenizer {
                 });
             }
         }
-        let kind = match model.metadata_scalar("tokenizer.ggml.model")? {
+        let kind = match source.metadata_scalar("tokenizer.ggml.model")? {
             None => TokenizerKind::SentencePiece,
             Some(MetadataScalar::String(value)) if value == "gpt2" => {
-                match model.metadata_scalar("tokenizer.ggml.pre")? {
+                match source.metadata_scalar("tokenizer.ggml.pre")? {
                     Some(MetadataScalar::String(pre)) if pre == "tekken" => {
                         TokenizerKind::TekkenBpe
                     }
@@ -1322,7 +1450,7 @@ impl LlamaTokenizer {
             HashMap::new()
         };
         let merge_ranks = if matches!(kind, TokenizerKind::Gpt2Bpe | TokenizerKind::TekkenBpe) {
-            let merges = model
+            let merges = source
                 .metadata_string_array("tokenizer.ggml.merges", MAX_TOKENIZER_ELEMENTS)?
                 .ok_or(LlamaError::MissingMetadata("tokenizer.ggml.merges"))?;
             let mut ranks = HashMap::with_capacity(merges.len());
@@ -3203,53 +3331,56 @@ fn parse_rope_scaling(
     }
 }
 
-fn parse_model_rope_scaling(
-    model: &GgufModel,
+fn parse_model_rope_scaling<S>(
+    source: &S,
     keys: &LlamaMetadataKeys,
     kind: Option<MetadataScalar>,
     factor: Option<f32>,
     context_length: usize,
-) -> Result<LlamaRopeScaling, LlamaError> {
+) -> Result<LlamaRopeScaling, LlamaError>
+where
+    S: MetadataSource + ?Sized,
+{
     let is_yarn = matches!(kind, Some(MetadataScalar::String(ref value)) if value == "yarn");
     if !is_yarn {
         return parse_rope_scaling(kind, factor);
     }
     let factor = factor.ok_or(LlamaError::MissingMetadata(keys.rope_scaling_factor))?;
     let beta_fast = optional_alias_f32(
-        model,
+        source,
         keys.rope_scaling_yarn_beta_fast,
         keys.rope_scaling_beta_fast_legacy,
     )?
     .unwrap_or(32.0);
     let beta_slow = optional_alias_f32(
-        model,
+        source,
         keys.rope_scaling_yarn_beta_slow,
         keys.rope_scaling_beta_slow_legacy,
     )?
     .unwrap_or(1.0);
     let original_context_length = optional_usize_value(
-        model.metadata_scalar(keys.rope_scaling_original_context_length)?,
+        source.metadata_scalar(keys.rope_scaling_original_context_length)?,
         keys.rope_scaling_original_context_length,
     )?
     .unwrap_or(context_length);
     let log_multiplier = optional_alias_f32(
-        model,
+        source,
         keys.rope_scaling_yarn_log_multiplier,
         keys.rope_scaling_mscale_all_dim_legacy,
     )?
     .unwrap_or(0.0);
     let ext_factor = optional_f32_value(
-        model.metadata_scalar(keys.rope_scaling_yarn_ext_factor)?,
+        source.metadata_scalar(keys.rope_scaling_yarn_ext_factor)?,
         keys.rope_scaling_yarn_ext_factor,
     )?
     .unwrap_or(1.0);
     let rope_attention_factor = optional_f32_value(
-        model.metadata_scalar(keys.rope_scaling_attn_factor)?,
+        source.metadata_scalar(keys.rope_scaling_attn_factor)?,
         keys.rope_scaling_attn_factor,
     )?
     .unwrap_or(1.0);
     let configured_yarn_attention_factor = optional_f32_value(
-        model.metadata_scalar(keys.rope_scaling_yarn_attn_factor)?,
+        source.metadata_scalar(keys.rope_scaling_yarn_attn_factor)?,
         keys.rope_scaling_yarn_attn_factor,
     )?;
     let get_mscale = |scale: f32, multiplier: f32| {
@@ -3289,15 +3420,18 @@ fn parse_model_rope_scaling(
     Ok(scaling)
 }
 
-fn optional_alias_f32(
-    model: &GgufModel,
+fn optional_alias_f32<S>(
+    source: &S,
     primary_key: &'static str,
     alias_key: &'static str,
-) -> Result<Option<f32>, LlamaError> {
+) -> Result<Option<f32>, LlamaError>
+where
+    S: MetadataSource + ?Sized,
+{
     optional_f32_value(
-        model
+        source
             .metadata_scalar(primary_key)?
-            .or(model.metadata_scalar(alias_key)?),
+            .or(source.metadata_scalar(alias_key)?),
         primary_key,
     )
 }
@@ -3321,12 +3455,15 @@ fn rope_yarn_ramp(low: f32, high: f32, pair_index: usize) -> f32 {
     1.0 - value.clamp(0.0, 1.0)
 }
 
-fn parse_attention_window_pattern(
-    model: &GgufModel,
+fn parse_attention_window_pattern<S>(
+    source: &S,
     key: &'static str,
     block_count: usize,
-) -> Result<Option<Vec<bool>>, LlamaError> {
-    match model.metadata_scalar(key) {
+) -> Result<Option<Vec<bool>>, LlamaError>
+where
+    S: MetadataSource + ?Sized,
+{
+    match source.metadata_scalar(key) {
         Ok(Some(value)) => {
             let period =
                 as_usize(value).map_err(|value| LlamaError::InvalidMetadata { key, value })?;
@@ -3336,7 +3473,7 @@ fn parse_attention_window_pattern(
             Ok(Some(pattern))
         }
         Ok(None) => Ok(None),
-        Err(ModelError::MetadataArray(_)) => model
+        Err(ModelError::MetadataArray(_)) => source
             .metadata_bool_array(key, MAX_CONFIG_ARRAY_ELEMENTS)
             .map_err(LlamaError::from),
         Err(error) => Err(LlamaError::from(error)),
