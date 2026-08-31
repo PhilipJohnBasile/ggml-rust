@@ -1,0 +1,18 @@
+[package]
+name = "ggml-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+description = "Digest-bound GGUF model indexing and CPU tensor materialization"
+
+[dependencies]
+ggml-gguf = { version = "0.1.0", path = "../gguf" }
+ggml-mmap = { version = "0.1.0", path = "../mmap" }
+ggml-tensor = { version = "0.1.0", path = "../tensor" }
+sha2.workspace = true
+
+[lints]
+workspace = true

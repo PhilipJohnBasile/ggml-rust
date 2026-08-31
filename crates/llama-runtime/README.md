@@ -1,0 +1,19 @@
+# llama-runtime
+
+llama-runtime is the model-contract layer for the Rust-native Llama runtime.
+It turns scalar architecture metadata in a validated GGUF file into a checked
+LlamaConfig, then validates canonical Llama tensor names and shapes before
+execution code is allowed to consume the model. It can load F32 weights and
+supported quantized matrices into the checked CPU tensor engine, maintain a
+bounded per-layer KV cache, apply rotary embeddings, and perform deterministic
+greedy or seeded temperature, top-k, and nucleus top-p generation.
+
+The CPU decoder is the correctness fallback. `LlamaModel::load_cpu` uses the
+fast F32 reference representation, while `LlamaModel::load_cpu_quantized`
+retains supported rank-2 weights in encoded form and uses direct products and
+embedding column lookup without a complete F32 expansion. Encoded output
+columns are decoded in a bounded worker set for the direct CPU product. On the
+local M5 Max, one startup-inclusive TinyLlama Q4_K_M token smoke measured 15.08
+seconds in this mode; that is a memory-bound reference measurement, not a
+general throughput claim. The crate does not yet provide MLX or Metal kernels,
+the full llama.cpp sampling surface, or every llama.cpp architecture variant.

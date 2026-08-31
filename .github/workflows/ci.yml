@@ -43,9 +43,15 @@ jobs:
         run: |
           cargo package -p ggml-gguf --locked --no-verify --list
           cargo package -p ggml-mmap --locked --no-verify --list
+          cargo package -p ggml-model --locked --no-verify --list
+          cargo package -p ggml-tensor --locked --no-verify --list
+          cargo package -p llama-runtime --locked --no-verify --list
           cargo package -p gguf-inspect --locked --no-verify --list
       - name: Check license copies
         run: |
           cmp LICENSE crates/gguf/LICENSE
           cmp LICENSE crates/mmap/LICENSE
+          cmp LICENSE crates/model/LICENSE
+          cmp LICENSE crates/tensor/LICENSE
+          cmp LICENSE crates/llama-runtime/LICENSE
           cmp LICENSE tools/gguf-inspect/LICENSE

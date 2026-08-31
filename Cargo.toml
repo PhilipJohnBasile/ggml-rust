@@ -2,6 +2,11 @@
 members = [
     "crates/gguf",
     "crates/mmap",
+    "crates/model",
+    "crates/tensor",
+    "crates/graph",
+    "crates/agent-memory",
+    "crates/llama-runtime",
     "tools/gguf-inspect",
 ]
 resolver = "3"
@@ -13,6 +18,9 @@ rust-version = "1.98"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/PhilipJohnBasile/ggml-rust"
+
+[workspace.dependencies]
+sha2 = "0.10.9"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
