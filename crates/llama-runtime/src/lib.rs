@@ -1156,14 +1156,15 @@ impl LlamaConfig {
 ///
 /// A temperature of zero selects the highest finite logit and preserves the
 /// deterministic greedy behavior. A positive temperature enables sampling,
-/// optionally restricted by `top_k` and nucleus `top_p`. A zero `top_k` means
-/// that no top-k limit is applied. The seed is deterministic, including when
-/// it is zero.
+/// optionally restricted by `top_k`, nucleus `top_p`, and minimum probability
+/// `min_p`. A zero `top_k` or `min_p` means that the corresponding limit is not
+/// applied. The seed is deterministic, including when it is zero.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LlamaSamplingConfig {
     temperature: f32,
     top_k: usize,
     top_p: f32,
+    min_p: f32,
     seed: u64,
 }
 
@@ -1173,6 +1174,7 @@ impl Default for LlamaSamplingConfig {
             temperature: 0.0,
             top_k: 0,
             top_p: 1.0,
+            min_p: 0.0,
             seed: 0,
         }
     }
@@ -1183,7 +1185,7 @@ impl LlamaSamplingConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error when temperature or nucleus probability is invalid.
+    /// Returns an error when temperature or probability limits are invalid.
     pub fn new(temperature: f32, top_k: usize, top_p: f32, seed: u64) -> Result<Self, LlamaError> {
         if !temperature.is_finite() || temperature < 0.0 {
             return Err(LlamaError::InvalidConfig(
@@ -1199,8 +1201,28 @@ impl LlamaSamplingConfig {
             temperature,
             top_k,
             top_p,
+            min_p: 0.0,
             seed,
         })
+    }
+
+    /// Sets the minimum relative probability threshold.
+    ///
+    /// Candidates whose probability would be below `min_p` times the highest
+    /// candidate probability are discarded. The highest candidate is always
+    /// retained. A value of zero disables the filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `min_p` is not finite or is outside `0..=1`.
+    pub fn with_min_p(mut self, min_p: f32) -> Result<Self, LlamaError> {
+        if !min_p.is_finite() || !(0.0..=1.0).contains(&min_p) {
+            return Err(LlamaError::InvalidConfig(
+                "sampling min_p must be finite and in [0, 1]".to_owned(),
+            ));
+        }
+        self.min_p = min_p;
+        Ok(self)
     }
 
     /// Returns the temperature. Zero selects greedy decoding.
@@ -1219,6 +1241,12 @@ impl LlamaSamplingConfig {
     #[must_use]
     pub const fn top_p(self) -> f32 {
         self.top_p
+    }
+
+    /// Returns the minimum relative probability threshold. Zero means off.
+    #[must_use]
+    pub const fn min_p(self) -> f32 {
+        self.min_p
     }
 
     /// Returns the deterministic sampling seed.
@@ -3408,6 +3436,14 @@ fn sample_logits(
     if config.top_k() != 0 {
         candidates.truncate(config.top_k());
     }
+    if config.min_p() > 0.0 {
+        let minimum = candidates[0].1 + config.min_p().ln();
+        let keep = candidates
+            .iter()
+            .position(|(_, value)| *value < minimum)
+            .unwrap_or(candidates.len());
+        candidates.truncate(keep.max(1));
+    }
     let maximum = candidates[0].1;
     let mut weighted = candidates
         .into_iter()
@@ -4710,7 +4746,13 @@ mod tests {
         assert!((config.temperature() - 0.8).abs() < f32::EPSILON);
         assert_eq!(config.top_k(), 12);
         assert!((config.top_p() - 0.95).abs() < f32::EPSILON);
+        assert!(config.min_p().abs() < f32::EPSILON);
         assert_eq!(config.seed(), 42);
+        assert!(config.with_min_p(f32::NAN).is_err());
+        assert!(config.with_min_p(f32::INFINITY).is_err());
+        assert!(config.with_min_p(-0.1).is_err());
+        assert!(config.with_min_p(1.1).is_err());
+        assert!((config.with_min_p(0.2).unwrap().min_p() - 0.2).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -4735,6 +4777,32 @@ mod tests {
         assert_eq!(
             sample_logits(&[10.0, 0.0, 0.0], config, &mut rng).unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn sampling_minimum_probability_keeps_only_relative_tail() {
+        let config = LlamaSamplingConfig::new(1.0, 0, 1.0, 7)
+            .unwrap()
+            .with_min_p(0.5)
+            .unwrap();
+        let mut rng = DeterministicRng::new(config.seed());
+        assert_eq!(
+            sample_logits(&[4.0, 3.0, 0.0], config, &mut rng).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn sampling_minimum_probability_zero_is_identity() {
+        let base = LlamaSamplingConfig::new(1.0, 0, 1.0, 42).unwrap();
+        let disabled = base.with_min_p(0.0).unwrap();
+        assert_eq!(base, disabled);
+        let mut first_rng = DeterministicRng::new(base.seed());
+        let mut second_rng = DeterministicRng::new(disabled.seed());
+        assert_eq!(
+            sample_logits(&[1.0, 0.9, 0.8], base, &mut first_rng).unwrap(),
+            sample_logits(&[1.0, 0.9, 0.8], disabled, &mut second_rng).unwrap()
         );
     }
 
